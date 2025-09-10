@@ -250,7 +250,7 @@ pub fn bank_from_snapshot_archives(
 
     verify_slot_deltas(slot_deltas.as_slice(), &bank)?;
 
-    bank.status_cache.write().unwrap().append(&slot_deltas);
+    bank.status_cache.append(&slot_deltas);
 
     let snapshot_archive_info = incremental_snapshot_archive_info.map_or_else(
         || full_snapshot_archive_info.snapshot_archive_info(),
@@ -447,7 +447,7 @@ pub fn bank_from_snapshot_dir(
 
     verify_slot_deltas(slot_deltas.as_slice(), &bank)?;
 
-    bank.status_cache.write().unwrap().append(&slot_deltas);
+    bank.status_cache.append(&slot_deltas);
 
     if !bank.verify_snapshot_bank(
         true,
@@ -525,7 +525,7 @@ fn verify_slot_deltas(
     slot_deltas: &[BankSlotDelta],
     bank: &Bank,
 ) -> std::result::Result<(), VerifySlotDeltasError> {
-    let max_root_entries = bank.status_cache.read().unwrap().max_root_entries();
+    let max_root_entries = bank.status_cache.max_root_entries();
     let info = verify_slot_deltas_structural(slot_deltas, bank.slot(), max_root_entries)?;
     verify_slot_deltas_with_history(
         &info.slots,
@@ -723,7 +723,7 @@ pub fn bank_to_full_snapshot_archive(
         SnapshotKind::Archive(snapshot_archive_kind),
         bank,
         bank.get_snapshot_storages(None),
-        bank.status_cache.read().unwrap().root_slot_deltas(),
+        bank.status_cache.root_slot_deltas(),
     );
 
     let snapshot_storages = snapshot_package.snapshot_storages;
@@ -787,7 +787,7 @@ pub fn bank_to_incremental_snapshot_archive(
         SnapshotKind::Archive(snapshot_archive_kind),
         bank,
         bank.get_snapshot_storages(Some(full_snapshot_slot)),
-        bank.status_cache.read().unwrap().root_slot_deltas(),
+        bank.status_cache.root_slot_deltas(),
     );
 
     // Note: Since the snapshot_storages above are *only* the incremental storages,
@@ -940,7 +940,7 @@ mod tests {
         let bank_snapshot_package = BankSnapshotPackage {
             bank_fields: bank.get_fields_to_serialize(),
             bank_hash_stats: bank.get_bank_hash_stats(),
-            status_cache_slot_deltas: bank.status_cache.read().unwrap().root_slot_deltas(),
+            status_cache_slot_deltas: bank.status_cache.root_slot_deltas(),
         };
 
         let snapshot_storages = bank.get_snapshot_storages(None);

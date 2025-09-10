@@ -264,8 +264,6 @@ fn get_default_max_status_cache_entries() -> u64 {
         .unwrap()
         .root_bank()
         .status_cache
-        .read()
-        .unwrap()
         .max_root_entries() as u64
 }
 
@@ -319,11 +317,7 @@ fn test_slots_to_snapshot() {
             .unwrap()
             .root_bank()
             .status_cache
-            .read()
-            .unwrap()
             .roots()
-            .iter()
-            .cloned()
             .sorted();
         assert!(slots_to_snapshot.into_iter().eq(expected_slots_to_snapshot));
     }
@@ -834,7 +828,7 @@ fn test_fastboot_snapshots_teardown(exit_backpressure: bool) {
                 SnapshotKind::Fastboot,
                 &bank,
                 bank.get_snapshot_storages(None),
-                bank.status_cache.read().unwrap().root_slot_deltas(),
+                bank.status_cache.root_slot_deltas(),
             );
             pending_snapshot_packages
                 .lock()

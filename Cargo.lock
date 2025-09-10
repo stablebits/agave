@@ -9982,6 +9982,7 @@ dependencies = [
  "base64 0.22.1",
  "bincode",
  "bitvec",
+ "boxcar",
  "bytemuck",
  "criterion",
  "crossbeam-channel",

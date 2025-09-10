@@ -15,7 +15,7 @@ use {
 #[cfg(not(feature = "shuttle-test"))]
 #[bench]
 fn bench_status_cache_serialize(bencher: &mut Bencher) {
-    let mut status_cache = BankStatusCache::default();
+    let status_cache = BankStatusCache::default();
     status_cache.add_root(0);
     status_cache.clear();
     for hash_index in 0..100 {
@@ -30,7 +30,7 @@ fn bench_status_cache_serialize(bencher: &mut Bencher) {
             status_cache.insert(&blockhash, sig, 0, Ok(()));
         }
     }
-    assert!(status_cache.roots().contains(&0));
+    assert!(status_cache.roots().collect::<Vec<_>>().contains(&0));
     bencher.iter(|| {
         let _ = serialize(&status_cache.root_slot_deltas()).unwrap();
     });
@@ -45,7 +45,7 @@ fn bench_status_cache_serialize_max(bencher: &mut Bencher) {
     let max_root_entries = status_cache.max_root_entries() as u64;
     fill_status_cache(&mut status_cache, max_root_entries, 100_000);
 
-    assert!(status_cache.roots().contains(&0));
+    assert!(status_cache.roots().collect::<Vec<_>>().contains(&0));
     bencher.iter(|| {
         let _ = serialize(&status_cache.root_slot_deltas()).unwrap();
     });
@@ -53,7 +53,7 @@ fn bench_status_cache_serialize_max(bencher: &mut Bencher) {
 
 #[bench]
 fn bench_status_cache_root_slot_deltas(bencher: &mut Bencher) {
-    let mut status_cache = BankStatusCache::default();
+    let status_cache = BankStatusCache::default();
 
     // fill the status cache
     let slots: Vec<_> = (42..).take(status_cache.max_root_entries()).collect();

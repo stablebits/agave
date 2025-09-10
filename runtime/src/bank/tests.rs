@@ -3467,7 +3467,7 @@ fn test_status_cache_ancestors() {
     let (parent, _bank_forks) = create_simple_test_arc_bank(500);
     let bank1 = Arc::new(new_from_parent(parent));
     let mut bank = bank1;
-    let max_root_entries = bank.status_cache.read().unwrap().max_root_entries();
+    let max_root_entries = bank.status_cache.max_root_entries();
     for _ in 0..max_root_entries * 2 {
         bank = Arc::new(new_from_parent(bank));
         bank.squash();
