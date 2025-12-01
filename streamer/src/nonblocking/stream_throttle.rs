@@ -24,7 +24,7 @@ const STREAM_LOAD_EMA_INTERVAL_MS: u64 = 5;
 const STREAM_LOAD_EMA_INTERVAL_COUNT: u64 = 10;
 const EMA_WINDOW_MS: u64 = STREAM_LOAD_EMA_INTERVAL_MS * STREAM_LOAD_EMA_INTERVAL_COUNT;
 
-pub(crate) struct StakedStreamLoadEMA {
+pub struct StakedStreamLoadEMA {
     current_load_ema: AtomicU64,
     load_in_recent_interval: AtomicU64,
     last_update: RwLock<Instant>,
@@ -40,7 +40,7 @@ pub(crate) struct StakedStreamLoadEMA {
 }
 
 impl StakedStreamLoadEMA {
-    pub(crate) fn new(
+    pub fn new(
         stats: Arc<StreamerStats>,
         max_unstaked_connections: usize,
         max_streams_per_ms: u64,
@@ -71,7 +71,7 @@ impl StakedStreamLoadEMA {
         }
     }
 
-    fn ema_function(current_ema: u128, recent_load: u128) -> u128 {
+    pub fn ema_function(current_ema: u128, recent_load: u128) -> u128 {
         // Using the EMA multiplier helps in avoiding the floating point math during EMA related calculations
         const STREAM_LOAD_EMA_MULTIPLIER: u128 = 1024;
         let multiplied_smoothing_factor: u128 =
@@ -87,7 +87,7 @@ impl StakedStreamLoadEMA {
             / STREAM_LOAD_EMA_MULTIPLIER
     }
 
-    fn update_ema(&self, time_since_last_update_ms: u128) {
+    pub fn update_ema(&self, time_since_last_update_ms: u128) {
         // if time_since_last_update_ms > STREAM_LOAD_EMA_INTERVAL_MS, there might be intervals where ema was not updated.
         // count how many updates (1 + missed intervals) are needed.
         let num_extra_updates =
@@ -120,7 +120,7 @@ impl StakedStreamLoadEMA {
             .store(updated_load_ema as usize, Ordering::Relaxed);
     }
 
-    pub(crate) fn update_ema_if_needed(&self) {
+    pub fn update_ema_if_needed(&self) {
         const EMA_DURATION: Duration = Duration::from_millis(STREAM_LOAD_EMA_INTERVAL_MS);
         // Read lock enables multiple connection handlers to run in parallel if interval is not expired
         if Instant::now().duration_since(*self.last_update.read().unwrap()) >= EMA_DURATION {
@@ -134,14 +134,21 @@ impl StakedStreamLoadEMA {
         }
     }
 
-    pub(crate) fn increment_load(&self, peer_type: ConnectionPeerType) {
+    pub fn increment_load(&self, peer_type: ConnectionPeerType) {
         if peer_type.is_staked() {
             self.load_in_recent_interval.fetch_add(1, Ordering::Relaxed);
         }
         self.update_ema_if_needed();
     }
 
-    pub(crate) fn available_load_capacity_in_throttling_duration(
+    pub fn increment_load_by_count(&self, peer_type: ConnectionPeerType, count: u64) {
+        if peer_type.is_staked() {
+            self.load_in_recent_interval.fetch_add(count, Ordering::Relaxed);
+        }
+        self.update_ema_if_needed();
+    }
+
+    pub fn available_load_capacity_in_throttling_duration(
         &self,
         peer_type: ConnectionPeerType,
         total_stake: u64,
@@ -189,6 +196,18 @@ impl StakedStreamLoadEMA {
 
     pub(crate) fn max_streams_per_ms(&self) -> u64 {
         self.max_streams_per_ms
+    }
+
+    pub fn current_load_ema(&self) -> u64 {
+        self.current_load_ema.load(Ordering::Relaxed)
+    }
+
+    pub fn max_staked_load_in_ema_window(&self) -> u64 {
+        self.max_staked_load_in_ema_window
+    }
+
+    pub fn max_unstaked_load_in_throttling_window(&self) -> u64 {
+        self.max_unstaked_load_in_throttling_window
     }
 }
 
