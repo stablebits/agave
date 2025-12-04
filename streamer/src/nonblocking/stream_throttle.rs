@@ -251,9 +251,9 @@ pub(crate) async fn throttle_stream(
             STREAM_THROTTLING_INTERVAL.saturating_sub(throttle_interval_start.elapsed());
 
         if !throttle_duration.is_zero() {
-            debug!(
+            error!(
                 "Throttling {stream_type} stream from {remote_addr:?}, peer type: {peer_type:?}, \
-                 current_load: {current_load}, total_stake: {total_stake},
+                 current_load: {current_load}, total_stake: {total_stake}, \
                  max_streams_per_interval: {max_streams_per_throttling_interval}, \
                  read_interval_streams: {streams_read_in_throttle_interval} throttle_duration: \
                  {throttle_duration:?}"
