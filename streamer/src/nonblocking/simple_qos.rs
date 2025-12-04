@@ -273,6 +273,9 @@ impl QosController<SimpleQosConnectionContext> for SimpleQos {
                 remote_addr,
                 stream_counter,
                 max_streams_per_throttling_interval,
+                0,
+                0,
+                "votes",
             )
             .await;
         }

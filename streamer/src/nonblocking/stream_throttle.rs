@@ -141,6 +141,10 @@ impl StakedStreamLoadEMA {
         self.update_ema_if_needed();
     }
 
+    pub(crate) fn current_load(&self) -> u64 {
+        self.current_load_ema.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn available_load_capacity_in_throttling_duration(
         &self,
         peer_type: ConnectionPeerType,
@@ -234,6 +238,9 @@ pub(crate) async fn throttle_stream(
     remote_addr: std::net::SocketAddr,
     stream_counter: &Arc<ConnectionStreamCounter>,
     max_streams_per_throttling_interval: u64,
+    current_load: u64,
+    total_stake: u64,
+    stream_type: &'static str,
 ) {
     let throttle_interval_start = stream_counter.reset_throttling_params_if_needed();
     let streams_read_in_throttle_interval = stream_counter.stream_count.load(Ordering::Relaxed);
@@ -245,7 +252,8 @@ pub(crate) async fn throttle_stream(
 
         if !throttle_duration.is_zero() {
             debug!(
-                "Throttling stream from {remote_addr:?}, peer type: {peer_type:?}, \
+                "Throttling {stream_type} stream from {remote_addr:?}, peer type: {peer_type:?}, \
+                 current_load: {current_load}, total_stake: {total_stake},
                  max_streams_per_interval: {max_streams_per_throttling_interval}, \
                  read_interval_streams: {streams_read_in_throttle_interval} throttle_duration: \
                  {throttle_duration:?}"

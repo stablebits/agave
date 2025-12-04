@@ -532,6 +532,7 @@ impl QosController<SwQosConnectionContext> for SwQos {
 
             let max_streams_per_throttling_interval =
                 self.max_streams_per_throttling_interval(context);
+            let current_load = self.staked_stream_load_ema.current_load();
 
             throttle_stream(
                 &self.stats,
@@ -539,6 +540,9 @@ impl QosController<SwQosConnectionContext> for SwQos {
                 remote_addr,
                 stream_counter,
                 max_streams_per_throttling_interval,
+                current_load,
+                context.total_stake,
+                "tpu",
             )
             .await;
         }
