@@ -24,6 +24,9 @@ const STREAM_LOAD_EMA_INTERVAL_MS: u64 = 5;
 const STREAM_LOAD_EMA_INTERVAL_COUNT: u64 = 10;
 const EMA_WINDOW_MS: u64 = STREAM_LOAD_EMA_INTERVAL_MS * STREAM_LOAD_EMA_INTERVAL_COUNT;
 
+const UNSTAKED_STREAM_THROTTLING_LOAD_THRESHOLD_PERCENT: u64 = 50;
+const STAKED_STREAM_THROTTLING_LOAD_THRESHOLD_PERCENT: u64 = 50;
+
 pub(crate) struct StakedStreamLoadEMA {
     current_load_ema: AtomicU64,
     load_in_recent_interval: AtomicU64,
@@ -37,6 +40,11 @@ pub(crate) struct StakedStreamLoadEMA {
     // Maximum number of streams for an unstaked connection in stream throttling window
     max_unstaked_load_in_throttling_window: u64,
     max_streams_per_ms: u64,
+
+    // No throttling for staked connections below this load.
+    staked_stream_throttling_load_threshold: u64,
+    // No throttling for unstaked connections below this load.
+    unstaked_stream_throttling_load_threshold: u64,
 }
 
 impl StakedStreamLoadEMA {
@@ -60,6 +68,14 @@ impl StakedStreamLoadEMA {
             0
         };
 
+        let staked_stream_throttling_load_threshold =
+            Percentage::from(STAKED_STREAM_THROTTLING_LOAD_THRESHOLD_PERCENT)
+                .apply_to(max_staked_load_in_ema_window);
+
+        let unstaked_stream_throttling_load_threshold =
+            Percentage::from(UNSTAKED_STREAM_THROTTLING_LOAD_THRESHOLD_PERCENT)
+                .apply_to(max_staked_load_in_ema_window);
+
         Self {
             current_load_ema: AtomicU64::default(),
             load_in_recent_interval: AtomicU64::default(),
@@ -68,6 +84,8 @@ impl StakedStreamLoadEMA {
             max_staked_load_in_ema_window,
             max_unstaked_load_in_throttling_window,
             max_streams_per_ms,
+            staked_stream_throttling_load_threshold,
+            unstaked_stream_throttling_load_threshold,
         }
     }
 
@@ -146,12 +164,37 @@ impl StakedStreamLoadEMA {
         peer_type: ConnectionPeerType,
         total_stake: u64,
     ) -> u64 {
+        let current_load = self.current_load_ema.load(Ordering::Relaxed);
+        match peer_type {
+            ConnectionPeerType::Unstaked => {
+                if current_load < self.unstaked_stream_throttling_load_threshold {
+                    MAX_UNSTAKED_TPS
+                } else {
+                    self.available_throttled_load_capacity(peer_type, total_stake, current_load)
+                }
+            }
+            ConnectionPeerType::Staked(_) => {
+                if current_load < self.staked_stream_throttling_load_threshold {
+                    self.max_streams_per_ms * STREAM_THROTTLING_INTERVAL_MS
+                } else {
+                    self.available_throttled_load_capacity(peer_type, total_stake, current_load)
+                }
+            }
+        }
+    }
+
+    pub fn available_throttled_load_capacity(
+        &self,
+        peer_type: ConnectionPeerType,
+        total_stake: u64,
+        current_load: u64,
+    ) -> u64 {
         match peer_type {
             ConnectionPeerType::Unstaked => self.max_unstaked_load_in_throttling_window,
             ConnectionPeerType::Staked(stake) => {
                 // If the current load is low, cap it to 25% of max_load.
                 let current_load = u128::from(cmp::max(
-                    self.current_load_ema.load(Ordering::Relaxed),
+                    current_load,
                     self.max_staked_load_in_ema_window / 4,
                 ));
 
