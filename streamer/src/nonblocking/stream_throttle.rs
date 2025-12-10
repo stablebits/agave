@@ -24,8 +24,11 @@ const STREAM_LOAD_EMA_INTERVAL_MS: u64 = 5;
 const STREAM_LOAD_EMA_INTERVAL_COUNT: u64 = 10;
 const EMA_WINDOW_MS: u64 = STREAM_LOAD_EMA_INTERVAL_MS * STREAM_LOAD_EMA_INTERVAL_COUNT;
 
-const UNSTAKED_STREAM_THROTTLING_LOAD_THRESHOLD_PERCENT: u64 = 50;
 const STAKED_STREAM_THROTTLING_LOAD_THRESHOLD_PERCENT: u64 = 50;
+
+// Unstaked nodes must contribute to the EMA load for this threshold to be meaningful.
+// See increment_load().
+const UNSTAKED_STREAM_THROTTLING_LOAD_THRESHOLD_PERCENT: u64 = 0;
 
 pub(crate) struct StakedStreamLoadEMA {
     current_load_ema: AtomicU64,
