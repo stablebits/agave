@@ -10,7 +10,7 @@ use {
                 CONNECTION_CLOSE_REASON_EXCEED_MAX_STREAM_COUNT,
             },
             stream_throttle::{
-                throttle_stream, ConnectionStreamCounter, StakedStreamLoadEMA,
+                ConnectionStreamCounter, StakedStreamLoadEMA, STREAM_THROTTLING_INTERVAL,
                 STREAM_THROTTLING_INTERVAL_MS,
             },
         },
@@ -23,10 +23,6 @@ use {
     },
     percentage::Percentage,
     quinn::{Connection, VarInt},
-    solana_quic_definitions::{
-        QUIC_MAX_STAKED_CONCURRENT_STREAMS, QUIC_MAX_UNSTAKED_CONCURRENT_STREAMS,
-        QUIC_MIN_STAKED_CONCURRENT_STREAMS, QUIC_TOTAL_STAKED_CONCURRENT_STREAMS,
-    },
     solana_time_utils as timing,
     std::{
         future::Future,
@@ -34,6 +30,7 @@ use {
             atomic::{AtomicU64, Ordering},
             Arc, RwLock,
         },
+        time::Duration,
     },
     tokio::sync::{Mutex, MutexGuard},
     tokio_util::sync::CancellationToken,
@@ -90,6 +87,8 @@ pub struct SwQosConnectionContext {
     last_update: Arc<AtomicU64>,
     remote_address: std::net::SocketAddr,
     stream_counter: Option<Arc<ConnectionStreamCounter>>,
+    rtt: Duration,
+    max_streams: u64,
 }
 
 impl ConnectionContext for SwQosConnectionContext {
@@ -130,40 +129,13 @@ impl SwQos {
     }
 }
 
-fn compute_max_allowed_uni_streams(peer_type: ConnectionPeerType, total_stake: u64) -> usize {
-    match peer_type {
-        ConnectionPeerType::Staked(peer_stake) => {
-            // No checked math for f64 type. So let's explicitly check for 0 here
-            if total_stake == 0 || peer_stake > total_stake {
-                warn!(
-                    "Invalid stake values: peer_stake: {peer_stake:?}, total_stake: \
-                     {total_stake:?}"
-                );
-
-                QUIC_MIN_STAKED_CONCURRENT_STREAMS
-            } else {
-                let delta = (QUIC_TOTAL_STAKED_CONCURRENT_STREAMS
-                    - QUIC_MIN_STAKED_CONCURRENT_STREAMS) as f64;
-
-                (((peer_stake as f64 / total_stake as f64) * delta) as usize
-                    + QUIC_MIN_STAKED_CONCURRENT_STREAMS)
-                    .clamp(
-                        QUIC_MIN_STAKED_CONCURRENT_STREAMS,
-                        QUIC_MAX_STAKED_CONCURRENT_STREAMS,
-                    )
-            }
-        }
-        ConnectionPeerType::Unstaked => QUIC_MAX_UNSTAKED_CONCURRENT_STREAMS,
-    }
-}
-
 impl SwQos {
     fn cache_new_connection(
         &self,
         client_connection_tracker: ClientConnectionTracker,
         connection: &Connection,
         mut connection_table_l: MutexGuard<ConnectionTable<ConnectionStreamCounter>>,
-        conn_context: &SwQosConnectionContext,
+        conn_context: &mut SwQosConnectionContext,
     ) -> Result<
         (
             Arc<AtomicU64>,
@@ -172,11 +144,8 @@ impl SwQos {
         ),
         ConnectionHandlerError,
     > {
-        if let Ok(max_uni_streams) = VarInt::from_u64(compute_max_allowed_uni_streams(
-            conn_context.peer_type(),
-            conn_context.total_stake,
-        ) as u64)
-        {
+        conn_context.max_streams = self.rtt_adjusted_max_streams(conn_context);
+        if let Ok(max_uni_streams) = VarInt::from_u64(conn_context.max_streams) {
             let remote_addr = connection.remote_address();
 
             debug!(
@@ -251,7 +220,7 @@ impl SwQos {
         connection: &Connection,
         connection_table: Arc<Mutex<ConnectionTable<ConnectionStreamCounter>>>,
         max_connections: usize,
-        conn_context: &SwQosConnectionContext,
+        conn_context: &mut SwQosConnectionContext,
     ) -> Result<
         (
             Arc<AtomicU64>,
@@ -283,6 +252,15 @@ impl SwQos {
         self.staked_stream_load_ema
             .available_load_capacity(conn_context.peer_type, conn_context.total_stake)
     }
+
+    fn rtt_adjusted_max_streams(&self, conn_context: &SwQosConnectionContext) -> u64 {
+        let den = STREAM_THROTTLING_INTERVAL.as_nanos().max(1);
+        let streams = (self.max_streams_per_throttling_interval(conn_context) as u128)
+            .saturating_mul(conn_context.rtt.as_nanos())
+            / den;
+
+        streams.clamp(1, 5000) as u64
+    }
 }
 
 impl QosController<SwQosConnectionContext> for SwQos {
@@ -296,6 +274,8 @@ impl QosController<SwQosConnectionContext> for SwQos {
                 remote_address: connection.remote_address(),
                 stream_counter: None,
                 last_update: Arc::new(AtomicU64::new(timing::timestamp())),
+                rtt: connection.rtt(),
+                max_streams: 0,
             },
             |(pubkey, stake, total_stake)| {
                 // The heuristic is that the stake should be large enough to have 1 stream pass through within one throttle
@@ -322,6 +302,8 @@ impl QosController<SwQosConnectionContext> for SwQos {
                     remote_address: connection.remote_address(),
                     last_update: Arc::new(AtomicU64::new(timing::timestamp())),
                     stream_counter: None,
+                    rtt: connection.rtt(),
+                    max_streams: 0,
                 }
             },
         )
@@ -480,24 +462,40 @@ impl QosController<SwQosConnectionContext> for SwQos {
     }
 
     #[allow(clippy::manual_async_fn)]
-    fn on_new_stream(&self, context: &SwQosConnectionContext) -> impl Future<Output = ()> + Send {
+    fn on_new_stream(
+        &self,
+        context: &mut SwQosConnectionContext,
+        connection: &Connection,
+    ) -> impl Future<Output = ()> + Send {
         async move {
-            let peer_type = context.peer_type();
-            let remote_addr = context.remote_address;
-            let stream_counter: &Arc<ConnectionStreamCounter> =
-                context.stream_counter.as_ref().unwrap();
+            let max_streams = self.rtt_adjusted_max_streams(context);
+            if max_streams != context.max_streams {
+                info!(
+                    "changing max_streams {} -> {}",
+                    context.max_streams, max_streams
+                );
+                context.max_streams = max_streams;
+                if let Ok(max_streams) = VarInt::from_u64(max_streams) {
+                    connection.set_max_concurrent_uni_streams(max_streams);
+                }
+            }
 
-            let max_streams_per_throttling_interval =
-                self.max_streams_per_throttling_interval(context);
+            // let peer_type = context.peer_type();
+            // let remote_addr = context.remote_address;
+            // let stream_counter: &Arc<ConnectionStreamCounter> =
+            //     context.stream_counter.as_ref().unwrap();
 
-            throttle_stream(
-                &self.stats,
-                peer_type,
-                remote_addr,
-                stream_counter,
-                max_streams_per_throttling_interval,
-            )
-            .await;
+            // let max_streams_per_throttling_interval =
+            //     self.max_streams_per_throttling_interval(context);
+
+            // throttle_stream(
+            //     &self.stats,
+            //     peer_type,
+            //     remote_addr,
+            //     stream_counter,
+            //     max_streams_per_throttling_interval,
+            // )
+            // .await;
         }
     }
 
@@ -511,31 +509,4 @@ impl QosController<SwQosConnectionContext> for SwQos {
 #[cfg(test)]
 pub mod test {
     use super::*;
-
-    #[test]
-    fn test_max_allowed_uni_streams() {
-        assert_eq!(
-            compute_max_allowed_uni_streams(ConnectionPeerType::Unstaked, 0),
-            QUIC_MAX_UNSTAKED_CONCURRENT_STREAMS
-        );
-        assert_eq!(
-            compute_max_allowed_uni_streams(ConnectionPeerType::Staked(10), 0),
-            QUIC_MIN_STAKED_CONCURRENT_STREAMS
-        );
-        let delta =
-            (QUIC_TOTAL_STAKED_CONCURRENT_STREAMS - QUIC_MIN_STAKED_CONCURRENT_STREAMS) as f64;
-        assert_eq!(
-            compute_max_allowed_uni_streams(ConnectionPeerType::Staked(1000), 10000),
-            QUIC_MAX_STAKED_CONCURRENT_STREAMS,
-        );
-        assert_eq!(
-            compute_max_allowed_uni_streams(ConnectionPeerType::Staked(100), 10000),
-            ((delta / (100_f64)) as usize + QUIC_MIN_STAKED_CONCURRENT_STREAMS)
-                .min(QUIC_MAX_STAKED_CONCURRENT_STREAMS)
-        );
-        assert_eq!(
-            compute_max_allowed_uni_streams(ConnectionPeerType::Unstaked, 10000),
-            QUIC_MAX_UNSTAKED_CONCURRENT_STREAMS
-        );
-    }
 }

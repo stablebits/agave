@@ -31,7 +31,11 @@ pub(crate) trait QosController<C: ConnectionContext> {
     ) -> impl Future<Output = Option<CancellationToken>> + Send;
 
     /// Called when a new stream is received on a connection
-    fn on_new_stream(&self, context: &C) -> impl Future<Output = ()> + Send;
+    fn on_new_stream(
+        &self,
+        context: &mut C,
+        connection: &Connection,
+    ) -> impl Future<Output = ()> + Send;
 
     /// Called when a stream is accepted on a connection
     fn on_stream_accepted(&self, context: &C);

@@ -595,7 +595,7 @@ async fn handle_connection<Q, C>(
     connection: Connection,
     stats: Arc<StreamerStats>,
     wait_for_chunk_timeout: Duration,
-    context: C,
+    mut context: C,
     qos: Arc<Q>,
     cancel: CancellationToken,
 ) where
@@ -626,7 +626,7 @@ async fn handle_connection<Q, C>(
             _ = cancel.cancelled() => break,
         };
 
-        qos.on_new_stream(&context).await;
+        qos.on_new_stream(&mut context, &connection).await;
         qos.on_stream_accepted(&context);
         stats.active_streams.fetch_add(1, Ordering::Relaxed);
         stats.total_new_streams.fetch_add(1, Ordering::Relaxed);

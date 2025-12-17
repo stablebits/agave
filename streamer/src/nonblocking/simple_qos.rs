@@ -262,7 +262,8 @@ impl QosController<SimpleQosConnectionContext> for SimpleQos {
     #[allow(clippy::manual_async_fn)]
     fn on_new_stream(
         &self,
-        context: &SimpleQosConnectionContext,
+        context: &mut SimpleQosConnectionContext,
+        _connection: &Connection,
     ) -> impl Future<Output = ()> + Send {
         async move {
             let peer_type = context.peer_type();
