@@ -102,6 +102,7 @@ struct PacketAccumulator {
     // array used by handle_connection()
     pub chunks: SmallVec<[Bytes; 4]>,
     pub start_time: Instant,
+    pub elapsed: u64,
 }
 
 impl PacketAccumulator {
@@ -110,6 +111,7 @@ impl PacketAccumulator {
             meta,
             chunks: SmallVec::default(),
             start_time: Instant::now(),
+            elapsed: 0,
         }
     }
 }
@@ -593,6 +595,33 @@ fn track_streamer_fetch_packet_performance(
         .fetch_add(measure.as_us(), Ordering::Relaxed);
 }
 
+// Buckets: 0ms, then 10 buckets of 25ms: [1..=25], [26..=50], ... [226..=250], and an overflow bucket (>250)
+const N_BUCKETS: usize = 11; // 0ms + 10x25ms
+const BUCKET_MS: u64 = 25;
+
+#[derive(Default)]
+struct Hist {
+    buckets: [u64; N_BUCKETS + 1], // +1 overflow
+    count: u64,
+    max: u64,
+    sum: u64,
+}
+
+impl Hist {
+    fn add_ms(&mut self, ms: u64) {
+        self.count += 1;
+        self.sum += ms;
+        self.max = std::cmp::max(self.max, ms);
+        let idx = if ms == 0 {
+            0
+        } else {
+            let i = 1 + ((ms - 1) / BUCKET_MS) as usize; // 1..=10 for 1..=250
+            i.min(N_BUCKETS) // clamp to overflow index (11)
+        };
+        self.buckets[idx] += 1;
+    }
+}
+
 async fn handle_connection<Q, C>(
     packet_sender: Sender<PacketBatch>,
     remote_address: SocketAddr,
@@ -607,13 +636,19 @@ async fn handle_connection<Q, C>(
     C: ConnectionContext + Send + Sync + 'static,
 {
     let peer_type = context.peer_type();
-    debug!(
-        "quic new connection {} streams: {} connections: {}",
-        remote_address,
+    let remote_addr = connection.remote_address();
+    let initial_rtt = connection.rtt().as_millis() as u64;
+    info!(
+        "[hol] quic new connection {} streams: {} connections: {} rtt: {} peer_type: {:?}",
+        remote_addr,
         stats.active_streams.load(Ordering::Relaxed),
         stats.total_connections.load(Ordering::Relaxed),
+        initial_rtt,
+        peer_type,
     );
     stats.total_connections.fetch_add(1, Ordering::Relaxed);
+
+    let mut hist: Hist = Hist::default();
 
     'conn: loop {
         // Wait for new streams. If the peer is disconnected we get a cancellation signal and stop
@@ -635,7 +670,7 @@ async fn handle_connection<Q, C>(
         stats.total_new_streams.fetch_add(1, Ordering::Relaxed);
 
         let mut meta = Meta::default();
-        meta.set_socket_addr(&remote_address);
+        meta.set_socket_addr(&remote_addr);
         meta.set_from_staked_node(matches!(peer_type, ConnectionPeerType::Staked(_)));
         if let Some(pubkey) = context.remote_pubkey() {
             meta.set_remote_pubkey(pubkey);
@@ -712,9 +747,22 @@ async fn handle_connection<Q, C>(
             }
         }
 
+        hist.add_ms(accum.elapsed);
+
         stats.active_streams.fetch_sub(1, Ordering::Relaxed);
         qos.on_stream_closed(&context);
     }
+
+    info! (
+        "[hol] quic closed connection {} rtt: {} peer_type: {:?} count: {} sum: {} max: {} buckets: {:?}",
+        remote_addr,
+        connection.rtt().as_millis(),
+        peer_type,
+        hist.count,
+        hist.sum,
+        hist.max,
+        hist.buckets,
+    );
 
     let removed_connection_count = qos.remove_connection(&context, connection).await;
     if removed_connection_count > 0 {
@@ -774,6 +822,9 @@ fn handle_chunks(
     if n_chunks != 0 {
         return Ok(StreamState::Receiving);
     }
+
+    // Time it took to assemble the stream.
+    accum.elapsed = accum.start_time.elapsed().as_millis() as u64;
 
     if accum.chunks.is_empty() {
         debug!("stream is empty");
