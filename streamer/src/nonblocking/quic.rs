@@ -4,7 +4,7 @@ use {
             connection_rate_limiter::ConnectionRateLimiter,
             qos::{ConnectionContext, OpaqueStreamerCounter, QosController},
         },
-        quic::{configure_server, QuicServerError, QuicStreamerConfig, StreamerStats},
+        quic::{configure_server, Hist, QuicServerError, QuicStreamerConfig, StreamerStats},
         streamer::StakedNodes,
     },
     bytes::{BufMut, Bytes, BytesMut},
@@ -595,33 +595,6 @@ fn track_streamer_fetch_packet_performance(
         .fetch_add(measure.as_us(), Ordering::Relaxed);
 }
 
-// Buckets: 0ms, then 10 buckets of 25ms: [1..=25], [26..=50], ... [226..=250], and an overflow bucket (>250)
-const N_BUCKETS: usize = 11; // 0ms + 10x25ms
-const BUCKET_MS: u64 = 25;
-
-#[derive(Default)]
-struct Hist {
-    buckets: [u64; N_BUCKETS + 1], // +1 overflow
-    count: u64,
-    max: u64,
-    sum: u64,
-}
-
-impl Hist {
-    fn add_ms(&mut self, ms: u64) {
-        self.count += 1;
-        self.sum += ms;
-        self.max = std::cmp::max(self.max, ms);
-        let idx = if ms == 0 {
-            0
-        } else {
-            let i = 1 + ((ms - 1) / BUCKET_MS) as usize; // 1..=10 for 1..=250
-            i.min(N_BUCKETS) // clamp to overflow index (11)
-        };
-        self.buckets[idx] += 1;
-    }
-}
-
 async fn handle_connection<Q, C>(
     packet_sender: Sender<PacketBatch>,
     remote_address: SocketAddr,
@@ -648,7 +621,8 @@ async fn handle_connection<Q, C>(
     );
     stats.total_connections.fetch_add(1, Ordering::Relaxed);
 
-    let mut hist: Hist = Hist::default();
+    let hist: Hist = Hist::default();
+    let mut max_time = 0u64;
 
     'conn: loop {
         // Wait for new streams. If the peer is disconnected we get a cancellation signal and stop
@@ -747,20 +721,21 @@ async fn handle_connection<Q, C>(
             }
         }
 
+        max_time = std::cmp::max(max_time, accum.elapsed);
         hist.add_ms(accum.elapsed);
+        stats.hol_hist.add_ms(accum.elapsed);
 
         stats.active_streams.fetch_sub(1, Ordering::Relaxed);
         qos.on_stream_closed(&context);
     }
 
-    info! (
-        "[hol] quic closed connection {} rtt: {} peer_type: {:?} count: {} sum: {} max: {} buckets: {:?}",
+    info!(
+        "[hol] quic closed connection {} rtt: {} peer_type: {:?} total: {} max: {} buckets: {:?}",
         remote_addr,
         connection.rtt().as_millis(),
         peer_type,
-        hist.count,
-        hist.sum,
-        hist.max,
+        hist.total.load(Ordering::Relaxed),
+        max_time,
         hist.buckets,
     );
 

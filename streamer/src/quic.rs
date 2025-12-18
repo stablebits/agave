@@ -167,6 +167,36 @@ impl NotifyKeyUpdate for EndpointKeyUpdater {
     }
 }
 
+const N_BUCKETS: usize = 11; // 0ms + 10x25ms
+const BUCKET_MS: u64 = 25;
+
+pub struct Hist {
+    pub buckets: [AtomicU64; N_BUCKETS + 1], // +1 overflow
+    pub total: AtomicU64,
+}
+
+impl Default for Hist {
+    fn default() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            total: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Hist {
+    pub fn add_ms(&self, ms: u64) {
+        self.total.fetch_add(ms, Ordering::Relaxed);
+        let idx = if ms == 0 {
+            0
+        } else {
+            let i = 1 + ((ms - 1) / BUCKET_MS) as usize; // 1..=10 for 1..=250
+            i.min(N_BUCKETS) // clamp to overflow index (11)
+        };
+        self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 #[derive(Default)]
 pub struct StreamerStats {
     pub(crate) total_connections: AtomicUsize,
@@ -215,6 +245,7 @@ pub struct StreamerStats {
     pub(crate) stream_load_ema_overflow: AtomicUsize,
     pub(crate) stream_load_capacity_overflow: AtomicUsize,
     pub(crate) process_sampled_packets_us_hist: Mutex<histogram::Histogram>,
+    pub(crate) hol_hist: Hist,
     pub(crate) perf_track_overhead_us: AtomicU64,
     pub(crate) total_staked_packets_sent_for_batching: AtomicUsize,
     pub(crate) total_unstaked_packets_sent_for_batching: AtomicUsize,
@@ -514,6 +545,66 @@ impl StreamerStats {
             (
                 "process_sampled_packets_count",
                 process_sampled_packets_us_hist.entries(),
+                i64
+            ),
+            (
+                "hol_hist_buckets[0]",
+                self.hol_hist.buckets[0].load(Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "hol_hist_buckets[1]",
+                self.hol_hist.buckets[1].load(Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "hol_hist_buckets[2]",
+                self.hol_hist.buckets[2].load(Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "hol_hist_buckets[3]",
+                self.hol_hist.buckets[3].load(Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "hol_hist_buckets[4]",
+                self.hol_hist.buckets[4].load(Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "hol_hist_buckets[5]",
+                self.hol_hist.buckets[5].load(Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "hol_hist_buckets[6]",
+                self.hol_hist.buckets[6].load(Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "hol_hist_buckets[7]",
+                self.hol_hist.buckets[7].load(Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "hol_hist_buckets[8]",
+                self.hol_hist.buckets[8].load(Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "hol_hist_buckets[9]",
+                self.hol_hist.buckets[9].load(Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "hol_hist_buckets[10]",
+                self.hol_hist.buckets[10].load(Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "hol_hist_buckets[11]",
+                self.hol_hist.buckets[11].load(Ordering::Relaxed) as i64,
                 i64
             ),
             (
