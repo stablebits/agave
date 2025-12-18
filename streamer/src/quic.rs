@@ -548,62 +548,67 @@ impl StreamerStats {
                 i64
             ),
             (
-                "hol_hist_buckets[0]",
+                "hol_hist_total",
+                self.hol_hist.total.load(Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "hol_hist_buckets_0",
                 self.hol_hist.buckets[0].load(Ordering::Relaxed) as i64,
                 i64
             ),
             (
-                "hol_hist_buckets[1]",
+                "hol_hist_buckets_1",
                 self.hol_hist.buckets[1].load(Ordering::Relaxed) as i64,
                 i64
             ),
             (
-                "hol_hist_buckets[2]",
+                "hol_hist_buckets_2",
                 self.hol_hist.buckets[2].load(Ordering::Relaxed) as i64,
                 i64
             ),
             (
-                "hol_hist_buckets[3]",
+                "hol_hist_buckets_3",
                 self.hol_hist.buckets[3].load(Ordering::Relaxed) as i64,
                 i64
             ),
             (
-                "hol_hist_buckets[4]",
+                "hol_hist_buckets_4",
                 self.hol_hist.buckets[4].load(Ordering::Relaxed) as i64,
                 i64
             ),
             (
-                "hol_hist_buckets[5]",
+                "hol_hist_buckets_5",
                 self.hol_hist.buckets[5].load(Ordering::Relaxed) as i64,
                 i64
             ),
             (
-                "hol_hist_buckets[6]",
+                "hol_hist_buckets_6",
                 self.hol_hist.buckets[6].load(Ordering::Relaxed) as i64,
                 i64
             ),
             (
-                "hol_hist_buckets[7]",
+                "hol_hist_buckets_7",
                 self.hol_hist.buckets[7].load(Ordering::Relaxed) as i64,
                 i64
             ),
             (
-                "hol_hist_buckets[8]",
+                "hol_hist_buckets_8",
                 self.hol_hist.buckets[8].load(Ordering::Relaxed) as i64,
                 i64
             ),
             (
-                "hol_hist_buckets[9]",
+                "hol_hist_buckets_9",
                 self.hol_hist.buckets[9].load(Ordering::Relaxed) as i64,
                 i64
             ),
             (
-                "hol_hist_buckets[10]",
+                "hol_hist_buckets_10",
                 self.hol_hist.buckets[10].load(Ordering::Relaxed) as i64,
                 i64
             ),
             (
-                "hol_hist_buckets[11]",
+                "hol_hist_buckets_11",
                 self.hol_hist.buckets[11].load(Ordering::Relaxed) as i64,
                 i64
             ),
