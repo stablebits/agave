@@ -363,8 +363,8 @@ protobuf-src = "1.1.0"
 protosol = "2.0.0"
 qstring = "0.7.2"
 qualifier_attr = { version = "0.2.2", default-features = false }
-quinn = { git = "ssh://git@github.com/stablebits/quinn.git", branch = "accept_uni_and_read_to_end-v2" }
-quinn-proto = { git = "ssh://git@github.com/stablebits/quinn.git", branch = "accept_uni_and_read_to_end-v2" }
+quinn = { git = "https://github.com/stablebits/quinn.git", branch = "accept_uni_and_read_to_end-v2" }
+quinn-proto = { git = "https://github.com/stablebits/quinn.git", branch = "accept_uni_and_read_to_end-v2" }
 quote = "1.0"
 rand = "0.9.2"
 rand0-7 = { package = "rand", version = "0.7" }

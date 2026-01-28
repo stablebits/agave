@@ -5817,7 +5817,7 @@ dependencies = [
  "quinn-udp 0.5.14",
  "rustc-hash 2.1.1",
  "rustls 0.23.36",
- "socket2 0.5.10",
+ "socket2 0.6.2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -5827,7 +5827,7 @@ dependencies = [
 [[package]]
 name = "quinn"
 version = "0.12.0"
-source = "git+ssh://git@github.com/stablebits/quinn.git?branch=accept_uni_and_read_to_end-v2#00cb7abdcbe77078bb1536f7d567c28482a5527c"
+source = "git+https://github.com/stablebits/quinn.git?branch=accept_uni_and_read_to_end-v2#00cb7abdcbe77078bb1536f7d567c28482a5527c"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -5836,7 +5836,7 @@ dependencies = [
  "quinn-udp 0.6.0",
  "rustc-hash 2.1.1",
  "rustls 0.23.36",
- "socket2 0.5.10",
+ "socket2 0.6.2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -5867,7 +5867,7 @@ dependencies = [
 [[package]]
 name = "quinn-proto"
 version = "0.12.0"
-source = "git+ssh://git@github.com/stablebits/quinn.git?branch=accept_uni_and_read_to_end-v2#00cb7abdcbe77078bb1536f7d567c28482a5527c"
+source = "git+https://github.com/stablebits/quinn.git?branch=accept_uni_and_read_to_end-v2#00cb7abdcbe77078bb1536f7d567c28482a5527c"
 dependencies = [
  "bytes",
  "fastbloom",
@@ -5895,7 +5895,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.2",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -5903,11 +5903,11 @@ dependencies = [
 [[package]]
 name = "quinn-udp"
 version = "0.6.0"
-source = "git+ssh://git@github.com/stablebits/quinn.git?branch=accept_uni_and_read_to_end-v2#00cb7abdcbe77078bb1536f7d567c28482a5527c"
+source = "git+https://github.com/stablebits/quinn.git?branch=accept_uni_and_read_to_end-v2#00cb7abdcbe77078bb1536f7d567c28482a5527c"
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.5.10",
+ "socket2 0.6.2",
  "tracing",
  "windows-sys 0.61.0",
 ]
