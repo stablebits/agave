@@ -612,14 +612,6 @@ async fn handle_connection<Q, C>(
     let peer_type = context.peer_type();
     let remote_addr = connection.remote_address();
     let initial_rtt = connection.rtt().as_millis() as u64;
-    info!(
-        "[hol] quic new connection {} streams: {} connections: {} rtt: {} peer_type: {:?}",
-        remote_addr,
-        stats.active_streams.load(Ordering::Relaxed),
-        stats.total_connections.load(Ordering::Relaxed),
-        initial_rtt,
-        peer_type,
-    );
     stats.total_connections.fetch_add(1, Ordering::Relaxed);
 
     let hist: Hist = Hist::default();
@@ -686,16 +678,6 @@ async fn handle_connection<Q, C>(
         stats.active_streams.fetch_sub(1, Ordering::Relaxed);
         qos.on_stream_closed(&context);
     }
-
-    info!(
-        "[hol] quic closed connection {} rtt: {} peer_type: {:?} total: {} max: {} buckets: {:?}",
-        remote_addr,
-        connection.rtt().as_millis(),
-        peer_type,
-        hist.total.load(Ordering::Relaxed),
-        max_time,
-        hist.buckets,
-    );
 
     let removed_connection_count = qos.remove_connection(&context, connection).await;
     if removed_connection_count > 0 {
