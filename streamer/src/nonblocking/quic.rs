@@ -4,14 +4,17 @@ use {
             connection_rate_limiter::ConnectionRateLimiter,
             qos::{ConnectionContext, OpaqueStreamerCounter, QosController},
         },
-        quic::{configure_server, QuicServerError, QuicStreamerConfig, StreamerStats},
+        quic::{configure_server, Hist, QuicServerError, QuicStreamerConfig, StreamerStats},
         streamer::StakedNodes,
     },
     bytes::{BufMut, Bytes, BytesMut},
     crossbeam_channel::{Sender, TrySendError},
     futures::{stream::FuturesUnordered, Future, StreamExt as _},
     indexmap::map::{Entry, IndexMap},
-    quinn::{Accept, Connecting, Connection, Endpoint, EndpointConfig, TokioRuntime},
+    quinn::{
+        Accept, AcceptAnyCompleteUniWithDataError, Connecting, Connection, Endpoint,
+        EndpointConfig, TokioRuntime,
+    },
     rand::{rng, Rng},
     smallvec::SmallVec,
     solana_keypair::Keypair,
@@ -24,7 +27,7 @@ use {
     solana_tls_utils::get_pubkey_from_tls_certificate,
     solana_transaction_metrics_tracker::signature_if_should_track_packet,
     std::{
-        array, fmt,
+        fmt,
         iter::repeat_with,
         net::{IpAddr, SocketAddr, UdpSocket},
         pin::Pin,
@@ -102,6 +105,7 @@ struct PacketAccumulator {
     // array used by handle_connection()
     pub chunks: SmallVec<[Bytes; 4]>,
     pub start_time: Instant,
+    pub elapsed: u64,
 }
 
 impl PacketAccumulator {
@@ -110,6 +114,7 @@ impl PacketAccumulator {
             meta,
             chunks: SmallVec::default(),
             start_time: Instant::now(),
+            elapsed: 0,
         }
     }
 }
@@ -508,7 +513,6 @@ async fn setup_connection<Q, C>(
                         from,
                         new_connection,
                         stats,
-                        server_params.wait_for_chunk_timeout,
                         conn_context.clone(),
                         qos,
                         cancel_connection,
@@ -598,7 +602,6 @@ async fn handle_connection<Q, C>(
     remote_address: SocketAddr,
     connection: Connection,
     stats: Arc<StreamerStats>,
-    wait_for_chunk_timeout: Duration,
     context: C,
     qos: Arc<Q>,
     cancel: CancellationToken,
@@ -607,23 +610,30 @@ async fn handle_connection<Q, C>(
     C: ConnectionContext + Send + Sync + 'static,
 {
     let peer_type = context.peer_type();
-    debug!(
-        "quic new connection {} streams: {} connections: {}",
-        remote_address,
-        stats.active_streams.load(Ordering::Relaxed),
-        stats.total_connections.load(Ordering::Relaxed),
-    );
+    let remote_addr = connection.remote_address();
+    let initial_rtt = connection.rtt().as_millis() as u64;
     stats.total_connections.fetch_add(1, Ordering::Relaxed);
 
+    let hist: Hist = Hist::default();
+    let mut max_time = 0u64;
+    let mut data: Vec<Bytes> = Vec::with_capacity(4);
+
     'conn: loop {
-        // Wait for new streams. If the peer is disconnected we get a cancellation signal and stop
-        // the connection task.
-        let mut stream = select! {
-            stream = connection.accept_uni() => match stream {
-                Ok(stream) => stream,
-                Err(e) => {
-                    debug!("stream error: {e:?}");
+        // Wait for a complete unidirectional stream. This accepts and reads the entire stream
+        // in a single operation, avoiding head-of-line blocking from incremental reads.
+        let _stream_id = select! {
+            result = connection.accept_any_complete_uni_with_data(&mut data) => match result {
+                Ok(stream_id) => stream_id,
+                Err(AcceptAnyCompleteUniWithDataError::ConnectionLost(e)) => {
+                    debug!("connection lost: {e:?}");
                     break;
+                }
+                Err(AcceptAnyCompleteUniWithDataError::Reset { stream_id, error_code }) => {
+                    debug!("stream {stream_id} reset with error code {error_code}");
+                    stats
+                        .total_stream_read_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
             },
             _ = cancel.cancelled() => break,
@@ -635,82 +645,35 @@ async fn handle_connection<Q, C>(
         stats.total_new_streams.fetch_add(1, Ordering::Relaxed);
 
         let mut meta = Meta::default();
-        meta.set_socket_addr(&remote_address);
+        meta.set_socket_addr(&remote_addr);
         meta.set_from_staked_node(matches!(peer_type, ConnectionPeerType::Staked(_)));
         if let Some(pubkey) = context.remote_pubkey() {
             meta.set_remote_pubkey(pubkey);
         }
 
         let mut accum = PacketAccumulator::new(meta);
-        // Virtually all small transactions will fit in 1 chunk. Larger transactions will fit in 1
-        // or 2 chunks if the first chunk starts towards the end of a datagram. A small number of
-        // transaction will have other protocol frames inserted in the middle. Empirically it's been
-        // observed that 4 is the maximum number of chunks txs get split into.
-        //
-        // Bytes values are small, so overall the array takes only 128 bytes, and the "cost" of
-        // overallocating a few bytes is negligible compared to the cost of having to do multiple
-        // read_chunks() calls.
-        let mut chunks: [Bytes; 4] = array::from_fn(|_| Bytes::new());
 
-        loop {
-            // Read the next chunks, waiting up to `wait_for_chunk_timeout`. If we don't get chunks
-            // before then, we assume the stream is dead. This can only happen if there's severe
-            // packet loss or the peer stops sending for whatever reason.
-            let n_chunks = match tokio::select! {
-                chunk = tokio::time::timeout(
-                    wait_for_chunk_timeout,
-                    stream.read_chunks(&mut chunks)) => chunk,
-
-                // If the peer gets disconnected stop the task right away.
-                _ = cancel.cancelled() => break,
-            } {
-                // read_chunk returned success
-                Ok(Ok(chunk)) => chunk.unwrap_or(0),
-                // read_chunk returned error
-                Ok(Err(e)) => {
-                    debug!("Received stream error: {e:?}");
-                    stats
-                        .total_stream_read_errors
-                        .fetch_add(1, Ordering::Relaxed);
-                    break;
-                }
-                // timeout elapsed
-                Err(_) => {
-                    debug!("Timeout in receiving on stream");
-                    stats
-                        .total_stream_read_timeouts
-                        .fetch_add(1, Ordering::Relaxed);
-                    break;
-                }
-            };
-
-            match handle_chunks(
-                // Bytes::clone() is a cheap atomic inc
-                chunks.iter().take(n_chunks).cloned(),
-                &mut accum,
-                &packet_sender,
-                &stats,
-                peer_type,
-            ) {
-                // The stream is finished, break out of the loop and close the stream.
-                Ok(StreamState::Finished) => {
-                    qos.on_stream_finished(&context);
-                    break;
-                }
-                // The stream is still active, continue reading.
-                Ok(StreamState::Receiving) => {}
-                Err(_) => {
-                    // Disconnect peers that send invalid streams.
-                    connection.close(
-                        CONNECTION_CLOSE_CODE_INVALID_STREAM.into(),
-                        CONNECTION_CLOSE_REASON_INVALID_STREAM,
-                    );
-                    stats.active_streams.fetch_sub(1, Ordering::Relaxed);
-                    qos.on_stream_error(&context);
-                    break 'conn;
-                }
+        match handle_stream_data(&mut data, &mut accum, &packet_sender, &stats, peer_type) {
+            Ok(()) => {
+                qos.on_stream_finished(&context);
+            }
+            Err(StreamError::InvalidStream) => {
+                connection.close(
+                    CONNECTION_CLOSE_CODE_INVALID_STREAM.into(),
+                    CONNECTION_CLOSE_REASON_INVALID_STREAM,
+                );
+                stats.active_streams.fetch_sub(1, Ordering::Relaxed);
+                qos.on_stream_error(&context);
+                break 'conn;
+            }
+            Err(StreamError::EmptyStream) => {
+                // empty stream, just skip
             }
         }
+
+        max_time = std::cmp::max(max_time, accum.elapsed);
+        hist.add_ms(accum.elapsed);
+        stats.hol_hist.add_ms(accum.elapsed);
 
         stats.active_streams.fetch_sub(1, Ordering::Relaxed);
         qos.on_stream_closed(&context);
@@ -729,34 +692,26 @@ async fn handle_connection<Q, C>(
     stats.total_connections.fetch_sub(1, Ordering::Relaxed);
 }
 
-enum StreamState {
-    // Stream is not finished, keep receiving chunks
-    Receiving,
-    // Stream is finished
-    Finished,
+enum StreamError {
+    InvalidStream,
+    EmptyStream,
 }
 
-// Handle the chunks received from the stream. If the stream is finished, send the packet to the
-// packet sender.
-//
-// Returns Err(()) if the stream is invalid.
-fn handle_chunks(
-    chunks: impl ExactSizeIterator<Item = Bytes>,
+// Handle complete stream data received via accept_any_complete_uni_with_data().
+// All chunks for the stream are already available.
+fn handle_stream_data(
+    data: &mut Vec<Bytes>,
     accum: &mut PacketAccumulator,
     packet_sender: &Sender<PacketBatch>,
     stats: &StreamerStats,
     peer_type: ConnectionPeerType,
-) -> Result<StreamState, ()> {
-    let n_chunks = chunks.len();
-    for chunk in chunks {
+) -> Result<(), StreamError> {
+    for chunk in data.drain(..) {
         accum.meta.size += chunk.len();
         if accum.meta.size > PACKET_DATA_SIZE {
-            // The stream window size is set to PACKET_DATA_SIZE, so one individual chunk can
-            // never exceed this size. A peer can send two chunks that together exceed the size
-            // tho, in which case we report the error.
             stats.invalid_stream_size.fetch_add(1, Ordering::Relaxed);
             debug!("invalid stream size {}", accum.meta.size);
-            return Err(());
+            return Err(StreamError::InvalidStream);
         }
         accum.chunks.push(chunk);
         if peer_type.is_staked() {
@@ -770,17 +725,14 @@ fn handle_chunks(
         }
     }
 
-    // n_chunks == 0 marks the end of a stream
-    if n_chunks != 0 {
-        return Ok(StreamState::Receiving);
-    }
+    accum.elapsed = accum.start_time.elapsed().as_millis() as u64;
 
     if accum.chunks.is_empty() {
         debug!("stream is empty");
         stats
             .total_packet_batches_none
             .fetch_add(1, Ordering::Relaxed);
-        return Err(());
+        return Err(StreamError::EmptyStream);
     }
 
     // done receiving chunks
@@ -860,7 +812,7 @@ fn handle_chunks(
         trace!("sent {bytes_sent} byte packet for batching");
     }
 
-    Ok(StreamState::Finished)
+    Ok(())
 }
 
 struct ConnectionEntry<S: OpaqueStreamerCounter> {
