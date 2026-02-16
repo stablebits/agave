@@ -26,6 +26,7 @@ solana-keypair = { workspace = true }
 solana-measure = { workspace = true }
 solana-metrics = { workspace = true }
 solana-net-utils = { workspace = true }
+solana-packet = { workspace = true }
 solana-pubkey = { workspace = true, default-features = false }
 solana-rpc-client-api = { workspace = true }
 solana-signer = { workspace = true }
@@ -39,7 +40,6 @@ tokio = { workspace = true, features = ["full"] }
 agave-logger = { workspace = true }
 crossbeam-channel = { workspace = true }
 solana-net-utils = { workspace = true, features = ["dev-context-only-utils"] }
-solana-packet = { workspace = true }
 solana-perf = { workspace = true }
 solana-quic-client = { path = ".", features = ["agave-unstable-api"] }
 solana-streamer = { workspace = true, features = ["dev-context-only-utils"] }
