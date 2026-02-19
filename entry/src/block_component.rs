@@ -130,7 +130,7 @@
 /// └─────────────────────────────────────────┘
 /// ```
 use {
-    crate::entry::Entry,
+    crate::entry::{Entry, MaxDataShredsLen},
     agave_votor_messages::consensus_message::{Certificate, CertificateType},
     solana_bls_signatures::{
         Signature as BLSSignature, SignatureCompressed as BLSSignatureCompressed,
@@ -139,55 +139,14 @@ use {
     solana_hash::Hash,
     std::mem::MaybeUninit,
     wincode::{
+        config::{Config, DefaultConfig},
         containers::{Pod, Vec as WincodeVec},
         error::write_length_encoding_overflow,
         io::{Reader, Writer},
-        len::{BincodeLen, SeqLen},
+        len::{BincodeLen, FixIntLen},
         ReadResult, SchemaRead, SchemaWrite, WriteResult,
     },
 };
-
-/// 1-byte length prefix (max 255 elements).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct U8Len;
-
-impl SeqLen for U8Len {
-    fn read<'de, T>(reader: &mut impl Reader<'de>) -> ReadResult<usize> {
-        u8::get(reader).map(|len| len as usize)
-    }
-
-    fn write(writer: &mut impl Writer, len: usize) -> WriteResult<()> {
-        let Ok(len) = len.try_into() else {
-            return Err(write_length_encoding_overflow("u8::MAX"));
-        };
-        Ok(writer.write(&[len])?)
-    }
-
-    fn write_bytes_needed(_len: usize) -> WriteResult<usize> {
-        Ok(1)
-    }
-}
-
-/// 2-byte length prefix (max 65535 elements).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct U16Len;
-
-impl SeqLen for U16Len {
-    fn read<'de, T>(reader: &mut impl Reader<'de>) -> ReadResult<usize> {
-        u16::get(reader).map(|len| len as usize)
-    }
-
-    fn write(writer: &mut impl Writer, len: usize) -> WriteResult<()> {
-        let Ok(len): Result<u16, _> = len.try_into() else {
-            return Err(write_length_encoding_overflow("u16::MAX"));
-        };
-        Ok(writer.write(&len.to_le_bytes())?)
-    }
-
-    fn write_bytes_needed(_len: usize) -> WriteResult<usize> {
-        Ok(2)
-    }
-}
 
 /// Placeholder for skip reward certificate.
 #[derive(Clone, PartialEq, Eq, Debug, SchemaWrite, SchemaRead)]
@@ -204,13 +163,16 @@ pub struct NotarRewardCertificate {
 /// Wraps a value with a u16 length prefix for TLV-style serialization.
 ///
 /// The length prefix represents the serialized byte size of the inner value.
-#[derive(Debug, Clone, PartialEq, Eq, SchemaWrite, SchemaRead)]
-pub struct LengthPrefixed<T: SchemaWrite<Src = T> + for<'a> SchemaRead<'a, Dst = T>> {
+#[derive(Debug, Clone, PartialEq, Eq, SchemaRead, SchemaWrite)]
+pub struct LengthPrefixed<T> {
     len: u16,
     inner: T,
 }
 
-impl<T: SchemaWrite<Src = T> + for<'a> SchemaRead<'a, Dst = T>> LengthPrefixed<T> {
+impl<T> LengthPrefixed<T>
+where
+    T: SchemaWrite<DefaultConfig, Src = T>,
+{
     pub fn new(inner: T) -> Self {
         let inner_size = T::size_of(&inner).unwrap();
         let len = inner_size
@@ -219,7 +181,9 @@ impl<T: SchemaWrite<Src = T> + for<'a> SchemaRead<'a, Dst = T>> LengthPrefixed<T
             .unwrap();
         Self { len, inner }
     }
+}
 
+impl<T> LengthPrefixed<T> {
     pub fn inner(&self) -> &T {
         &self.inner
     }
@@ -243,7 +207,7 @@ pub struct BlockFooterV1 {
     #[wincode(with = "Pod<Hash>")]
     pub bank_hash: Hash,
     pub block_producer_time_nanos: u64,
-    #[wincode(with = "WincodeVec<u8, U8Len>")]
+    #[wincode(with = "WincodeVec<u8, FixIntLen<u8>>")]
     pub block_user_agent: Vec<u8>,
     pub final_cert: Option<FinalCertificate>,
     pub skip_reward_cert: Option<SkipRewardCertificate>,
@@ -342,7 +306,7 @@ impl FinalCertificate {
 pub struct VotesAggregate {
     #[wincode(with = "Pod<BLSSignatureCompressed>")]
     signature: BLSSignatureCompressed,
-    #[wincode(with = "WincodeVec<u8, U16Len>")]
+    #[wincode(with = "WincodeVec<u8, FixIntLen<u16>>")]
     bitmap: Vec<u8>,
 }
 
@@ -509,34 +473,38 @@ impl BlockComponent {
     }
 }
 
-impl SchemaWrite for BlockComponent {
+unsafe impl<C: Config> SchemaWrite<C> for BlockComponent {
     type Src = Self;
 
     fn size_of(src: &Self::Src) -> WriteResult<usize> {
         match src {
-            Self::EntryBatch(entries) => <Vec<Entry>>::size_of(entries),
+            Self::EntryBatch(entries) => {
+                <WincodeVec<Entry, MaxDataShredsLen> as SchemaWrite<C>>::size_of(entries)
+            }
             Self::BlockMarker(marker) => {
-                let marker_size = VersionedBlockMarker::size_of(marker)?;
+                let marker_size = <VersionedBlockMarker as SchemaWrite<C>>::size_of(marker)?;
                 Ok(Self::ENTRY_COUNT_SIZE + marker_size)
             }
         }
     }
 
-    fn write(writer: &mut impl Writer, src: &Self::Src) -> WriteResult<()> {
+    fn write(mut writer: impl Writer, src: &Self::Src) -> WriteResult<()> {
         match src {
-            Self::EntryBatch(entries) => <Vec<Entry>>::write(writer, entries),
+            Self::EntryBatch(entries) => {
+                <WincodeVec<Entry, MaxDataShredsLen> as SchemaWrite<C>>::write(writer, entries)
+            }
             Self::BlockMarker(marker) => {
                 writer.write(&0u64.to_le_bytes())?;
-                VersionedBlockMarker::write(writer, marker)
+                <VersionedBlockMarker as SchemaWrite<C>>::write(writer, marker)
             }
         }
     }
 }
 
-impl<'de> SchemaRead<'de> for BlockComponent {
+unsafe impl<'de, C: Config> SchemaRead<'de, C> for BlockComponent {
     type Dst = Self;
 
-    fn read(reader: &mut impl Reader<'de>, dst: &mut MaybeUninit<Self::Dst>) -> ReadResult<()> {
+    fn read(mut reader: impl Reader<'de>, dst: &mut MaybeUninit<Self::Dst>) -> ReadResult<()> {
         // Read the entry count (first 8 bytes) to determine variant
         let count_bytes = reader.fill_array::<8>()?;
         let entry_count = u64::from_le_bytes(*count_bytes);
@@ -545,9 +513,12 @@ impl<'de> SchemaRead<'de> for BlockComponent {
             // This is a BlockMarker - consume the count bytes and read the marker
             // SAFETY: fill_array::<8>() above guarantees at least 8 bytes are available
             unsafe { reader.consume_unchecked(8) };
-            dst.write(Self::BlockMarker(VersionedBlockMarker::get(reader)?));
+            dst.write(Self::BlockMarker(<VersionedBlockMarker as SchemaRead<
+                C,
+            >>::get(reader)?));
         } else {
-            let entries: Vec<Entry> = <Vec<Entry>>::get(reader)?;
+            let entries: Vec<Entry> =
+                <WincodeVec<Entry, MaxDataShredsLen> as SchemaRead<'de, C>>::get(reader)?;
 
             if entries.len() >= Self::MAX_ENTRIES {
                 return Err(wincode::ReadError::Custom("Too many entries"));
@@ -562,7 +533,7 @@ impl<'de> SchemaRead<'de> for BlockComponent {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, std::iter::repeat_n};
+    use {super::*, std::iter::repeat_n, wincode::config::DEFAULT_PREALLOCATION_SIZE_LIMIT};
 
     fn mock_entries(n: usize) -> Vec<Entry> {
         repeat_n(Entry::default(), n).collect()
@@ -623,6 +594,18 @@ mod tests {
         assert_eq!(comp, deser);
 
         let comp = BlockComponent::new_block_marker(marker);
+        let bytes = wincode::serialize(&comp).unwrap();
+        let deser: BlockComponent = wincode::deserialize(&bytes).unwrap();
+        assert_eq!(comp, deser);
+    }
+
+    #[test]
+    fn large_entry_batch_round_trips() {
+        // Ensure an EntryBatch that exceeds wincode's default 4 MiB prealloc
+        // limit can still round-trip.
+        let num_entries = DEFAULT_PREALLOCATION_SIZE_LIMIT / std::mem::size_of::<Entry>() + 1;
+
+        let comp = BlockComponent::new_entry_batch(mock_entries(num_entries)).unwrap();
         let bytes = wincode::serialize(&comp).unwrap();
         let deser: BlockComponent = wincode::deserialize(&bytes).unwrap();
         assert_eq!(comp, deser);
