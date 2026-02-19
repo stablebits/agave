@@ -756,8 +756,16 @@ async fn handle_connection<Q, C>(
                                 qos.on_stream_finished(&context);
                             }
                             _ => {
-                                // Empty stream or error on finalization.
+                                // Empty stream or error on finalization —
+                                // disconnect the peer (matches Data path).
+                                connection.close(
+                                    CONNECTION_CLOSE_CODE_INVALID_STREAM.into(),
+                                    CONNECTION_CLOSE_REASON_INVALID_STREAM,
+                                );
+                                slots[i].deactivate();
+                                stats.active_streams.fetch_sub(1, Ordering::Relaxed);
                                 qos.on_stream_error(&context);
+                                break 'conn;
                             }
                         }
                         slots[i].deactivate();
@@ -801,7 +809,6 @@ async fn handle_connection<Q, C>(
                                     CONNECTION_CLOSE_REASON_INVALID_STREAM,
                                 );
                                 slots[i].deactivate();
-                                active_count -= 1;
                                 stats.active_streams.fetch_sub(1, Ordering::Relaxed);
                                 qos.on_stream_error(&context);
                                 break 'conn;
@@ -2187,6 +2194,38 @@ pub mod test {
             _ => panic!("unexpected close"),
         }
         assert_eq!(stats.invalid_stream_size.load(Ordering::Relaxed), 1);
+        cancel.cancel();
+        join_handle.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_client_connection_close_empty_stream() {
+        let SpawnTestServerResult {
+            join_handle,
+            server_address,
+            stats,
+            cancel,
+            ..
+        } = setup_quic_server(
+            None,
+            QuicStreamerConfig::default_for_tests(),
+            SwQosConfig::default(),
+        );
+
+        let client_connection = make_client_endpoint(&server_address, None).await;
+
+        // Open a stream and immediately finish it without writing any data.
+        let mut send_stream = client_connection.open_uni().await.unwrap();
+        send_stream.finish().unwrap();
+
+        match client_connection.closed().await {
+            ConnectionError::ApplicationClosed(ApplicationClose { error_code, reason }) => {
+                assert_eq!(error_code, CONNECTION_CLOSE_CODE_INVALID_STREAM.into());
+                assert_eq!(reason, CONNECTION_CLOSE_REASON_INVALID_STREAM);
+            }
+            _ => panic!("unexpected close"),
+        }
+        assert_eq!(stats.total_new_streams.load(Ordering::Relaxed), 1);
         cancel.cancel();
         join_handle.await.unwrap();
     }
