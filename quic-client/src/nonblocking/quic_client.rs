@@ -7,9 +7,9 @@ use {
     futures::future::TryFutureExt,
     log::*,
     quinn::{
-        congestion::CubicConfig, crypto::rustls::QuicClientConfig, ClientConfig, ClosedStream,
-        ConnectError, Connection, ConnectionError, Endpoint, EndpointConfig, IdleTimeout,
-        TokioRuntime, TransportConfig, WriteError,
+        crypto::rustls::QuicClientConfig, ClientConfig, ClosedStream, ConnectError, Connection,
+        ConnectionError, Endpoint, EndpointConfig, IdleTimeout, TokioRuntime, TransportConfig,
+        WriteError,
     },
     solana_connection_cache::{
         client_connection::ClientStats, connection_cache_stats::ConnectionCacheStats,
@@ -36,7 +36,6 @@ use {
 };
 
 const QUIC_KEEP_ALIVE: Duration = Duration::from_secs(1);
-const INITIAL_CONGESTION_WINDOW: u64 = 128 * solana_packet::PACKET_DATA_SIZE as u64;
 
 // Based on commonly-used handshake timeouts for various TCP
 // applications. Different applications vary, but most seem to
@@ -114,9 +113,6 @@ impl QuicLazyInitializedEndpoint {
         transport_config.max_idle_timeout(Some(timeout));
         transport_config.keep_alive_interval(Some(QUIC_KEEP_ALIVE));
         transport_config.send_fairness(false);
-        let mut cubic = CubicConfig::default();
-        cubic.initial_window(INITIAL_CONGESTION_WINDOW);
-        transport_config.congestion_controller_factory(Arc::new(cubic));
         config.transport_config(Arc::new(transport_config));
 
         endpoint.set_default_client_config(config);

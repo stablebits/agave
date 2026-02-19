@@ -101,8 +101,7 @@ pub struct ConnectionWorkersSchedulerConfig {
     /// Configures the number of leaders to connect to and send transactions to.
     pub leaders_fanout: Fanout,
 
-    /// Initial congestion window size in bytes. If `None`, uses
-    /// `DEFAULT_INITIAL_CONGESTION_WINDOW`.
+    /// Initial congestion window size in bytes. If `None`, uses quinn's default.
     pub initial_congestion_window: Option<u64>,
 }
 

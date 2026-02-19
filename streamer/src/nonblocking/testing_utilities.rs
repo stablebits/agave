@@ -34,6 +34,7 @@ use {
 /// connection timeout and keep-alive is not strictly necessary. But for longer running tests, it
 /// makes sense to have keep-alive enable and set the value to be around half of the connection timeout.
 const QUIC_KEEP_ALIVE_FOR_TESTS: Duration = Duration::from_secs(5);
+/// Allow bursting 128 transactions at connection start (subject to flow control restrictions).
 const INITIAL_CONGESTION_WINDOW: u64 = 128 * solana_packet::PACKET_DATA_SIZE as u64;
 
 /// Spawn a streamer instance in the current tokio runtime.

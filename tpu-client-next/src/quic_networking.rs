@@ -29,8 +29,8 @@ pub const QUIC_KEEP_ALIVE: Duration = Duration::from_secs(1);
 
 /// Default QUIC approach is arguably overly conservative for short-lived, latency-sensitive flows.
 /// Modern CDNs routinely use much larger initial congestion windows to avoid slow start dominating
-/// transfer time. A larger initial congestion window allows sending more data at connection start
-/// without waiting for slow-start ramp-up, improving transaction throughput.
+/// transfer time. Allow bursting 128 transactions at connection start (subject to flow control
+/// restrictions).
 pub const INITIAL_CONGESTION_WINDOW: u64 = 128 * solana_packet::PACKET_DATA_SIZE as u64;
 
 pub(crate) fn create_client_config(
