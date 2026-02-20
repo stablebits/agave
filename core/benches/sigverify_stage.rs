@@ -43,91 +43,6 @@ where
     }
 }
 
-fn run_bench_packet_discard(num_ips: usize, bencher: &mut Bencher) {
-    agave_logger::setup();
-    let len = 30 * 1000;
-    let chunk_size = 1024;
-    let tx = test_tx();
-    let mut batches = to_packet_batches(&vec![tx; len], chunk_size);
-
-    let mut total = 0;
-
-    let ips: Vec<_> = (0..num_ips)
-        .map(|_| {
-            let mut addr = [0u16; 8];
-            rng().fill(&mut addr);
-            std::net::IpAddr::from(addr)
-        })
-        .collect();
-
-    for batch in batches.iter_mut() {
-        total += batch.len();
-        for mut p in batch.iter_mut() {
-            let ip_index = rng().random_range(0..ips.len());
-            p.meta_mut().addr = ips[ip_index];
-        }
-    }
-    info!("total packets: {total}");
-
-    bencher.iter(move || {
-        SigVerifyStage::discard_excess_packets(&mut batches, 10_000);
-        let mut num_packets = 0;
-        for batch in batches.iter_mut() {
-            for mut p in batch.iter_mut() {
-                if !p.meta().discard() {
-                    num_packets += 1;
-                }
-                p.meta_mut().set_discard(false);
-            }
-        }
-        assert_eq!(num_packets, 10_000);
-    });
-}
-
-fn bench_packet_discard_many_senders(bencher: &mut Bencher) {
-    run_bench_packet_discard(1000, bencher);
-}
-
-fn bench_packet_discard_single_sender(bencher: &mut Bencher) {
-    run_bench_packet_discard(1, bencher);
-}
-
-fn bench_packet_discard_mixed_senders(bencher: &mut Bencher) {
-    const SIZE: usize = 30 * 1000;
-    const CHUNK_SIZE: usize = 1024;
-    fn new_rand_addr<R: Rng>(rng: &mut R) -> std::net::IpAddr {
-        let mut addr = [0u16; 8];
-        rng.fill(&mut addr);
-        std::net::IpAddr::from(addr)
-    }
-    let mut rng = rng();
-    let mut batches = to_packet_batches(&vec![test_tx(); SIZE], CHUNK_SIZE);
-    let spam_addr = new_rand_addr(&mut rng);
-    for batch in batches.iter_mut() {
-        for mut packet in batch.iter_mut() {
-            // One spam address, ~1000 unique addresses.
-            packet.meta_mut().addr = if rng.random_ratio(1, 30) {
-                new_rand_addr(&mut rng)
-            } else {
-                spam_addr
-            }
-        }
-    }
-    bencher.iter(move || {
-        SigVerifyStage::discard_excess_packets(&mut batches, 10_000);
-        let mut num_packets = 0;
-        for batch in batches.iter_mut() {
-            for mut packet in batch.iter_mut() {
-                if !packet.meta().discard() {
-                    num_packets += 1;
-                }
-                packet.meta_mut().set_discard(false);
-            }
-        }
-        assert_eq!(num_packets, 10_000);
-    });
-}
-
 fn gen_batches(use_same_tx: bool) -> Vec<PacketBatch> {
     let len = 4096;
     let chunk_size = 1024;
@@ -247,11 +162,11 @@ fn bench_shrink_sigverify_stage_core(bencher: &mut Bencher, discard_factor: i32)
 
     bencher.iter(|| {
         let batches = batches0.clone();
-        let (pre_shrink_time_us, _pre_shrink_total, batches) =
+        let (pre_shrink_time_us, _pre_shrink_total, mut batches) =
             SigVerifyStage::maybe_shrink_batches(batches);
 
         let mut verify_time = Measure::start("sigverify_batch_time");
-        let _batches = verifier.verify_batches(batches, num_valid_packets);
+        verifier.verify_batches(&mut batches, num_valid_packets);
         verify_time.stop();
 
         c += 1;
@@ -272,27 +187,6 @@ const BENCH_CASES_SHRINK_SIGVERIFY_STAGE_CORE: &[i32] = &[0, 10, 20, 30, 40, 50,
 
 fn benches() -> Vec<TestDescAndFn> {
     let mut benches = vec![
-        TestDescAndFn {
-            desc: TestDesc {
-                name: Cow::from("bench_packet_discard_many_senders"),
-                ignore: false,
-            },
-            testfn: TestFn::StaticBenchFn(bench_packet_discard_many_senders),
-        },
-        TestDescAndFn {
-            desc: TestDesc {
-                name: Cow::from("bench_packet_discard_single_sender"),
-                ignore: false,
-            },
-            testfn: TestFn::StaticBenchFn(bench_packet_discard_single_sender),
-        },
-        TestDescAndFn {
-            desc: TestDesc {
-                name: Cow::from("bench_packet_discard_mixed_senders"),
-                ignore: false,
-            },
-            testfn: TestFn::StaticBenchFn(bench_packet_discard_mixed_senders),
-        },
         TestDescAndFn {
             desc: TestDesc {
                 name: Cow::from("bench_sigverify_stage_with_same_tx"),

@@ -7,8 +7,7 @@
 use {
     crate::sigverify,
     core::time::Duration,
-    crossbeam_channel::{Receiver, RecvTimeoutError, SendError},
-    itertools::Itertools,
+    crossbeam_channel::{Receiver, RecvTimeoutError, SendError, TryRecvError},
     solana_measure::measure::Measure,
     solana_perf::{
         deduper::{self, Deduper},
@@ -17,8 +16,7 @@ use {
             count_discarded_packets, count_packets_in_batches, count_valid_packets, shrink_batches,
         },
     },
-    solana_streamer::streamer::{self, StreamerError},
-    solana_time_utils as timing,
+    solana_streamer::streamer::StreamerError,
     std::{
         thread::{self, Builder, JoinHandle},
         time::Instant,
@@ -26,13 +24,7 @@ use {
     thiserror::Error,
 };
 
-// Try to target 50ms, rough timings from mainnet machines
-//
-// 50ms/(300ns/packet) = 166666 packets ~ 1300 batches
-const MAX_DEDUP_BATCH: usize = 165_000;
-
-// 50ms/(10us/packet) = 5000 packets
-const MAX_SIGVERIFY_BATCH: usize = 5_000;
+const VERIFY_BATCH_TARGET: usize = 1000;
 
 // Packet batch shrinker will reorganize packets into compacted batches if 10%
 // or more of the packets in a group of packet batches have been discarded.
@@ -55,7 +47,7 @@ pub struct SigVerifyStage {
 
 pub trait SigVerifier {
     type SendType: std::fmt::Debug;
-    fn verify_batches(&self, batches: Vec<PacketBatch>, valid_packets: usize) -> Vec<PacketBatch>;
+    fn verify_batches(&self, batches: &mut [PacketBatch], valid_packets: usize);
     fn send_packets(&mut self, packet_batches: Vec<PacketBatch>) -> Result<(), Self::SendType>;
 }
 
@@ -66,23 +58,16 @@ pub struct DisabledSigVerifier {}
 struct SigVerifierStats {
     recv_batches_us_hist: histogram::Histogram, // time to call recv_batch
     verify_batches_pp_us_hist: histogram::Histogram, // per-packet time to call verify_batch
-    discard_packets_pp_us_hist: histogram::Histogram, // per-packet time to call verify_batch
-    dedup_packets_pp_us_hist: histogram::Histogram, // per-packet time to call verify_batch
+    dedup_packets_pp_us_hist: histogram::Histogram, // per-packet time to call dedup
     batches_hist: histogram::Histogram,         // number of packet batches per verify call
     packets_hist: histogram::Histogram,         // number of packets per verify call
     num_deduper_saturations: usize,
     total_batches: usize,
     total_packets: usize,
     total_dedup: usize,
-    total_excess_fail: usize,
     total_valid_packets: usize,
-    total_shrinks: usize,
-    total_discard_random: usize,
     total_dedup_time_us: usize,
-    total_discard_time_us: usize,
-    total_discard_random_time_us: usize,
     total_verify_time_us: usize,
-    total_shrink_time_us: usize,
 }
 
 impl SigVerifierStats {
@@ -135,28 +120,6 @@ impl SigVerifierStats {
                 i64
             ),
             (
-                "discard_packets_pp_us_90pct",
-                self.discard_packets_pp_us_hist
-                    .percentile(90.0)
-                    .unwrap_or(0),
-                i64
-            ),
-            (
-                "discard_packets_pp_us_min",
-                self.discard_packets_pp_us_hist.minimum().unwrap_or(0),
-                i64
-            ),
-            (
-                "discard_packets_pp_us_max",
-                self.discard_packets_pp_us_hist.maximum().unwrap_or(0),
-                i64
-            ),
-            (
-                "discard_packets_pp_us_mean",
-                self.discard_packets_pp_us_hist.mean().unwrap_or(0),
-                i64
-            ),
-            (
                 "dedup_packets_pp_us_90pct",
                 self.dedup_packets_pp_us_hist.percentile(90.0).unwrap_or(0),
                 i64
@@ -196,32 +159,17 @@ impl SigVerifierStats {
             ("total_batches", self.total_batches, i64),
             ("total_packets", self.total_packets, i64),
             ("total_dedup", self.total_dedup, i64),
-            ("total_excess_fail", self.total_excess_fail, i64),
             ("total_valid_packets", self.total_valid_packets, i64),
-            ("total_discard_random", self.total_discard_random, i64),
-            ("total_shrinks", self.total_shrinks, i64),
             ("total_dedup_time_us", self.total_dedup_time_us, i64),
-            ("total_discard_time_us", self.total_discard_time_us, i64),
-            (
-                "total_discard_random_time_us",
-                self.total_discard_random_time_us,
-                i64
-            ),
             ("total_verify_time_us", self.total_verify_time_us, i64),
-            ("total_shrink_time_us", self.total_shrink_time_us, i64),
         );
     }
 }
 
 impl SigVerifier for DisabledSigVerifier {
     type SendType = ();
-    fn verify_batches(
-        &self,
-        mut batches: Vec<PacketBatch>,
-        _valid_packets: usize,
-    ) -> Vec<PacketBatch> {
-        sigverify::ed25519_verify_disabled(&mut batches);
-        batches
+    fn verify_batches(&self, batches: &mut [PacketBatch], _valid_packets: usize) {
+        sigverify::ed25519_verify_disabled(batches);
     }
 
     fn send_packets(&mut self, _packet_batches: Vec<PacketBatch>) -> Result<(), Self::SendType> {
@@ -239,31 +187,6 @@ impl SigVerifyStage {
         let thread_hdl =
             Self::verifier_service(packet_receiver, verifier, thread_name, metrics_name);
         Self { thread_hdl }
-    }
-
-    pub fn discard_excess_packets(batches: &mut [PacketBatch], mut max_packets: usize) {
-        // Group packets by their incoming IP address.
-        let mut addrs = batches
-            .iter_mut()
-            .rev()
-            .flat_map(|batch| batch.iter_mut().rev())
-            .filter(|packet| !packet.meta().discard())
-            .map(|packet| (packet.meta().addr, packet))
-            .into_group_map();
-        // Allocate max_packets evenly across addresses.
-        while max_packets > 0 && !addrs.is_empty() {
-            let num_addrs = addrs.len();
-            addrs.retain(|_, packets| {
-                let cap = max_packets.div_ceil(num_addrs);
-                max_packets -= packets.len().min(cap);
-                packets.truncate(packets.len().saturating_sub(cap));
-                !packets.is_empty()
-            });
-        }
-        // Discard excess packets from each address.
-        for mut packet in addrs.into_values().flatten() {
-            packet.meta_mut().set_discard(true);
-        }
     }
 
     /// make this function public so that it is available for benchmarking
@@ -291,92 +214,98 @@ impl SigVerifyStage {
         recvr: &Receiver<PacketBatch>,
         verifier: &mut T,
         stats: &mut SigVerifierStats,
+        accumulated: &mut Vec<PacketBatch>,
     ) -> Result<(), T::SendType> {
-        let (mut batches, num_packets, recv_duration) = streamer::recv_packet_batches(recvr)?;
+        accumulated.clear();
 
-        let batches_len = batches.len();
-        debug!(
-            "@{:?} verifier: verifying: {}",
-            timing::timestamp(),
-            num_packets,
-        );
+        // 1. Blocking recv for first batch
+        let recv_start = Instant::now();
+        let mut batch = recvr
+            .recv_timeout(Duration::new(1, 0))
+            .map_err(|e| SigVerifyServiceError::Streamer(StreamerError::RecvTimeout(e)))?;
+        let recv_duration = recv_start.elapsed();
 
-        let mut discard_random_time = Measure::start("sigverify_discard_random_time");
-        let non_discarded_packets = solana_perf::discard::discard_batches_randomly(
-            &mut batches,
-            MAX_DEDUP_BATCH,
-            num_packets,
-        );
-        let num_discarded_randomly = num_packets.saturating_sub(non_discarded_packets);
-        discard_random_time.stop();
+        let mut total_packets = batch.len();
+        let mut total_dedup = 0;
+        let mut valid_count = 0;
 
+        // 2. Dedup + accumulate batches until VERIFY_BATCH_TARGET valid packets or channel empty
         let mut dedup_time = Measure::start("sigverify_dedup_time");
-        let discard_or_dedup_fail =
-            deduper::dedup_packets_and_count_discards(deduper, &mut batches) as usize;
-        dedup_time.stop();
-        let num_unique = non_discarded_packets.saturating_sub(discard_or_dedup_fail);
 
-        let mut discard_time = Measure::start("sigverify_discard_time");
-        let mut num_packets_to_verify = num_unique;
-        if num_unique > MAX_SIGVERIFY_BATCH {
-            Self::discard_excess_packets(&mut batches, MAX_SIGVERIFY_BATCH);
-            num_packets_to_verify = MAX_SIGVERIFY_BATCH;
+        let dedup_fail =
+            deduper::dedup_packets_and_count_discards(deduper, std::slice::from_mut(&mut batch));
+        total_dedup += dedup_fail as usize;
+        let batch_valid = batch.len() - dedup_fail as usize;
+        if batch_valid > 0 {
+            valid_count += batch_valid;
+            accumulated.push(batch);
         }
-        let excess_fail = num_unique.saturating_sub(MAX_SIGVERIFY_BATCH);
-        discard_time.stop();
 
-        // Pre-shrink packet batches if many packets are discarded from dedup / discard
-        let (pre_shrink_time_us, pre_shrink_total, batches) = Self::maybe_shrink_batches(batches);
+        while valid_count < VERIFY_BATCH_TARGET {
+            match recvr.try_recv() {
+                Ok(mut batch) => {
+                    let batch_len = batch.len();
+                    total_packets += batch_len;
+                    let dedup_fail = deduper::dedup_packets_and_count_discards(
+                        deduper,
+                        std::slice::from_mut(&mut batch),
+                    );
+                    total_dedup += dedup_fail as usize;
+                    let batch_valid = batch_len - dedup_fail as usize;
+                    if batch_valid > 0 {
+                        valid_count += batch_valid;
+                        accumulated.push(batch);
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    return Err(SigVerifyServiceError::Streamer(
+                        StreamerError::RecvTimeout(RecvTimeoutError::Disconnected),
+                    ));
+                }
+            }
+        }
+        dedup_time.stop();
+        let batches_len = accumulated.len();
 
+        // 3. Verify in-place
         let mut verify_time = Measure::start("sigverify_batch_time");
-        let batches = verifier.verify_batches(batches, num_packets_to_verify);
-        let num_valid_packets = count_valid_packets(&batches);
+        verifier.verify_batches(accumulated, valid_count);
+        let num_valid_packets = count_valid_packets(&*accumulated);
         verify_time.stop();
 
-        // Post-shrink packet batches if many packets are discarded from sigverify
-        let (post_shrink_time_us, post_shrink_total, batches) = Self::maybe_shrink_batches(batches);
+        // 4. Send
+        let to_send: Vec<PacketBatch> = accumulated.drain(..).collect();
+        if !to_send.is_empty() {
+            verifier.send_packets(to_send)?;
+        }
 
-        verifier.send_packets(batches)?;
-
-        debug!(
-            "@{:?} verifier: done. batches: {} total verify time: {:?} verified: {} v/s {}",
-            timing::timestamp(),
-            batches_len,
-            verify_time.as_ms(),
-            num_packets,
-            (num_packets as f32 / verify_time.as_s())
-        );
-
+        // 5. Update stats
         stats
             .recv_batches_us_hist
             .increment(recv_duration.as_micros() as u64)
             .unwrap();
-        stats
-            .verify_batches_pp_us_hist
-            .increment(verify_time.as_us() / (num_packets as u64))
-            .unwrap();
-        stats
-            .discard_packets_pp_us_hist
-            .increment(discard_time.as_us() / (num_packets as u64))
-            .unwrap();
-        stats
-            .dedup_packets_pp_us_hist
-            .increment(dedup_time.as_us() / (num_packets as u64))
-            .unwrap();
+        if total_packets > 0 {
+            stats
+                .verify_batches_pp_us_hist
+                .increment(verify_time.as_us() / (total_packets as u64))
+                .unwrap();
+            stats
+                .dedup_packets_pp_us_hist
+                .increment(dedup_time.as_us() / (total_packets as u64))
+                .unwrap();
+        }
         stats.batches_hist.increment(batches_len as u64).unwrap();
-        stats.packets_hist.increment(num_packets as u64).unwrap();
+        stats
+            .packets_hist
+            .increment(total_packets as u64)
+            .unwrap();
         stats.total_batches += batches_len;
-        stats.total_packets += num_packets;
-        stats.total_dedup += discard_or_dedup_fail;
+        stats.total_packets += total_packets;
+        stats.total_dedup += total_dedup;
         stats.total_valid_packets += num_valid_packets;
-        stats.total_discard_random_time_us += discard_random_time.as_us() as usize;
-        stats.total_discard_random += num_discarded_randomly;
-        stats.total_excess_fail += excess_fail;
-        stats.total_shrinks += pre_shrink_total + post_shrink_total;
         stats.total_dedup_time_us += dedup_time.as_us() as usize;
-        stats.total_discard_time_us += discard_time.as_us() as usize;
         stats.total_verify_time_us += verify_time.as_us() as usize;
-        stats.total_shrink_time_us += (pre_shrink_time_us + post_shrink_time_us) as usize;
 
         Ok(())
     }
@@ -397,13 +326,18 @@ impl SigVerifyStage {
             .spawn(move || {
                 let mut rng = rand::rng();
                 let mut deduper = Deduper::<2, [u8]>::new(&mut rng, DEDUPER_NUM_BITS);
+                let mut accumulated = Vec::with_capacity(16);
                 loop {
                     if deduper.maybe_reset(&mut rng, DEDUPER_FALSE_POSITIVE_RATE, MAX_DEDUPER_AGE) {
                         stats.num_deduper_saturations += 1;
                     }
-                    if let Err(e) =
-                        Self::verifier(&deduper, &packet_receiver, &mut verifier, &mut stats)
-                    {
+                    if let Err(e) = Self::verifier(
+                        &deduper,
+                        &packet_receiver,
+                        &mut verifier,
+                        &mut stats,
+                        &mut accumulated,
+                    ) {
                         match e {
                             SigVerifyServiceError::Streamer(StreamerError::RecvTimeout(
                                 RecvTimeoutError::Disconnected,
@@ -438,39 +372,8 @@ mod tests {
         super::*,
         crate::{banking_trace::BankingTracer, sigverify::TransactionSigVerifier},
         crossbeam_channel::unbounded,
-        solana_perf::{
-            packet::{to_packet_batches, Packet, RecycledPacketBatch},
-            test_tx::test_tx,
-        },
+        solana_perf::{packet::to_packet_batches, test_tx::test_tx},
     };
-
-    fn count_non_discard(packet_batches: &[PacketBatch]) -> usize {
-        packet_batches
-            .iter()
-            .flatten()
-            .filter(|p| !p.meta().discard())
-            .count()
-    }
-
-    #[test]
-    fn test_packet_discard() {
-        agave_logger::setup();
-        let batch_size = 10;
-        let mut batch = RecycledPacketBatch::with_capacity(batch_size);
-        let packet = Packet::default();
-        batch.resize(batch_size, packet);
-        batch[3].meta_mut().addr = std::net::IpAddr::from([1u16; 8]);
-        batch[3].meta_mut().set_discard(true);
-        batch[4].meta_mut().addr = std::net::IpAddr::from([2u16; 8]);
-        let mut batches = vec![PacketBatch::from(batch)];
-        let max = 3;
-        SigVerifyStage::discard_excess_packets(&mut batches, max);
-        let total_non_discard = count_non_discard(&batches);
-        assert_eq!(total_non_discard, max);
-        assert!(!batches[0].get(0).unwrap().meta().discard());
-        assert!(batches[0].get(3).unwrap().meta().discard());
-        assert!(!batches[0].get(4).unwrap().meta().discard());
-    }
 
     fn gen_batches(
         use_same_tx: bool,
@@ -507,9 +410,6 @@ mod tests {
         let now = Instant::now();
         let packets_per_batch = 128;
         let total_packets = 1920;
-        // This is important so that we don't discard any packets and fail asserts below about
-        // `total_excess_tracer_packets`
-        assert!(total_packets < MAX_SIGVERIFY_BATCH);
         let batches = gen_batches(use_same_tx, packets_per_batch, total_packets);
         trace!(
             "starting... generation took: {} ms batches: {}",

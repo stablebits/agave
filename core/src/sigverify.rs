@@ -66,12 +66,7 @@ impl SigVerifier for TransactionSigVerifier {
         Ok(())
     }
 
-    fn verify_batches(
-        &self,
-        mut batches: Vec<PacketBatch>,
-        valid_packets: usize,
-    ) -> Vec<PacketBatch> {
-        sigverify::ed25519_verify(&mut batches, self.reject_non_vote, valid_packets);
-        batches
+    fn verify_batches(&self, batches: &mut [PacketBatch], valid_packets: usize) {
+        sigverify::ed25519_verify(batches, self.reject_non_vote, valid_packets);
     }
 }
