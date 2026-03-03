@@ -1,7 +1,7 @@
 use {
     crate::nonblocking::quic::{ClientConnectionTracker, ConnectionPeerType},
     quinn::Connection,
-    std::future::Future,
+    std::{future::Future, time::Duration},
     tokio_util::sync::CancellationToken,
 };
 
@@ -11,6 +11,16 @@ use {
 pub(crate) trait ConnectionContext: Clone + Send + Sync {
     fn peer_type(&self) -> ConnectionPeerType;
     fn remote_pubkey(&self) -> Option<solana_pubkey::Pubkey>;
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ParkedStreamMode {
+    /// Park and periodically re-check saturation before accepting more streams.
+    Park,
+    /// Accept streams but immediately stop/reset them.
+    Reset,
+    /// Process streams as usual (subject to whatever quota has already been issued).
+    Allow,
 }
 
 /// A trait to manage QoS for connections. This includes
@@ -51,6 +61,30 @@ pub(crate) trait QosController<C: ConnectionContext> {
         context: &C,
         connection: Connection,
     ) -> impl Future<Output = usize> + Send;
+
+    /// Whether the system is globally saturated.
+    fn is_saturated(&self) -> bool {
+        false
+    }
+
+    /// Desired max concurrent uni streams. `Some(0)` parks; `None` leaves unchanged.
+    fn compute_max_streams(
+        &self,
+        context: &C,
+        connection: &Connection,
+        saturated: bool,
+    ) -> Option<u32> {
+        let _ = (context, connection, saturated);
+        None
+    }
+
+    /// Behavior for connections that are effectively parked (MAX_STREAMS == 0).
+    fn parked_stream_mode(&self, _context: &C) -> ParkedStreamMode {
+        ParkedStreamMode::Park
+    }
+
+    /// Pull QoS-specific metrics into StreamerStats before reporting.
+    fn pull_stats(&self, _stats: &crate::quic::StreamerStats, _elapsed: Duration) {}
 
     /// How many concurrent
     fn max_concurrent_connections(&self) -> usize;

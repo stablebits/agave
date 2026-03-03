@@ -2,7 +2,7 @@ use {
     crate::{
         nonblocking::{
             connection_rate_limiter::ConnectionRateLimiter,
-            qos::{ConnectionContext, OpaqueStreamerCounter, QosController},
+            qos::{ConnectionContext, OpaqueStreamerCounter, ParkedStreamMode, QosController},
         },
         quic::{QuicServerError, QuicStreamerConfig, StreamerStats, configure_server},
         quic_socket::QuicSocket,
@@ -12,7 +12,7 @@ use {
     crossbeam_channel::{Sender, TrySendError},
     futures::{Future, StreamExt as _, stream::FuturesUnordered},
     indexmap::map::{Entry, IndexMap},
-    quinn::{Accept, Connecting, Connection, Endpoint, EndpointConfig, TokioRuntime},
+    quinn::{Accept, Connecting, Connection, Endpoint, EndpointConfig, TokioRuntime, VarInt},
     rand::{Rng, rng},
     smallvec::SmallVec,
     solana_keypair::Keypair,
@@ -51,6 +51,9 @@ use {
 
 pub const DEFAULT_WAIT_FOR_CHUNK_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Re-check interval for parked (zero-credit) connections.
+const PARK_RECHECK_INTERVAL: Duration = Duration::from_millis(10);
+
 pub const ALPN_TPU_PROTOCOL_ID: &[u8] = b"solana-tpu";
 
 const CONNECTION_CLOSE_CODE_DROPPED_ENTRY: u32 = 1;
@@ -64,6 +67,8 @@ const CONNECTION_CLOSE_REASON_TOO_MANY: &[u8] = b"too_many";
 
 const CONNECTION_CLOSE_CODE_INVALID_STREAM: u32 = 5;
 const CONNECTION_CLOSE_REASON_INVALID_STREAM: &[u8] = b"invalid_stream";
+
+const STREAM_STOP_CODE_DROPPED: u32 = 1;
 
 /// Total new connection counts per second. Heuristically taken from
 /// the default staked and unstaked connection limits. Might be adjusted
@@ -90,7 +95,6 @@ pub(crate) const MIN_RTT: Duration = Duration::from_millis(2);
 /// a stream reassembly would be delayed more is when something
 /// extraordinary has occured (congestion control or flow control blocking)
 const LATE_REASSEMBLY_THRESHOLD: f32 = 1.5;
-
 // A struct to accumulate the bytes making up
 // a packet, along with their offsets, and the
 // packet metadata. We use this accumulator to avoid
@@ -311,6 +315,7 @@ where
         };
 
         if last_datapoint.elapsed().as_secs() >= 5 {
+            qos.pull_stats(&stats, last_datapoint.elapsed());
             stats.report(name);
             last_datapoint = Instant::now();
         }
@@ -593,8 +598,36 @@ async fn handle_connection<Q, C>(
     // it is not the end of the world.
     let rtt = connection.rtt();
     'conn: loop {
-        // Wait for new streams. If the peer is disconnected we get a cancellation signal and stop
-        // the connection task.
+        // ── Credit gate ──
+        let saturated = qos.is_saturated();
+        let mut parked_stream_mode = None;
+        let mut recheck_on_timeout = false;
+        if let Some(max_streams) = qos.compute_max_streams(&context, &connection, saturated) {
+            connection.set_max_concurrent_uni_streams(VarInt::from_u32(max_streams));
+
+            if max_streams == 0 {
+                let mode = qos.parked_stream_mode(&context);
+                if mode == ParkedStreamMode::Park {
+                    // Park: don't accept streams, wait for load to drop
+                    stats.parked_streams.fetch_add(1, Ordering::Relaxed);
+                    select! {
+                        _ = tokio::time::sleep(PARK_RECHECK_INTERVAL) => continue,
+                        _ = cancel.cancelled() => break,
+                    }
+                }
+                parked_stream_mode = Some(mode);
+                recheck_on_timeout = true;
+            }
+        }
+
+        // ── Accept stream ──
+        let recheck = async {
+            if recheck_on_timeout {
+                tokio::time::sleep(PARK_RECHECK_INTERVAL).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
         let mut stream = select! {
             stream = connection.accept_uni() => match stream {
                 Ok(stream) => stream,
@@ -603,13 +636,23 @@ async fn handle_connection<Q, C>(
                     break;
                 }
             },
+            _ = recheck => continue,
             _ = cancel.cancelled() => break,
         };
 
+        // ── QoS callbacks ──
         qos.on_new_stream(&context).await;
-        qos.on_stream_accepted(&context);
         stats.active_streams.fetch_add(1, Ordering::Relaxed);
         stats.total_new_streams.fetch_add(1, Ordering::Relaxed);
+
+        if matches!(parked_stream_mode, Some(ParkedStreamMode::Reset)) {
+            let _ = stream.stop(VarInt::from_u32(STREAM_STOP_CODE_DROPPED));
+            stats.active_streams.fetch_sub(1, Ordering::Relaxed);
+            qos.on_stream_closed(&context);
+            continue;
+        }
+
+        qos.on_stream_accepted(&context);
 
         let mut meta = Meta::default();
         meta.set_socket_addr(&remote_address);
@@ -1098,8 +1141,9 @@ pub mod test {
             qos::NullStreamerCounter,
             swqos::SwQosConfig,
             testing_utilities::{
-                SpawnTestServerResult, check_multiple_streams, get_client_config,
-                make_client_endpoint, setup_quic_server, spawn_stake_weighted_qos_server,
+                SpawnSwQosServerResult, SpawnTestServerResult, check_multiple_streams,
+                get_client_config, make_client_endpoint, setup_quic_server,
+                spawn_stake_weighted_qos_server,
             },
         },
         assert_matches::assert_matches,
@@ -1554,11 +1598,15 @@ pub mod test {
         let server_address = s.local_addr().unwrap();
         let staked_nodes = Arc::new(RwLock::new(StakedNodes::default()));
         let cancel = CancellationToken::new();
-        let SpawnNonBlockingServerResult {
-            endpoints: _,
-            stats: _,
-            thread: t,
-            max_concurrent_connections: _,
+        let SpawnSwQosServerResult {
+            server:
+                SpawnNonBlockingServerResult {
+                    endpoints: _,
+                    stats: _,
+                    thread: t,
+                    max_concurrent_connections: _,
+                },
+            swqos: _,
         } = spawn_stake_weighted_qos_server(
             "quic_streamer_test",
             [s.into()],
@@ -1590,11 +1638,15 @@ pub mod test {
         let server_address = s.local_addr().unwrap();
         let staked_nodes = Arc::new(RwLock::new(StakedNodes::default()));
         let cancel = CancellationToken::new();
-        let SpawnNonBlockingServerResult {
-            endpoints: _,
-            stats,
-            thread: t,
-            max_concurrent_connections: _,
+        let SpawnSwQosServerResult {
+            server:
+                SpawnNonBlockingServerResult {
+                    endpoints: _,
+                    stats,
+                    thread: t,
+                    max_concurrent_connections: _,
+                },
+            swqos: _,
         } = spawn_stake_weighted_qos_server(
             "quic_streamer_test",
             [s.into()],
@@ -1958,7 +2010,6 @@ pub mod test {
             stats.total_new_streams.load(Ordering::Relaxed),
             expected_num_txs
         );
-        assert!(stats.throttled_unstaked_streams.load(Ordering::Relaxed) > 0);
     }
 
     #[test]
