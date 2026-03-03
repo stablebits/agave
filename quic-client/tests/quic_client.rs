@@ -12,7 +12,10 @@ mod tests {
         solana_perf::packet::PacketBatch,
         solana_quic_client::nonblocking::quic_client::{QuicClient, QuicLazyInitializedEndpoint},
         solana_streamer::{
-            nonblocking::{quic::SpawnNonBlockingServerResult, swqos::SwQosConfig},
+            nonblocking::{
+                quic::SpawnNonBlockingServerResult, swqos::SwQosConfig,
+                testing_utilities::SpawnSwQosServerResult,
+            },
             quic::{QuicStreamerConfig, SpawnServerResult},
             streamer::StakedNodes,
         },
@@ -151,11 +154,15 @@ mod tests {
         let (sender, receiver) = unbounded();
         let staked_nodes = Arc::new(RwLock::new(StakedNodes::default()));
         let (s, cancel, keypair) = server_args();
-        let SpawnNonBlockingServerResult {
-            endpoints: _,
-            stats: _,
-            thread: t,
-            max_concurrent_connections: _,
+        let SpawnSwQosServerResult {
+            server:
+                SpawnNonBlockingServerResult {
+                    endpoints: _,
+                    stats: _,
+                    thread: t,
+                    max_concurrent_connections: _,
+                },
+            swqos: _,
         } = solana_streamer::nonblocking::testing_utilities::spawn_stake_weighted_qos_server(
             "quic_streamer_test",
             vec![s.try_clone().unwrap().into()],
@@ -322,11 +329,15 @@ mod tests {
         let (sender, receiver) = unbounded();
         let staked_nodes = Arc::new(RwLock::new(StakedNodes::default()));
         let (s, cancel, keypair) = server_args();
-        let solana_streamer::nonblocking::quic::SpawnNonBlockingServerResult {
-            endpoints: _,
-            stats: _,
-            thread: t,
-            max_concurrent_connections: _,
+        let SpawnSwQosServerResult {
+            server:
+                SpawnNonBlockingServerResult {
+                    endpoints: _,
+                    stats: _,
+                    thread: t,
+                    max_concurrent_connections: _,
+                },
+            swqos: _,
         } = solana_streamer::nonblocking::testing_utilities::spawn_stake_weighted_qos_server(
             "quic_streamer_test",
             vec![s.try_clone().unwrap().into()],

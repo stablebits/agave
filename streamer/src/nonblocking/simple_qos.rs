@@ -4,8 +4,8 @@ use {
             qos::{ConnectionContext, OpaqueStreamerCounter, QosController},
             quic::{
                 ClientConnectionTracker, ConnectionHandlerError, ConnectionPeerType,
-                ConnectionTable, ConnectionTableKey, ConnectionTableType, MAX_RTT, MIN_RTT,
-                get_connection_stake, update_open_connections_stat,
+                ConnectionTable, ConnectionTableKey, ConnectionTableType, get_connection_stake,
+                update_open_connections_stat,
             },
         },
         quic::{
@@ -31,6 +31,11 @@ use {
     },
     tokio_util::sync::CancellationToken,
 };
+
+/// Max RTT for BDP scaling
+const MAX_RTT: Duration = Duration::from_millis(320);
+/// Min RTT for BDP scaling
+const MIN_RTT: Duration = Duration::from_millis(2);
 
 /// Allow for extra streams "in flight" on top of the nominal
 /// send rate in case of bursty traffic from the sender side.
