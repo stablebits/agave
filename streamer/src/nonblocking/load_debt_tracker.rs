@@ -160,16 +160,22 @@ impl LoadDebtTracker {
         );
     }
 
-    fn try_refill(&self) {
+    pub(crate) fn try_refill(&self) {
         let now_nanos = self.nanos_since_epoch();
-        self.refill_at(now_nanos);
+        self.refill_at(now_nanos, false);
+    }
+
+    /// Force a refill regardless of the interval timer.
+    pub(crate) fn force_refill(&self) {
+        let now_nanos = self.nanos_since_epoch();
+        self.refill_at(now_nanos, true);
     }
 
     fn nanos_since_epoch(&self) -> u64 {
         self.epoch.elapsed().as_nanos() as u64
     }
 
-    fn refill_at(&self, now_nanos: u64) {
+    fn refill_at(&self, now_nanos: u64, force: bool) {
         const LOCK_BIT: u64 = 1 << 63;
         const NANO_MASK: u64 = !LOCK_BIT;
 
@@ -182,7 +188,7 @@ impl LoadDebtTracker {
             return;
         }
         let elapsed_nanos = now_nanos - last_nanos;
-        if elapsed_nanos < self.refill_interval_nanos {
+        if !force && elapsed_nanos < self.refill_interval_nanos {
             return;
         }
 
@@ -209,6 +215,11 @@ impl LoadDebtTracker {
         // Release lock and store new timestamp.
         self.last_refill_nanos
             .store(now_nanos & NANO_MASK, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn refill_at_for_test(&self, now_nanos: u64) {
+        self.refill_at(now_nanos, false);
     }
 }
 
@@ -268,7 +279,7 @@ mod tests {
         acquire_n(&g, 100); // level = 0
 
         // 50ms elapsed at 100/s → refill = 5 tokens
-        g.refill_at(50_000_000);
+        g.refill_at_for_test(50_000_000);
         assert_eq!(g.bucket_level(), 5);
     }
 
@@ -278,7 +289,7 @@ mod tests {
         acquire_n(&g, 120); // level = -20
         assert_eq!(g.bucket_level(), -20);
         // 500ms at 100/s → refill = 50
-        g.refill_at(500_000_000);
+        g.refill_at_for_test(500_000_000);
         assert_eq!(g.bucket_level(), 30); // -20 + 50
     }
 
@@ -287,7 +298,7 @@ mod tests {
         let g = simple(); // burst = 100, starts at 100
 
         // Don't consume anything. Refill after 10s → would add 1000.
-        g.refill_at(10_000_000_000);
+        g.refill_at_for_test(10_000_000_000);
         assert_eq!(g.bucket_level(), 100); // capped
     }
 
@@ -295,7 +306,7 @@ mod tests {
     fn test_refill_skipped_before_interval() {
         let g = simple(); // interval = 10ms
         acquire_n(&g, 50); // level = 50
-        g.refill_at(5_000_000); // 5ms < 10ms interval → no refill
+        g.refill_at_for_test(5_000_000); // 5ms < 10ms interval → no refill
         assert_eq!(g.bucket_level(), 50);
     }
 
@@ -306,12 +317,12 @@ mod tests {
         assert!(g.is_saturated());
 
         // Refill 50 → level=50: still saturated (below 90%).
-        g.refill_at(500_000_000);
+        g.refill_at_for_test(500_000_000);
         assert_eq!(g.bucket_level(), 50);
         assert!(g.is_saturated());
 
         // Refill to 90 → at recovery threshold, recovered.
-        g.refill_at(900_000_000);
+        g.refill_at_for_test(900_000_000);
         assert_eq!(g.bucket_level(), 90);
         assert!(!g.is_saturated());
     }

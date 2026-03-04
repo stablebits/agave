@@ -224,6 +224,15 @@ impl SwQos {
             return false;
         }
 
+        // Force a refill (bypassing the interval timer) so the bucket
+        // level reflects reality before we make a reset decision.
+        self.load_tracker.force_refill();
+
+        let level = self.load_tracker.bucket_level();
+        if level >= threshold {
+            return false;
+        }
+
         // Debt factor: how deep past the threshold.
         let debt_depth = (threshold.saturating_sub(level)) as f64;
         let debt_factor = (debt_depth / self.reset_debt_scale.max(1) as f64).clamp(0.0, 1.0);
