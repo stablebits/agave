@@ -19,6 +19,7 @@ use {
     },
     percentage::Percentage,
     quinn::Connection,
+    rand::Rng,
     solana_time_utils as timing,
     std::{
         collections::HashMap,
@@ -64,6 +65,15 @@ pub struct SwQosConfig {
     pub parked_stream_mode: ParkedStreamMode,
     /// Per-peer RTT overrides (testing only). Bypasses `connection.rtt()`.
     pub rtt_overrides: HashMap<solana_pubkey::Pubkey, Duration>,
+    /// Bucket level at which probabilistic resets begin.
+    /// `None` = disabled. `Some(0)` = auto (`-burst_capacity`).
+    pub reset_debt_threshold: Option<i64>,
+    /// Debt range over which reset probability ramps from 0 → 1.
+    /// `None` = auto (`4 × |threshold|`). `Some(x)` = use `x`.
+    pub reset_debt_scale: Option<i64>,
+    /// Reference stake for the stake factor: connections with this stake
+    /// get factor 1.0; higher stake → lower probability.
+    pub reset_reference_stake: u64,
 }
 
 impl Default for SwQosConfig {
@@ -78,6 +88,9 @@ impl Default for SwQosConfig {
             base_max_streams_unstaked: DEFAULT_BASE_MAX_STREAMS_UNSTAKED,
             parked_stream_mode: ParkedStreamMode::Park,
             rtt_overrides: HashMap::new(),
+            reset_debt_threshold: Some(0),
+            reset_debt_scale: None,
+            reset_reference_stake: 50_000_000,
         }
     }
 }
@@ -96,6 +109,10 @@ impl SwQosConfig {
 pub struct SwQos {
     config: SwQosConfig,
     capacity_tps: u64,
+    /// Resolved threshold for probabilistic resets (`None` = disabled).
+    reset_debt_threshold: Option<i64>,
+    /// Resolved scale for the debt factor.
+    reset_debt_scale: i64,
     load_tracker: Arc<LoadDebtTracker>,
     stats: Arc<StreamerStats>,
     staked_nodes: Arc<RwLock<StakedNodes>>,
@@ -134,12 +151,30 @@ impl SwQos {
         staked_nodes: Arc<RwLock<StakedNodes>>,
         cancel: CancellationToken,
     ) -> Self {
-        let max_streams_per_second = config.max_streams_per_ms * 1000;
+        let max_streams_per_second = config.max_streams_per_ms.saturating_mul(1000);
         let burst_capacity = max_streams_per_second / 10;
+
+        // Resolve threshold: None → disabled, Some(0) → -burst_capacity.
+        let reset_debt_threshold = config.reset_debt_threshold.map(|t| {
+            if t == 0 {
+                -(burst_capacity as i64)
+            } else {
+                t
+            }
+        });
+
+        // Resolve scale: None → 4× |threshold|, Some(x) → x.
+        let reset_debt_scale = config.reset_debt_scale.unwrap_or_else(|| {
+            reset_debt_threshold
+                .map(|t| t.saturating_abs().saturating_mul(4))
+                .unwrap_or(1)
+        });
 
         Self {
             config,
             capacity_tps: max_streams_per_second,
+            reset_debt_threshold,
+            reset_debt_scale,
             load_tracker: Arc::new(LoadDebtTracker::new(
                 max_streams_per_second,
                 burst_capacity,
@@ -156,6 +191,60 @@ impl SwQos {
                 cancel,
             ))),
         }
+    }
+
+    /// Probabilistic connection reset under deep debt.
+    ///
+    /// Returns `true` when the connection should be closed. Only applies to
+    /// staked connections; unstaked connections are already parked/reset at
+    /// level-1.
+    ///
+    /// ```text
+    /// P(reset) = clamp((debt_factor + rtt_factor + stake_factor) / 3, 0, 1)
+    ///   where debt_factor  = clamp((threshold - level) / scale, 0, 1)
+    ///         rtt_factor   = clamp(rtt / MAX_RTT, 0, 1)
+    ///         stake_factor = clamp(reference_stake / stake, 0, 1)
+    /// ```
+    pub(crate) fn should_reset_connection(
+        &self,
+        context: &SwQosConnectionContext,
+        rtt: Duration,
+    ) -> bool {
+        let Some(threshold) = self.reset_debt_threshold else {
+            return false;
+        };
+
+        // Only applies to staked connections.
+        let stake = match context.peer_type {
+            ConnectionPeerType::Staked(s) => s,
+            ConnectionPeerType::Unstaked => return false,
+        };
+
+        let level = self.load_tracker.bucket_level();
+        if level >= threshold {
+            return false;
+        }
+
+        // Debt factor: how deep past the threshold.
+        let debt_depth = (threshold.saturating_sub(level)) as f64;
+        let debt_factor = (debt_depth / self.reset_debt_scale.max(1) as f64).clamp(0.0, 1.0);
+
+        // RTT factor: high-latency connections are more costly.
+        let rtt_factor = (rtt.as_secs_f64() / MAX_RTT.as_secs_f64()).clamp(0.0, 1.0);
+
+        // Stake factor: higher stake → lower probability.
+        let stake_factor =
+            (self.config.reset_reference_stake as f64 / (stake.max(1)) as f64).clamp(0.0, 1.0);
+
+        let p = ((debt_factor + rtt_factor + stake_factor) / 3.0).clamp(0.0, 1.0);
+        if p <= 0.0 {
+            return false;
+        }
+        if p >= 1.0 {
+            return true;
+        }
+
+        rand::rng().random_range(0.0..1.0) < p
     }
 
     /// Core MAX_STREAMS computation (testable without a quinn::Connection).
@@ -459,6 +548,10 @@ impl QosController<SwQosConnectionContext> for SwQos {
 
     fn on_stream_accepted(&self, _context: &SwQosConnectionContext) {
         self.load_tracker.acquire();
+    }
+
+    fn should_reset_connection(&self, context: &SwQosConnectionContext, rtt: Duration) -> bool {
+        self.should_reset_connection(context, rtt)
     }
 
     fn on_stream_error(&self, _conn_context: &SwQosConnectionContext) {}
@@ -836,5 +929,139 @@ pub mod test {
         });
         let ctx = unstaked_context();
         assert_eq!(swqos.parked_stream_mode(&ctx), ParkedStreamMode::Reset);
+    }
+
+    // ── Probabilistic reset ────────────────────────────────────────
+
+    /// Helper: build SwQos with a deep-negative bucket for reset tests.
+    fn make_swqos_with_debt(config: SwQosConfig, debt: u64) -> SwQos {
+        let swqos = make_swqos(config);
+        // Drive the bucket negative by acquiring many tokens.
+        let burst = swqos.load_tracker().bucket_level() as u64;
+        for _ in 0..burst.saturating_add(debt) {
+            swqos.load_tracker().acquire();
+        }
+        swqos
+    }
+
+    #[test]
+    fn should_reset_returns_false_above_threshold() {
+        // Bucket is positive → no resets regardless of config.
+        let swqos = make_swqos(SwQosConfig {
+            reset_debt_threshold: Some(-10_000),
+            reset_debt_scale: Some(100_000),
+            reset_reference_stake: 50_000_000,
+            ..SwQosConfig::default()
+        });
+        let ctx = staked_context(1_000, 100_000, 1);
+        for _ in 0..100 {
+            assert!(!swqos.should_reset_connection(&ctx, Duration::from_millis(200)));
+        }
+    }
+
+    #[test]
+    fn should_reset_returns_false_for_unstaked() {
+        let swqos = make_swqos_with_debt(
+            SwQosConfig {
+                reset_debt_threshold: Some(-10_000),
+                reset_debt_scale: Some(100_000),
+                reset_reference_stake: 50_000_000,
+                ..SwQosConfig::default()
+            },
+            200_000,
+        );
+        let ctx = unstaked_context();
+        for _ in 0..100 {
+            assert!(!swqos.should_reset_connection(&ctx, Duration::from_millis(200)));
+        }
+    }
+
+    #[test]
+    fn should_reset_high_probability_scenario() {
+        // Deep debt, high RTT, low stake → near-certain reset.
+        let swqos = make_swqos_with_debt(
+            SwQosConfig {
+                reset_debt_threshold: Some(-10_000),
+                reset_debt_scale: Some(100_000),
+                reset_reference_stake: 50_000_000,
+                ..SwQosConfig::default()
+            },
+            300_000, // bucket ≈ -300_000, well past threshold
+        );
+        let ctx = staked_context(1_000, 100_000, 1); // low stake
+        let rtt = Duration::from_millis(200); // max RTT
+
+        let resets = (0..200)
+            .filter(|_| swqos.should_reset_connection(&ctx, rtt))
+            .count();
+        // With debt_factor≈1.0, rtt_factor=1.0, stake_factor=1.0 → P≈1.0
+        assert!(
+            resets >= 180,
+            "Expected near-certain resets, got {resets}/200"
+        );
+    }
+
+    #[test]
+    fn should_reset_low_probability_high_stake() {
+        // Deep debt but whale stake → lower P than low-stake peer.
+        let swqos = make_swqos_with_debt(
+            SwQosConfig {
+                reset_debt_threshold: Some(-10_000),
+                reset_debt_scale: Some(100_000),
+                reset_reference_stake: 50_000_000,
+                ..SwQosConfig::default()
+            },
+            200_000,
+        );
+        let rtt = Duration::from_millis(200);
+
+        // Whale: stake_factor = 50M/5B = 0.01 → P ≈ (1.0+1.0+0.01)/3 ≈ 0.67
+        let whale = staked_context(5_000_000_000, 10_000_000_000, 1);
+        let whale_resets = (0..1000)
+            .filter(|_| swqos.should_reset_connection(&whale, rtt))
+            .count();
+
+        // Small: stake_factor = 50M/50M = 1.0 → P ≈ (1.0+1.0+1.0)/3 = 1.0
+        let small = staked_context(50_000_000, 10_000_000_000, 1);
+        let small_resets = (0..1000)
+            .filter(|_| swqos.should_reset_connection(&small, rtt))
+            .count();
+
+        // Whale should be reset less often than small staker.
+        assert!(
+            whale_resets < small_resets,
+            "Whale ({whale_resets}) should be reset less than small ({small_resets})"
+        );
+    }
+
+    #[test]
+    fn should_reset_low_probability_low_rtt() {
+        // Deep debt but low RTT → lower P than high-RTT peer.
+        let swqos = make_swqos_with_debt(
+            SwQosConfig {
+                reset_debt_threshold: Some(-10_000),
+                reset_debt_scale: Some(100_000),
+                reset_reference_stake: 50_000_000,
+                ..SwQosConfig::default()
+            },
+            200_000,
+        );
+        let ctx = staked_context(50_000_000, 1_000_000_000, 1);
+
+        // Low RTT: rtt_factor = 2/200 = 0.01 → P ≈ (1.0+0.01+1.0)/3 ≈ 0.67
+        let low_rtt_resets = (0..1000)
+            .filter(|_| swqos.should_reset_connection(&ctx, Duration::from_millis(2)))
+            .count();
+
+        // High RTT: rtt_factor = 200/200 = 1.0 → P ≈ (1.0+1.0+1.0)/3 = 1.0
+        let high_rtt_resets = (0..1000)
+            .filter(|_| swqos.should_reset_connection(&ctx, Duration::from_millis(200)))
+            .count();
+
+        // Low RTT should be reset less often than high RTT.
+        assert!(
+            low_rtt_resets < high_rtt_resets,
+            "Low RTT ({low_rtt_resets}) should be reset less than high RTT ({high_rtt_resets})"
+        );
     }
 }

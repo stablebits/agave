@@ -78,6 +78,11 @@ pub(crate) trait QosController<C: ConnectionContext> {
         None
     }
 
+    /// Whether this connection should be probabilistically reset due to deep debt.
+    fn should_reset_connection(&self, _context: &C, _rtt: Duration) -> bool {
+        false
+    }
+
     /// Behavior for connections that are effectively parked (MAX_STREAMS == 0).
     fn parked_stream_mode(&self, _context: &C) -> ParkedStreamMode {
         ParkedStreamMode::Park

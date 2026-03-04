@@ -68,6 +68,9 @@ const CONNECTION_CLOSE_REASON_TOO_MANY: &[u8] = b"too_many";
 const CONNECTION_CLOSE_CODE_INVALID_STREAM: u32 = 5;
 const CONNECTION_CLOSE_REASON_INVALID_STREAM: &[u8] = b"invalid_stream";
 
+const CONNECTION_CLOSE_CODE_LOAD_SHED: u32 = 6;
+const CONNECTION_CLOSE_REASON_LOAD_SHED: &[u8] = b"load_shed";
+
 const STREAM_STOP_CODE_DROPPED: u32 = 1;
 
 /// Total new connection counts per second. Heuristically taken from
@@ -81,13 +84,6 @@ const MAX_CONNECTION_BURST: u64 = 1000;
 /// Timeout for connection handshake. Timer starts once we get Initial from the
 /// peer, and is canceled when we get a Handshake packet from them.
 const QUIC_CONNECTION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Absolute max RTT to allow for a legitimate connection.
-/// Enough to cover any non-malicious link on Earth.
-pub(crate) const MAX_RTT: Duration = Duration::from_millis(320);
-/// Prevent connections from having 0 RTT when RTT is too small,
-/// as this would break some BDP calculations and assign zero bandwidth
-pub(crate) const MIN_RTT: Duration = Duration::from_millis(2);
 
 /// How many RTTs worth of delay can we tolerate on stream reassembly
 /// before considering stream to be "too late". 1.5 RTT should be enough
@@ -653,6 +649,24 @@ async fn handle_connection<Q, C>(
         }
 
         qos.on_stream_accepted(&context);
+
+        if qos.should_reset_connection(&context, rtt) {
+            warn!(
+                "Probabilistic load-shed reset: peer={} addr={}",
+                context
+                    .remote_pubkey()
+                    .map_or_else(|| "unknown".to_string(), |pk| pk.to_string()),
+                remote_address,
+            );
+            stats
+                .probabilistic_resets
+                .fetch_add(1, Ordering::Relaxed);
+            connection.close(
+                CONNECTION_CLOSE_CODE_LOAD_SHED.into(),
+                CONNECTION_CLOSE_REASON_LOAD_SHED,
+            );
+            break 'conn;
+        }
 
         let mut meta = Meta::default();
         meta.set_socket_addr(&remote_address);

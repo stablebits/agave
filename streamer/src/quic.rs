@@ -25,7 +25,7 @@ use {
         num::NonZeroUsize,
         sync::{
             Arc, RwLock,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicU64, AtomicUsize, Ordering},
         },
         thread::{self},
         time::Duration,
@@ -233,6 +233,7 @@ pub struct StreamerStats {
     pub(crate) outstanding_incoming_connection_attempts: AtomicUsize,
     pub(crate) total_incoming_connection_attempts: AtomicUsize,
     pub(crate) quic_endpoints_count: AtomicUsize,
+    pub(crate) probabilistic_resets: AtomicUsize,
     /// Unsaturated→saturated transitions since last report.
     pub(crate) transitions_to_saturated: AtomicU64,
     /// Saturated→unsaturated transitions since last report.
@@ -585,6 +586,11 @@ impl StreamerStats {
             (
                 "parked_streams",
                 self.parked_streams.swap(0, Ordering::Relaxed),
+                i64
+            ),
+            (
+                "probabilistic_resets",
+                self.probabilistic_resets.swap(0, Ordering::Relaxed),
                 i64
             ),
             (
