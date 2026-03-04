@@ -73,18 +73,20 @@ impl LoadDebtTracker {
     pub fn is_saturated(&self) -> bool {
         let level = self.bucket.load(Ordering::Relaxed);
         let was_saturated = self.was_saturated.load(Ordering::Relaxed);
-        let saturated = if was_saturated {
+        let (saturated, decision_level) = if was_saturated {
             if level < self.recovery_threshold {
                 self.try_refill();
-                self.bucket.load(Ordering::Relaxed) < self.recovery_threshold
+                let after = self.bucket.load(Ordering::Relaxed);
+                (after < self.recovery_threshold, after)
             } else {
-                false
+                (false, level)
             }
         } else if level <= 0 {
             self.try_refill();
-            self.bucket.load(Ordering::Relaxed) <= 0
+            let after = self.bucket.load(Ordering::Relaxed);
+            (after <= 0, after)
         } else {
-            false
+            (false, level)
         };
         let now_nanos = self.nanos_since_epoch();
         let prev = self.was_saturated.swap(saturated, Ordering::Relaxed);
@@ -94,8 +96,7 @@ impl LoadDebtTracker {
             self.saturated_since_nanos
                 .store(now_nanos, Ordering::Relaxed);
             log::warn!(
-                "LoadDebtTracker: system saturated (bucket={})",
-                self.bucket.load(Ordering::Relaxed),
+                "LoadDebtTracker: system saturated (bucket={decision_level})",
             );
         } else if !saturated && prev {
             self.transitions_to_unsaturated
@@ -106,8 +107,7 @@ impl LoadDebtTracker {
                     .fetch_add(now_nanos - entered, Ordering::Relaxed);
             }
             log::info!(
-                "LoadDebtTracker: system recovered (bucket={})",
-                self.bucket.load(Ordering::Relaxed),
+                "LoadDebtTracker: system recovered (bucket={decision_level})",
             );
         }
         saturated
@@ -160,22 +160,16 @@ impl LoadDebtTracker {
         );
     }
 
-    pub(crate) fn try_refill(&self) {
+    fn try_refill(&self) {
         let now_nanos = self.nanos_since_epoch();
-        self.refill_at(now_nanos, false);
-    }
-
-    /// Force a refill regardless of the interval timer.
-    pub(crate) fn force_refill(&self) {
-        let now_nanos = self.nanos_since_epoch();
-        self.refill_at(now_nanos, true);
+        self.refill_at(now_nanos);
     }
 
     fn nanos_since_epoch(&self) -> u64 {
         self.epoch.elapsed().as_nanos() as u64
     }
 
-    fn refill_at(&self, now_nanos: u64, force: bool) {
+    fn refill_at(&self, now_nanos: u64) {
         const LOCK_BIT: u64 = 1 << 63;
         const NANO_MASK: u64 = !LOCK_BIT;
 
@@ -188,7 +182,7 @@ impl LoadDebtTracker {
             return;
         }
         let elapsed_nanos = now_nanos - last_nanos;
-        if !force && elapsed_nanos < self.refill_interval_nanos {
+        if elapsed_nanos < self.refill_interval_nanos {
             return;
         }
 
@@ -219,7 +213,7 @@ impl LoadDebtTracker {
 
     #[cfg(test)]
     fn refill_at_for_test(&self, now_nanos: u64) {
-        self.refill_at(now_nanos, false);
+        self.refill_at(now_nanos);
     }
 }
 

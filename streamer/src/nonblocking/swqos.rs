@@ -25,10 +25,10 @@ use {
         collections::HashMap,
         future::Future,
         sync::{
-            Arc, RwLock,
+            Arc, OnceLock, RwLock,
             atomic::{AtomicU64, AtomicUsize, Ordering},
         },
-        time::Duration,
+        time::{Duration, Instant},
     },
     tokio::sync::{Mutex, MutexGuard},
     tokio_util::sync::CancellationToken,
@@ -42,6 +42,19 @@ const MAX_RTT: Duration = Duration::from_millis(200);
 
 /// Min RTT for BDP scaling
 const MIN_RTT: Duration = Duration::from_millis(1);
+
+/// Weights for probabilistic reset scoring.
+const RESET_WEIGHT_DEBT: f64 = 0.55;
+const RESET_WEIGHT_RTT: f64 = 0.15;
+const RESET_WEIGHT_STAKE: f64 = 0.30;
+/// Evaluate reset decision no more frequently than this base interval.
+const RESET_EVAL_INTERVAL: Duration = Duration::from_millis(1);
+/// Per-connection jitter on top of [`RESET_EVAL_INTERVAL`].
+const RESET_EVAL_JITTER_MAX_US: u64 = 250;
+/// Maximum reset hazard at score=1.0, in resets per second.
+const RESET_MAX_HAZARD_PER_SEC: f64 = 120.0;
+/// Hard cap to avoid guaranteed resets for high-score peers.
+const RESET_MAX_PROBABILITY: f64 = 0.90;
 
 const DEFAULT_BASE_MAX_STREAMS: u32 = 2048;
 
@@ -127,6 +140,8 @@ pub struct SwQosConnectionContext {
     total_stake: u64,
     in_staked_table: bool,
     last_update: Arc<AtomicU64>,
+    last_reset_eval_us: Arc<AtomicU64>,
+    reset_eval_jitter_us: u64,
     stream_counter: Option<Arc<SwQosStreamerCounter>>,
 }
 
@@ -141,6 +156,15 @@ impl ConnectionContext for SwQosConnectionContext {
 }
 
 impl SwQos {
+    fn monotonic_now_us() -> u64 {
+        static EPOCH: OnceLock<Instant> = OnceLock::new();
+        EPOCH
+            .get_or_init(Instant::now)
+            .elapsed()
+            .as_micros()
+            .min(u64::MAX as u128) as u64
+    }
+
     pub fn load_tracker(&self) -> &LoadDebtTracker {
         &self.load_tracker
     }
@@ -199,7 +223,10 @@ impl SwQos {
     /// staked connections; unstaked are already parked/reset at level-1.
     ///
     /// ```text
-    /// P(reset) = clamp((debt_factor + rtt_factor + stake_factor) / 3, 0, 1)
+    /// evaluate no more than once per (1ms + per-connection jitter)
+    /// score = w_debt * debt_factor + w_rtt * rtt_factor + w_stake * stake_factor
+    /// hazard = RESET_MAX_HAZARD_PER_SEC * score
+    /// P(reset) = clamp(1 - exp(-hazard * dt_seconds), 0, RESET_MAX_PROBABILITY)
     ///   where debt_factor  = clamp((threshold - level) / scale, 0, 1)
     ///         rtt_factor   = clamp(rtt / MAX_RTT, 0, 1)
     ///         stake_factor = clamp(reference_stake / stake, 0, 1)
@@ -224,12 +251,21 @@ impl SwQos {
             return false;
         }
 
-        // Force a refill (bypassing the interval timer) so the bucket
-        // level reflects reality before we make a reset decision.
-        self.load_tracker.force_refill();
-
-        let level = self.load_tracker.bucket_level();
-        if level >= threshold {
+        let now_us = Self::monotonic_now_us();
+        let eval_interval_us = (RESET_EVAL_INTERVAL
+            .as_micros()
+            .min(u64::MAX as u128) as u64)
+            .saturating_add(context.reset_eval_jitter_us);
+        let last_eval_us = context.last_reset_eval_us.load(Ordering::Relaxed);
+        let dt_us = now_us.saturating_sub(last_eval_us);
+        if dt_us < eval_interval_us {
+            return false;
+        }
+        if context
+            .last_reset_eval_us
+            .compare_exchange(last_eval_us, now_us, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
             return false;
         }
 
@@ -244,10 +280,17 @@ impl SwQos {
         let stake_factor =
             (self.config.reset_reference_stake as f64 / (stake.max(1)) as f64).clamp(0.0, 1.0);
 
-        let p = ((debt_factor + rtt_factor + stake_factor) / 3.0).clamp(0.0, 1.0);
-        let reset = if p >= 1.0 {
-            true
-        } else if p <= 0.0 {
+        let score = RESET_WEIGHT_DEBT * debt_factor
+            + RESET_WEIGHT_RTT * rtt_factor
+            + RESET_WEIGHT_STAKE * stake_factor;
+        let hazard_per_sec = RESET_MAX_HAZARD_PER_SEC * score.clamp(0.0, 1.0);
+        let dt_seconds = dt_us as f64 / 1_000_000.0;
+        let p = if hazard_per_sec <= 0.0 || dt_seconds <= 0.0 {
+            0.0
+        } else {
+            (1.0 - (-hazard_per_sec * dt_seconds).exp()).clamp(0.0, RESET_MAX_PROBABILITY)
+        };
+        let reset = if p <= 0.0 {
             false
         } else {
             rand::rng().random_range(0.0..1.0) < p
@@ -255,7 +298,7 @@ impl SwQos {
 
         if reset {
             log::warn!(
-                "Probabilistic load-shed reset: peer={} debt={level}",
+                "Probabilistic load-shed reset: peer={} debt={level} p={p:.3} dt_us={dt_us}",
                 context
                     .remote_pubkey
                     .map_or_else(|| "unknown".to_string(), |pk| pk.to_string()),
@@ -421,6 +464,8 @@ impl QosController<SwQosConnectionContext> for SwQos {
                 remote_pubkey: None,
                 in_staked_table: false,
                 last_update: Arc::new(AtomicU64::new(timing::timestamp())),
+                last_reset_eval_us: Arc::new(AtomicU64::new(Self::monotonic_now_us())),
+                reset_eval_jitter_us: rand::rng().random_range(0..=RESET_EVAL_JITTER_MAX_US),
                 stream_counter: None,
             },
             |(pubkey, stake, total_stake)| {
@@ -440,6 +485,8 @@ impl QosController<SwQosConnectionContext> for SwQos {
                     remote_pubkey: Some(pubkey),
                     in_staked_table: false,
                     last_update: Arc::new(AtomicU64::new(timing::timestamp())),
+                    last_reset_eval_us: Arc::new(AtomicU64::new(Self::monotonic_now_us())),
+                    reset_eval_jitter_us: rand::rng().random_range(0..=RESET_EVAL_JITTER_MAX_US),
                     stream_counter: None,
                 }
             },
@@ -653,6 +700,8 @@ pub mod test {
             total_stake: 0,
             in_staked_table: false,
             last_update: Arc::new(AtomicU64::new(0)),
+            last_reset_eval_us: Arc::new(AtomicU64::new(0)),
+            reset_eval_jitter_us: 0,
             stream_counter: None,
         }
     }
@@ -671,8 +720,20 @@ pub mod test {
             total_stake,
             in_staked_table: true,
             last_update: Arc::new(AtomicU64::new(0)),
+            last_reset_eval_us: Arc::new(AtomicU64::new(0)),
+            reset_eval_jitter_us: 0,
             stream_counter: Some(counter),
         }
+    }
+
+    fn arm_reset_eval(ctx: &SwQosConnectionContext) {
+        let interval_us = (RESET_EVAL_INTERVAL
+            .as_micros()
+            .min(u64::MAX as u128) as u64)
+            .saturating_add(ctx.reset_eval_jitter_us);
+        let now_us = SwQos::monotonic_now_us();
+        ctx.last_reset_eval_us
+            .store(now_us.saturating_sub(interval_us), Ordering::Relaxed);
     }
 
     // ── Saturated path ──────────────────────────────────────────────
@@ -973,6 +1034,7 @@ pub mod test {
         });
         let ctx = staked_context(1_000, 100_000, 1);
         for _ in 0..100 {
+            arm_reset_eval(&ctx);
             assert!(!swqos.should_reset_connection(&ctx, Duration::from_millis(200)));
         }
     }
@@ -990,13 +1052,14 @@ pub mod test {
         );
         let ctx = unstaked_context();
         for _ in 0..100 {
+            arm_reset_eval(&ctx);
             assert!(!swqos.should_reset_connection(&ctx, Duration::from_millis(200)));
         }
     }
 
     #[test]
     fn should_reset_high_probability_scenario() {
-        // Deep debt, high RTT, low stake → near-certain reset.
+        // Deep debt, high RTT, low stake -> high reset probability.
         let swqos = make_swqos_with_debt(
             SwQosConfig {
                 reset_debt_threshold: Some(-10_000),
@@ -1009,13 +1072,15 @@ pub mod test {
         let ctx = staked_context(1_000, 100_000, 1); // low stake
         let rtt = Duration::from_millis(200); // max RTT
 
-        let resets = (0..200)
-            .filter(|_| swqos.should_reset_connection(&ctx, rtt))
+        let resets = (0..1000)
+            .filter(|_| {
+                arm_reset_eval(&ctx);
+                swqos.should_reset_connection(&ctx, rtt)
+            })
             .count();
-        // With debt_factor≈1.0, rtt_factor=1.0, stake_factor=1.0 → P≈1.0
         assert!(
-            resets >= 180,
-            "Expected near-certain resets, got {resets}/200"
+            (50..=300).contains(&resets),
+            "Expected aggressive but non-certain resets, got {resets}/1000"
         );
     }
 
@@ -1033,16 +1098,22 @@ pub mod test {
         );
         let rtt = Duration::from_millis(200);
 
-        // Whale: stake_factor = 50M/5B = 0.01 → P ≈ (1.0+1.0+0.01)/3 ≈ 0.67
+        // Whale: stake_factor = 50M/5B = 0.01 -> substantially lower score.
         let whale = staked_context(5_000_000_000, 10_000_000_000, 1);
         let whale_resets = (0..1000)
-            .filter(|_| swqos.should_reset_connection(&whale, rtt))
+            .filter(|_| {
+                arm_reset_eval(&whale);
+                swqos.should_reset_connection(&whale, rtt)
+            })
             .count();
 
-        // Small: stake_factor = 50M/50M = 1.0 → P ≈ (1.0+1.0+1.0)/3 = 1.0
+        // Small: stake_factor = 50M/50M = 1.0 -> close to cap.
         let small = staked_context(50_000_000, 10_000_000_000, 1);
         let small_resets = (0..1000)
-            .filter(|_| swqos.should_reset_connection(&small, rtt))
+            .filter(|_| {
+                arm_reset_eval(&small);
+                swqos.should_reset_connection(&small, rtt)
+            })
             .count();
 
         // Whale should be reset less often than small staker.
@@ -1066,14 +1137,20 @@ pub mod test {
         );
         let ctx = staked_context(50_000_000, 1_000_000_000, 1);
 
-        // Low RTT: rtt_factor = 2/200 = 0.01 → P ≈ (1.0+0.01+1.0)/3 ≈ 0.67
+        // Low RTT: rtt_factor = 2/200 = 0.01 -> lower score.
         let low_rtt_resets = (0..1000)
-            .filter(|_| swqos.should_reset_connection(&ctx, Duration::from_millis(2)))
+            .filter(|_| {
+                arm_reset_eval(&ctx);
+                swqos.should_reset_connection(&ctx, Duration::from_millis(2))
+            })
             .count();
 
-        // High RTT: rtt_factor = 200/200 = 1.0 → P ≈ (1.0+1.0+1.0)/3 = 1.0
+        // High RTT: rtt_factor = 200/200 = 1.0 -> closer to cap.
         let high_rtt_resets = (0..1000)
-            .filter(|_| swqos.should_reset_connection(&ctx, Duration::from_millis(200)))
+            .filter(|_| {
+                arm_reset_eval(&ctx);
+                swqos.should_reset_connection(&ctx, Duration::from_millis(200))
+            })
             .count();
 
         // Low RTT should be reset less often than high RTT.
