@@ -196,8 +196,7 @@ impl SwQos {
     /// Probabilistic connection reset under deep debt.
     ///
     /// Returns `true` when the connection should be closed. Only applies to
-    /// staked connections; unstaked connections are already parked/reset at
-    /// level-1.
+    /// staked connections; unstaked are already parked/reset at level-1.
     ///
     /// ```text
     /// P(reset) = clamp((debt_factor + rtt_factor + stake_factor) / 3, 0, 1)
@@ -237,14 +236,24 @@ impl SwQos {
             (self.config.reset_reference_stake as f64 / (stake.max(1)) as f64).clamp(0.0, 1.0);
 
         let p = ((debt_factor + rtt_factor + stake_factor) / 3.0).clamp(0.0, 1.0);
-        if p <= 0.0 {
-            return false;
-        }
-        if p >= 1.0 {
-            return true;
+        let reset = if p >= 1.0 {
+            true
+        } else if p <= 0.0 {
+            false
+        } else {
+            rand::rng().random_range(0.0..1.0) < p
+        };
+
+        if reset {
+            log::warn!(
+                "Probabilistic load-shed reset: peer={} debt={level}",
+                context
+                    .remote_pubkey
+                    .map_or_else(|| "unknown".to_string(), |pk| pk.to_string()),
+            );
         }
 
-        rand::rng().random_range(0.0..1.0) < p
+        reset
     }
 
     /// Core MAX_STREAMS computation (testable without a quinn::Connection).

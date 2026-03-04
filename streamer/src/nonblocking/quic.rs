@@ -651,13 +651,6 @@ async fn handle_connection<Q, C>(
         qos.on_stream_accepted(&context);
 
         if qos.should_reset_connection(&context, rtt) {
-            warn!(
-                "Probabilistic load-shed reset: peer={} addr={}",
-                context
-                    .remote_pubkey()
-                    .map_or_else(|| "unknown".to_string(), |pk| pk.to_string()),
-                remote_address,
-            );
             stats
                 .probabilistic_resets
                 .fetch_add(1, Ordering::Relaxed);
