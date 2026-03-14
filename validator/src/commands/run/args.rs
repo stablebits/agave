@@ -765,6 +765,17 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("Controls the max number of streams for a TPU service."),
     )
     .arg(
+        Arg::with_name("tpu_swqos_mode")
+            .long("tpu-swqos-mode")
+            .takes_value(true)
+            .possible_values(&["sleep", "max-streams"])
+            .default_value("sleep")
+            .help(
+                "SwQoS mode: 'sleep' (legacy sleep-based throttling) or 'max-streams' (QUIC \
+                 MAX_STREAMS flow control)",
+            ),
+    )
+    .arg(
         Arg::with_name("num_quic_endpoints")
             .long("num-quic-endpoints")
             .takes_value(true)
@@ -1011,19 +1022,6 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                 "How large the read cache for account data can become, in bytes. The values will \
                  be the low and high watermarks for the cache. When the cache exceeds the high \
                  watermark, entries will be evicted until the size reaches the low watermark.",
-            )
-            .hidden(hidden_unless_forced()),
-    )
-    .arg(
-        Arg::with_name("accounts_db_mark_obsolete_accounts")
-            .long("accounts-db-mark-obsolete-accounts")
-            .help("Controls obsolete account tracking")
-            .takes_value(true)
-            .possible_values(&["enabled", "disabled"])
-            .long_help(
-                "Controls obsolete account tracking. This feature tracks obsolete accounts in the \
-                 account storage entry allowing for earlier cleaning of obsolete accounts in the \
-                 storages and index. This value is currently enabled by default.",
             )
             .hidden(hidden_unless_forced()),
     )

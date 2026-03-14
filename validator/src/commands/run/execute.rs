@@ -18,7 +18,7 @@ use {
     log::*,
     rand::{rng, seq::SliceRandom},
     solana_accounts_db::{
-        accounts_db::{AccountShrinkThreshold, AccountsDbConfig, MarkObsoleteAccounts},
+        accounts_db::{AccountShrinkThreshold, AccountsDbConfig},
         accounts_file::StorageAccess,
         accounts_index::{
             AccountSecondaryIndexes, AccountsIndexConfig, DEFAULT_NUM_ENTRIES_OVERHEAD,
@@ -66,8 +66,13 @@ use {
     solana_runtime::{runtime_config::RuntimeConfig, snapshot_utils},
     solana_signer::Signer,
     solana_streamer::{
-        nonblocking::{simple_qos::SimpleQosConfig, swqos::SwQosConfig},
-        quic::{QuicStreamerConfig, SimpleQosQuicStreamerConfig, SwQosQuicStreamerConfig},
+        nonblocking::{
+            simple_qos::SimpleQosConfig, swqos::SwQosSleepConfig,
+            swqos_max_streams::SwQosMaxStreamsConfig,
+        },
+        quic::{
+            QuicStreamerConfig, SimpleQosQuicStreamerConfig, SwQosConfig, SwQosQuicStreamerConfig,
+        },
     },
     solana_tpu_client::tpu_client::DEFAULT_TPU_CONNECTION_POOL_SIZE,
     solana_turbine::broadcast_stage::BroadcastStageType,
@@ -667,20 +672,6 @@ pub fn execute(
         })
         .unwrap_or_default();
 
-    let mark_obsolete_accounts = matches
-        .value_of("accounts_db_mark_obsolete_accounts")
-        .map(|mark_obsolete_accounts| {
-            match mark_obsolete_accounts {
-                "enabled" => MarkObsoleteAccounts::Enabled,
-                "disabled" => MarkObsoleteAccounts::Disabled,
-                _ => {
-                    // clap will enforce one of the above values is given
-                    unreachable!("invalid value given to accounts_db_mark_obsolete_accounts")
-                }
-            }
-        })
-        .unwrap_or_default();
-
     let accounts_db_config = AccountsDbConfig {
         index: Some(accounts_index_config),
         account_indexes: Some(account_indexes.clone()),
@@ -707,7 +698,6 @@ pub fn execute(
         scan_filter_for_shrinking,
         num_background_threads: Some(accounts_db_background_threads),
         num_foreground_threads: Some(accounts_db_foreground_threads),
-        mark_obsolete_accounts,
         use_registered_io_uring_buffers: resource_limits::check_memlock_limit_for_disk_io(
             solana_accounts_db::accounts_db::TOTAL_IO_URING_BUFFERS_SIZE_LIMIT,
         ),
@@ -980,6 +970,8 @@ pub fn execute(
     let tpu_max_connections_per_ipaddr_per_minute: u64 =
         value_t_or_exit!(matches, "tpu_max_connections_per_ipaddr_per_minute", u64);
     let max_streams_per_ms = value_t_or_exit!(matches, "tpu_max_streams_per_ms", u64);
+    let tpu_swqos_mode = matches.value_of("tpu_swqos_mode").unwrap();
+    info!("TPU SwQoS mode: {tpu_swqos_mode}");
 
     let cluster_entrypoints = entrypoint_addrs
         .iter()
@@ -1067,23 +1059,43 @@ pub fn execute(
     // the one pushed by bootstrap.
     node.info.hot_swap_pubkey(identity_keypair.pubkey());
 
+    // Build a SwQosConfig closure that constructs the correct variant
+    // based on the --tpu-swqos-mode flag, with per-config connection limits.
+    let make_swqos_config = |global_max_staked: u64, global_max_unstaked: u64| -> SwQosConfig {
+        match tpu_swqos_mode {
+            "sleep" => SwQosConfig::Sleep(SwQosSleepConfig {
+                max_connections_per_unstaked_peer: tpu_max_connections_per_unstaked_peer
+                    .try_into()
+                    .unwrap(),
+                max_connections_per_staked_peer: tpu_max_connections_per_staked_peer
+                    .try_into()
+                    .unwrap(),
+                max_staked_connections: global_max_staked.try_into().unwrap(),
+                max_unstaked_connections: global_max_unstaked.try_into().unwrap(),
+                max_streams_per_ms,
+            }),
+            _ => SwQosConfig::MaxStreams(SwQosMaxStreamsConfig {
+                max_connections_per_unstaked_peer: tpu_max_connections_per_unstaked_peer
+                    .try_into()
+                    .unwrap(),
+                max_connections_per_staked_peer: tpu_max_connections_per_staked_peer
+                    .try_into()
+                    .unwrap(),
+                max_staked_connections: global_max_staked.try_into().unwrap(),
+                max_unstaked_connections: global_max_unstaked.try_into().unwrap(),
+                max_streams_per_ms,
+                ..Default::default()
+            }),
+        }
+    };
+
     let tpu_quic_server_config = SwQosQuicStreamerConfig {
         quic_streamer_config: QuicStreamerConfig {
             max_connections_per_ipaddr_per_min: tpu_max_connections_per_ipaddr_per_minute,
             num_threads: tpu_transaction_receive_threads,
             ..Default::default()
         },
-        qos_config: SwQosConfig {
-            max_connections_per_unstaked_peer: tpu_max_connections_per_unstaked_peer
-                .try_into()
-                .unwrap(),
-            max_connections_per_staked_peer: tpu_max_connections_per_staked_peer
-                .try_into()
-                .unwrap(),
-            max_staked_connections: tpu_max_staked_connections.try_into().unwrap(),
-            max_unstaked_connections: tpu_max_unstaked_connections.try_into().unwrap(),
-            max_streams_per_ms,
-        },
+        qos_config: make_swqos_config(tpu_max_staked_connections, tpu_max_unstaked_connections),
     };
 
     let tpu_fwd_quic_server_config = SwQosQuicStreamerConfig {
@@ -1092,17 +1104,10 @@ pub fn execute(
             num_threads: tpu_transaction_forward_receive_threads,
             ..Default::default()
         },
-        qos_config: SwQosConfig {
-            max_connections_per_staked_peer: tpu_max_connections_per_staked_peer
-                .try_into()
-                .unwrap(),
-            max_connections_per_unstaked_peer: tpu_max_connections_per_unstaked_peer
-                .try_into()
-                .unwrap(),
-            max_staked_connections: tpu_max_fwd_staked_connections.try_into().unwrap(),
-            max_unstaked_connections: tpu_max_fwd_unstaked_connections.try_into().unwrap(),
-            max_streams_per_ms,
-        },
+        qos_config: make_swqos_config(
+            tpu_max_fwd_staked_connections,
+            tpu_max_fwd_unstaked_connections,
+        ),
     };
 
     let vote_quic_server_config = SimpleQosQuicStreamerConfig {
