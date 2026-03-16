@@ -443,7 +443,7 @@ impl QosController<SwQosConnectionContext> for SwQos {
         }
     }
 
-    fn on_stream_accepted(&self, conn_context: &SwQosConnectionContext) {
+    fn on_stream_accepted(&self, conn_context: &mut SwQosConnectionContext) {
         self.staked_stream_load_ema
             .increment_load(conn_context.peer_type);
         conn_context

@@ -14,9 +14,11 @@ pub(crate) trait ConnectionContext: Clone + Send + Sync {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum MaxStreamsAction {
+pub(crate) enum MaxStreamsDecision {
     /// This QoS implementation does not manage MAX_STREAMS on this path.
     Unmanaged,
+    /// Keep the previously applied MAX_STREAMS value.
+    Skip,
     /// Apply a MAX_STREAMS value.
     Set(u32),
     /// Park the connection (MAX_STREAMS=0 and park behavior).
@@ -44,7 +46,7 @@ pub(crate) trait QosController<C: ConnectionContext> {
     fn on_new_stream(&self, context: &C) -> impl Future<Output = ()> + Send;
 
     /// Called when a stream is accepted on a connection
-    fn on_stream_accepted(&self, context: &C);
+    fn on_stream_accepted(&self, context: &mut C);
 
     /// Called when a stream is finished successfully
     fn on_stream_finished(&self, context: &C);
@@ -66,9 +68,9 @@ pub(crate) trait QosController<C: ConnectionContext> {
     fn spawn_background_tasks(&mut self) {}
 
     /// Desired MAX_STREAMS action for this connection.
-    fn compute_max_streams(&self, context: &C, rtt: Duration) -> MaxStreamsAction {
+    fn compute_max_streams(&self, context: &mut C, rtt: Duration) -> MaxStreamsDecision {
         let _ = (context, rtt);
-        MaxStreamsAction::Unmanaged
+        MaxStreamsDecision::Unmanaged
     }
 
     /// How many concurrent

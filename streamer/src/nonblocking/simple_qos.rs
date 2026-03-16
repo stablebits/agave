@@ -354,7 +354,7 @@ impl QosController<SimpleQosConnectionContext> for SimpleQos {
         }
     }
 
-    fn on_stream_accepted(&self, _conn_context: &SimpleQosConnectionContext) {}
+    fn on_stream_accepted(&self, _conn_context: &mut SimpleQosConnectionContext) {}
 
     fn on_stream_error(&self, _conn_context: &SimpleQosConnectionContext) {}
 

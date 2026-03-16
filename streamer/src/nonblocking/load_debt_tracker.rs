@@ -1,14 +1,14 @@
 use std::{
+    ops::Deref,
     sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
 /// Global load-debt estimator.
 ///
-/// Connections consume tokens either one-at-a-time via
-/// [`acquire_and_is_saturated`] or in small pre-reserved batches via
-/// [`reserve_batch_and_is_saturated`]. Time-proportional refills happen lazily
-/// via [`try_refill_and_is_saturated`] which callers invoke once per stream.
+/// Connections consume tokens via [`acquire_and_is_saturated`];
+/// time-proportional refills happen lazily via
+/// [`try_refill_and_is_saturated`] which callers invoke once per stream.
 ///
 /// The bucket intentionally goes negative to represent debt, keeping the
 /// system saturated longer — QUIC flow control credit already issued
@@ -32,11 +32,12 @@ use std::{
 /// - relative bias is therefore bounded by `< (1 / I) / max_streams_per_second`.
 ///
 pub struct LoadDebtTracker {
-    bucket: AtomicI64,
-    /// High bit is a lock.
-    last_refill_nanos: AtomicU64,
+    /// Isolated to avoid false sharing with refill bookkeeping.
+    bucket: CachePadded<AtomicI64>,
+    /// High bit is a lock. Isolated to avoid contending with `bucket`.
+    last_refill_nanos: CachePadded<AtomicU64>,
     /// Needed because 0 < bucket < recovery_threshold is ambiguous without history.
-    saturated: AtomicBool,
+    saturated: CachePadded<AtomicBool>,
     epoch: Instant,
     refill_interval_nanos: u64,
     max_streams_per_second: u64,
@@ -47,9 +48,21 @@ pub struct LoadDebtTracker {
 const LOCK_BIT: u64 = 1 << 63;
 const NANO_MASK: u64 = !LOCK_BIT;
 
-pub(crate) struct BatchReservation {
-    pub(crate) saturated: bool,
-    pub(crate) reserved_tokens: usize,
+#[repr(align(64))]
+struct CachePadded<T>(T);
+
+impl<T> CachePadded<T> {
+    const fn new(value: T) -> Self {
+        Self(value)
+    }
+}
+
+impl<T> Deref for CachePadded<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl LoadDebtTracker {
@@ -81,9 +94,9 @@ impl LoadDebtTracker {
 
         let burst_capacity = burst_capacity as i64;
         Self {
-            bucket: AtomicI64::new(burst_capacity),
-            last_refill_nanos: AtomicU64::new(0),
-            saturated: AtomicBool::new(false),
+            bucket: CachePadded::new(AtomicI64::new(burst_capacity)),
+            last_refill_nanos: CachePadded::new(AtomicU64::new(0)),
+            saturated: CachePadded::new(AtomicBool::new(false)),
             epoch: Instant::now(),
             refill_interval_nanos: refill_interval_nanos as u64,
             max_streams_per_second,
@@ -103,59 +116,6 @@ impl LoadDebtTracker {
         }
 
         prev <= 0 || self.saturated.load(Ordering::Relaxed)
-    }
-
-    /// Reserve multiple future stream tokens with a single atomic decrement.
-    /// The current caller is expected to consume one reserved token immediately
-    /// and track the remainder locally.
-    pub(crate) fn reserve_batch_and_is_saturated(&self, batch_size: usize) -> BatchReservation {
-        assert!(batch_size > 0, "batch_size must be > 0");
-        let batch_size_i64 = i64::try_from(batch_size).expect("batch_size must fit i64");
-        let prev = self.bucket.fetch_sub(batch_size_i64, Ordering::Relaxed);
-        let level = prev.saturating_sub(batch_size_i64);
-        let was_sat = self.saturated.load(Ordering::Relaxed);
-        let saturated = if !was_sat && level <= 0 {
-            self.saturated.store(true, Ordering::Relaxed);
-            log::warn!("LoadDebtTracker: system saturated (bucket={level})");
-            true
-        } else {
-            level <= 0 || was_sat
-        };
-
-        BatchReservation {
-            saturated,
-            reserved_tokens: batch_size,
-        }
-    }
-
-    /// Refund previously reserved but unused tokens, e.g. when a connection
-    /// closes before consuming its entire local reservation.
-    pub(crate) fn refund_batch(&self, batch_size: usize) -> bool {
-        if batch_size == 0 {
-            return self.is_saturated();
-        }
-
-        let batch_size_i64 = i64::try_from(batch_size).expect("batch_size must fit i64");
-        let new_level = self.bucket.fetch_add(batch_size_i64, Ordering::Relaxed) + batch_size_i64;
-        let level = if new_level > self.burst_capacity {
-            self.bucket.store(self.burst_capacity, Ordering::Relaxed);
-            self.burst_capacity
-        } else {
-            new_level
-        };
-
-        let was_sat = self.saturated.load(Ordering::Relaxed);
-        if was_sat && level >= self.recovery_threshold {
-            self.saturated.store(false, Ordering::Relaxed);
-            log::info!("LoadDebtTracker: system recovered (bucket={level})");
-            false
-        } else if !was_sat && level <= 0 {
-            self.saturated.store(true, Ordering::Relaxed);
-            log::warn!("LoadDebtTracker: system saturated (bucket={level})");
-            true
-        } else {
-            level <= 0 || was_sat
-        }
     }
 
     /// Whether the system is saturated (pure atomic loads, no syscalls).
@@ -357,25 +317,6 @@ mod tests {
         // Don't consume anything. Refill after 10s → would add 1000.
         g.try_refill_at(10_000_000_000);
         assert_eq!(g.bucket_level(), 100); // capped
-    }
-
-    #[test]
-    fn test_reserve_batch_consumes_multiple_tokens() {
-        let g = simple();
-        let reservation = g.reserve_batch_and_is_saturated(4);
-        assert_eq!(reservation.reserved_tokens, 4);
-        assert!(!reservation.saturated);
-        assert_eq!(g.bucket_level(), 96);
-    }
-
-    #[test]
-    fn test_refund_batch_can_clear_saturation() {
-        let g = simple();
-        acquire_n(&g, 110); // level = -10, saturated
-        let saturated = g.refund_batch(100); // capped to burst/recovery threshold
-        assert_eq!(g.bucket_level(), 90);
-        assert!(!saturated);
-        assert!(!g.is_saturated());
     }
 
     #[test]

@@ -2,7 +2,7 @@ use {
     crate::{
         nonblocking::{
             load_debt_tracker::LoadDebtTracker,
-            qos::{ConnectionContext, MaxStreamsAction, OpaqueStreamerCounter, QosController},
+            qos::{ConnectionContext, MaxStreamsDecision, OpaqueStreamerCounter, QosController},
             quic::{
                 CONNECTION_CLOSE_CODE_DISALLOWED, CONNECTION_CLOSE_REASON_DISALLOWED,
                 ClientConnectionTracker, ConnectionHandlerError, ConnectionPeerType,
@@ -44,7 +44,7 @@ const MIN_RTT: Duration = Duration::from_millis(1);
 /// Base MAX_STREAMS at REFERENCE_RTT. Scales linearly with RTT via BDP.
 const DEFAULT_BASE_MAX_STREAMS_STAKED: u32 = 2048;
 const DEFAULT_BASE_MAX_STREAMS_UNSTAKED: u32 = 20;
-const SATURATED_STAKED_TOKEN_BATCH_SIZE: usize = 4;
+const SATURATED_STAKED_RECHECK_INTERVAL_STREAMS: u8 = 4;
 
 /// Per-key connection counter so compute_max_streams can divide quota evenly.
 pub(crate) struct SwQosMaxStreamsStreamerCounter {
@@ -104,8 +104,8 @@ pub struct SwQosMaxStreamsConnectionContext {
     remote_pubkey: Option<solana_pubkey::Pubkey>,
     total_stake: u64,
     in_staked_table: bool,
+    saturated_recheck_countdown: u8,
     last_update: Arc<AtomicU64>,
-    reserved_tokens: Arc<AtomicUsize>,
     stream_counter: Option<Arc<SwQosMaxStreamsStreamerCounter>>,
 }
 
@@ -322,8 +322,8 @@ impl QosController<SwQosMaxStreamsConnectionContext> for SwQosMaxStreams {
                 total_stake: 0,
                 remote_pubkey: None,
                 in_staked_table: false,
+                saturated_recheck_countdown: 0,
                 last_update: Arc::new(AtomicU64::new(timing::timestamp())),
-                reserved_tokens: Arc::new(AtomicUsize::new(0)),
                 stream_counter: None,
             },
             |(pubkey, stake, total_stake)| {
@@ -342,8 +342,8 @@ impl QosController<SwQosMaxStreamsConnectionContext> for SwQosMaxStreams {
                     total_stake,
                     remote_pubkey: Some(pubkey),
                     in_staked_table: false,
+                    saturated_recheck_countdown: 0,
                     last_update: Arc::new(AtomicU64::new(timing::timestamp())),
-                    reserved_tokens: Arc::new(AtomicUsize::new(0)),
                     stream_counter: None,
                 }
             },
@@ -458,44 +458,41 @@ impl QosController<SwQosMaxStreamsConnectionContext> for SwQosMaxStreams {
 
     fn compute_max_streams(
         &self,
-        context: &SwQosMaxStreamsConnectionContext,
+        context: &mut SwQosMaxStreamsConnectionContext,
         rtt: Duration,
-    ) -> MaxStreamsAction {
+    ) -> MaxStreamsDecision {
+        if matches!(context.peer_type, ConnectionPeerType::Staked(_))
+            && context.saturated_recheck_countdown > 0
+        {
+            return MaxStreamsDecision::Skip;
+        }
+
         let saturated = self.load_tracker.try_refill_and_is_saturated();
+        context.saturated_recheck_countdown =
+            if saturated && matches!(context.peer_type, ConnectionPeerType::Staked(_)) {
+                SATURATED_STAKED_RECHECK_INTERVAL_STREAMS
+            } else {
+                0
+            };
         match self.compute_max_streams_for_rtt(context, rtt, saturated) {
-            Some(0) => MaxStreamsAction::Park,
-            Some(max_streams) => MaxStreamsAction::Set(max_streams),
-            None => MaxStreamsAction::Unmanaged,
+            Some(0) => MaxStreamsDecision::Park,
+            Some(max_streams) => MaxStreamsDecision::Set(max_streams),
+            None => MaxStreamsDecision::Unmanaged,
         }
     }
 
-    fn on_stream_accepted(&self, context: &SwQosMaxStreamsConnectionContext) {
-        let saturated = match context.peer_type {
-            ConnectionPeerType::Unstaked => self.load_tracker.acquire_and_is_saturated(),
-            ConnectionPeerType::Staked(_) => {
-                let reserved = context.reserved_tokens.load(Ordering::Relaxed);
-                if reserved > 0 {
-                    context
-                        .reserved_tokens
-                        .store(reserved - 1, Ordering::Relaxed);
-                    self.load_tracker.is_saturated()
-                } else if self.load_tracker.is_saturated() {
-                    let reservation = self
-                        .load_tracker
-                        .reserve_batch_and_is_saturated(SATURATED_STAKED_TOKEN_BATCH_SIZE);
-                    context
-                        .reserved_tokens
-                        .store(reservation.reserved_tokens - 1, Ordering::Relaxed);
-                    reservation.saturated
-                } else {
-                    self.load_tracker.acquire_and_is_saturated()
-                }
+    fn on_stream_accepted(&self, context: &mut SwQosMaxStreamsConnectionContext) {
+        let saturated = self.load_tracker.acquire_and_is_saturated();
+        if matches!(context.peer_type, ConnectionPeerType::Staked(_)) {
+            if saturated {
+                context.saturated_recheck_countdown =
+                    context.saturated_recheck_countdown.saturating_sub(1);
+                self.stats
+                    .saturated_staked_streams
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                context.saturated_recheck_countdown = 0;
             }
-        };
-        if matches!(context.peer_type, ConnectionPeerType::Staked(_)) && saturated {
-            self.stats
-                .saturated_staked_streams
-                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -510,11 +507,6 @@ impl QosController<SwQosMaxStreamsConnectionContext> for SwQosMaxStreams {
         connection: Connection,
     ) -> impl Future<Output = usize> + Send {
         async move {
-            let reserved = conn_context.reserved_tokens.swap(0, Ordering::Relaxed);
-            if reserved > 0 {
-                let _ = self.load_tracker.refund_batch(reserved);
-            }
-
             if let Some(ref counter) = conn_context.stream_counter {
                 counter.connection_count.fetch_sub(1, Ordering::Relaxed);
             }
@@ -575,8 +567,8 @@ pub mod test {
             remote_pubkey: None,
             total_stake: 0,
             in_staked_table: false,
+            saturated_recheck_countdown: 0,
             last_update: Arc::new(AtomicU64::new(0)),
-            reserved_tokens: Arc::new(AtomicUsize::new(0)),
             stream_counter: None,
         }
     }
@@ -594,8 +586,8 @@ pub mod test {
             remote_pubkey: Some(solana_pubkey::Pubkey::new_unique()),
             total_stake,
             in_staked_table: true,
+            saturated_recheck_countdown: 0,
             last_update: Arc::new(AtomicU64::new(0)),
-            reserved_tokens: Arc::new(AtomicUsize::new(0)),
             stream_counter: Some(counter),
         }
     }
@@ -615,37 +607,6 @@ pub mod test {
     }
 
     // -- Saturated path --
-
-    #[test]
-    fn test_saturated_staked_stream_accept_uses_batch_reservation() {
-        let swqos = make_swqos(SwQosMaxStreamsConfig::default());
-        let ctx = staked_context(1_000, 100_000, 1);
-        for _ in 0..swqos.load_tracker().bucket_level() {
-            let _ = swqos.load_tracker().acquire_and_is_saturated();
-        }
-        assert!(swqos.load_tracker().is_saturated());
-
-        let level_before = swqos.load_tracker().bucket_level();
-        swqos.on_stream_accepted(&ctx);
-        assert_eq!(
-            ctx.reserved_tokens.load(Ordering::Relaxed),
-            SATURATED_STAKED_TOKEN_BATCH_SIZE - 1
-        );
-        assert_eq!(
-            swqos.load_tracker().bucket_level(),
-            level_before - SATURATED_STAKED_TOKEN_BATCH_SIZE as i64
-        );
-
-        swqos.on_stream_accepted(&ctx);
-        assert_eq!(
-            ctx.reserved_tokens.load(Ordering::Relaxed),
-            SATURATED_STAKED_TOKEN_BATCH_SIZE - 2
-        );
-        assert_eq!(
-            swqos.load_tracker().bucket_level(),
-            level_before - SATURATED_STAKED_TOKEN_BATCH_SIZE as i64
-        );
-    }
 
     #[test]
     fn test_saturated_unstaked_returns_zero() {
@@ -755,6 +716,46 @@ pub mod test {
             swqos.compute_max_streams_for_rtt(&ctx, Duration::from_millis(50), true),
             Some(1),
         );
+    }
+
+    #[test]
+    fn test_saturated_staked_recheck_countdown_skips_until_consumed() {
+        let swqos = make_swqos(SwQosMaxStreamsConfig {
+            max_streams_per_ms: 1,
+            ..SwQosMaxStreamsConfig::default()
+        });
+        let mut ctx = staked_context(1_000, 100_000, 1);
+        let initial_bucket = swqos.load_tracker().bucket_level();
+        for _ in 0..initial_bucket {
+            let _ = swqos.load_tracker().acquire_and_is_saturated();
+        }
+        assert!(swqos.load_tracker().is_saturated());
+
+        let action =
+            <SwQosMaxStreams as QosController<SwQosMaxStreamsConnectionContext>>::compute_max_streams(
+                &swqos,
+                &mut ctx,
+                Duration::from_millis(50),
+            );
+        assert!(matches!(action, MaxStreamsDecision::Set(_)));
+
+        for accepted in 1..=SATURATED_STAKED_RECHECK_INTERVAL_STREAMS {
+            <SwQosMaxStreams as QosController<SwQosMaxStreamsConnectionContext>>::on_stream_accepted(
+                &swqos,
+                &mut ctx,
+            );
+            let decision =
+                <SwQosMaxStreams as QosController<SwQosMaxStreamsConnectionContext>>::compute_max_streams(
+                    &swqos,
+                    &mut ctx,
+                    Duration::from_millis(50),
+                );
+            if accepted == SATURATED_STAKED_RECHECK_INTERVAL_STREAMS {
+                assert!(matches!(decision, MaxStreamsDecision::Set(_)));
+            } else {
+                assert_eq!(decision, MaxStreamsDecision::Skip);
+            }
+        }
     }
 
     // -- Unsaturated path --

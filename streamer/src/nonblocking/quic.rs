@@ -2,7 +2,7 @@ use {
     crate::{
         nonblocking::{
             connection_rate_limiter::ConnectionRateLimiter,
-            qos::{ConnectionContext, MaxStreamsAction, OpaqueStreamerCounter, QosController},
+            qos::{ConnectionContext, MaxStreamsDecision, OpaqueStreamerCounter, QosController},
         },
         quic::{QuicServerError, QuicStreamerConfig, StreamerStats, configure_server},
         quic_socket::QuicSocket,
@@ -602,6 +602,7 @@ async fn handle_connection<Q, C>(
     Q: QosController<C> + Send + Sync + 'static,
     C: ConnectionContext + Send + Sync + 'static,
 {
+    let mut context = context;
     let peer_type = context.peer_type();
     let mut park_recheck_backoff = ParkRecheckBackoff::new();
     let mut last_applied_max_streams: Option<u32> = None;
@@ -618,9 +619,9 @@ async fn handle_connection<Q, C>(
     // it is not the end of the world.
     let rtt = connection.rtt();
     'conn: loop {
-        match qos.compute_max_streams(&context, rtt) {
-            MaxStreamsAction::Unmanaged => {}
-            MaxStreamsAction::Set(max_streams) => {
+        match qos.compute_max_streams(&mut context, rtt) {
+            MaxStreamsDecision::Unmanaged | MaxStreamsDecision::Skip => {}
+            MaxStreamsDecision::Set(max_streams) => {
                 debug_assert!(max_streams > 0, "Set(0) should use Park");
                 if max_streams > 0 && last_applied_max_streams != Some(max_streams) {
                     connection.set_max_concurrent_uni_streams(VarInt::from_u32(max_streams));
@@ -629,7 +630,7 @@ async fn handle_connection<Q, C>(
                 // Unparked: restore fast re-checks for the next time this connection parks.
                 park_recheck_backoff.reset();
             }
-            MaxStreamsAction::Park => {
+            MaxStreamsDecision::Park => {
                 if last_applied_max_streams != Some(0) {
                     connection.set_max_concurrent_uni_streams(VarInt::from_u32(0));
                     last_applied_max_streams = Some(0);
@@ -660,7 +661,7 @@ async fn handle_connection<Q, C>(
         };
 
         qos.on_new_stream(&context).await;
-        qos.on_stream_accepted(&context);
+        qos.on_stream_accepted(&mut context);
         stats.active_streams.fetch_add(1, Ordering::Relaxed);
         stats.total_new_streams.fetch_add(1, Ordering::Relaxed);
 
