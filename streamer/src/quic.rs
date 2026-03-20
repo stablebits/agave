@@ -237,6 +237,7 @@ pub struct StreamerStats {
     pub(crate) quic_endpoints_count: AtomicUsize,
     /// Streams accepted while the system was saturated (staked peers).
     pub(crate) saturated_staked_streams: AtomicUsize,
+    pub(crate) load_shed_resets: AtomicUsize,
 }
 
 impl StreamerStats {
@@ -556,6 +557,11 @@ impl StreamerStats {
             (
                 "saturated_staked_streams",
                 self.saturated_staked_streams.swap(0, Ordering::Relaxed),
+                i64
+            ),
+            (
+                "load_shed_resets",
+                self.load_shed_resets.swap(0, Ordering::Relaxed),
                 i64
             ),
         );

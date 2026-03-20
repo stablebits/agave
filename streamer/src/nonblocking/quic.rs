@@ -2,7 +2,10 @@ use {
     crate::{
         nonblocking::{
             connection_rate_limiter::ConnectionRateLimiter,
-            qos::{ConnectionContext, MaxStreamsAction, OpaqueStreamerCounter, QosController},
+            qos::{
+                ConnectionContext, MaxStreamsAction, OpaqueStreamerCounter, QosController,
+                StreamAcceptedAction,
+            },
         },
         quic::{QuicServerError, QuicStreamerConfig, StreamerStats, configure_server},
         quic_socket::QuicSocket,
@@ -70,6 +73,9 @@ const CONNECTION_CLOSE_REASON_TOO_MANY: &[u8] = b"too_many";
 
 const CONNECTION_CLOSE_CODE_INVALID_STREAM: u32 = 5;
 const CONNECTION_CLOSE_REASON_INVALID_STREAM: &[u8] = b"invalid_stream";
+
+const CONNECTION_CLOSE_CODE_LOAD_SHED: u32 = 6;
+const CONNECTION_CLOSE_REASON_LOAD_SHED: &[u8] = b"load_shed";
 
 /// Total new connection counts per second. Heuristically taken from
 /// the default staked and unstaked connection limits. Might be adjusted
@@ -613,9 +619,11 @@ async fn handle_connection<Q, C>(
     );
     stats.total_connections.fetch_add(1, Ordering::Relaxed);
 
-    // cache the RTT to avoid grabbing lock for every stream.
-    // we only use that for some stats here, so if it gets stale during connection lifetime
-    // it is not the end of the world.
+    // Cache an early RTT estimate to avoid grabbing a lock for every stream.
+    // MAX_STREAMS uses this value for the connection lifetime for now, even
+    // though the true RTT may drift over time and the initial sample can be
+    // noisy or sender-influenced. Another alternative would be to sample it
+    // periodically.
     let rtt = connection.rtt();
     'conn: loop {
         match qos.compute_max_streams(&context, rtt) {
@@ -660,9 +668,19 @@ async fn handle_connection<Q, C>(
         };
 
         qos.on_new_stream(&context).await;
-        qos.on_stream_accepted(&context);
-        stats.active_streams.fetch_add(1, Ordering::Relaxed);
+        let stream_action = qos.on_stream_accepted(&context);
         stats.total_new_streams.fetch_add(1, Ordering::Relaxed);
+
+        if matches!(stream_action, StreamAcceptedAction::CloseConnection) {
+            stats.load_shed_resets.fetch_add(1, Ordering::Relaxed);
+            connection.close(
+                CONNECTION_CLOSE_CODE_LOAD_SHED.into(),
+                CONNECTION_CLOSE_REASON_LOAD_SHED,
+            );
+            break 'conn;
+        }
+
+        stats.active_streams.fetch_add(1, Ordering::Relaxed);
 
         let mut meta = Meta::default();
         meta.set_socket_addr(&remote_address);
