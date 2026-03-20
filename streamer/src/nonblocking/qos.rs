@@ -23,6 +23,12 @@ pub(crate) enum MaxStreamsAction {
     Park,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum StreamAcceptedAction {
+    Continue,
+    CloseConnection,
+}
+
 /// A trait to manage QoS for connections. This includes
 /// 1) deriving the ConnectionContext for a connection
 /// 2) managing connection caching and connection limits, stream limits
@@ -43,8 +49,8 @@ pub(crate) trait QosController<C: ConnectionContext> {
     /// Called when a new stream is received on a connection
     fn on_new_stream(&self, context: &C) -> impl Future<Output = ()> + Send;
 
-    /// Called when a stream is accepted on a connection
-    fn on_stream_accepted(&self, context: &C);
+    /// Called when a stream is accepted on a connection.
+    fn on_stream_accepted(&self, context: &C) -> StreamAcceptedAction;
 
     /// Called when a stream is finished successfully
     fn on_stream_finished(&self, context: &C);

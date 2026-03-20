@@ -1,7 +1,7 @@
 use {
     crate::{
         nonblocking::{
-            qos::{ConnectionContext, OpaqueStreamerCounter, QosController},
+            qos::{ConnectionContext, OpaqueStreamerCounter, QosController, StreamAcceptedAction},
             quic::{
                 CONNECTION_CLOSE_CODE_DISALLOWED, CONNECTION_CLOSE_REASON_DISALLOWED,
                 ClientConnectionTracker, ConnectionHandlerError, ConnectionPeerType,
@@ -353,7 +353,12 @@ impl QosController<SimpleQosConnectionContext> for SimpleQos {
         }
     }
 
-    fn on_stream_accepted(&self, _conn_context: &SimpleQosConnectionContext) {}
+    fn on_stream_accepted(
+        &self,
+        _conn_context: &SimpleQosConnectionContext,
+    ) -> StreamAcceptedAction {
+        StreamAcceptedAction::Continue
+    }
 
     fn on_stream_error(&self, _conn_context: &SimpleQosConnectionContext) {}
 

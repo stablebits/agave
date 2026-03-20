@@ -125,8 +125,7 @@ impl LoadDebtTracker {
         self.saturated.load(Ordering::Relaxed)
     }
 
-    /// Return the current bucket level (testing only).
-    #[cfg(test)]
+    /// Return the current bucket level.
     pub fn bucket_level(&self) -> i64 {
         self.bucket.load(Ordering::Relaxed)
     }
@@ -217,6 +216,13 @@ impl LoadDebtTracker {
         } else if log_recovered {
             log::info!("LoadDebtTracker: system recovered (bucket={log_level})");
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn advance_time_for_tests(&self, delta: Duration) {
+        let delta_nanos = delta.as_nanos().min(u64::MAX as u128) as u64;
+        let now_nanos = self.nanos_since_epoch().saturating_add(delta_nanos);
+        self.update_state_at(now_nanos, false);
     }
 }
 

@@ -2,7 +2,10 @@ use {
     crate::{
         nonblocking::{
             load_debt_tracker::LoadDebtTracker,
-            qos::{ConnectionContext, MaxStreamsAction, OpaqueStreamerCounter, QosController},
+            qos::{
+                ConnectionContext, MaxStreamsAction, OpaqueStreamerCounter, QosController,
+                StreamAcceptedAction,
+            },
             quic::{
                 CONNECTION_CLOSE_CODE_DISALLOWED, CONNECTION_CLOSE_REASON_DISALLOWED,
                 ClientConnectionTracker, ConnectionHandlerError, ConnectionPeerType,
@@ -19,14 +22,15 @@ use {
     },
     percentage::Percentage,
     quinn::Connection,
+    solana_net_utils::token_bucket::TokenBucket,
     solana_time_utils as timing,
     std::{
         future::Future,
         sync::{
-            Arc, RwLock,
-            atomic::{AtomicU64, AtomicUsize, Ordering},
+            Arc, Mutex as StdMutex, OnceLock, RwLock,
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         },
-        time::Duration,
+        time::{Duration, Instant},
     },
     tokio::sync::{Mutex, MutexGuard},
     tokio_util::sync::CancellationToken,
@@ -50,10 +54,41 @@ const MIN_RTT_STAKED_UNSATURATED: Duration = Duration::from_millis(50);
 /// ceiling for the highest-staked peers; scaling remains linear with RTT.
 const DEFAULT_BASE_MAX_STREAMS_STAKED: u32 = 1024;
 const DEFAULT_BASE_MAX_STREAMS_UNSTAKED: u32 = 20;
+/// Burst window for emergency sender token buckets. Senders have different
+/// RTTs, but saturated MAX_STREAMS is scaled and then capped at MAX_RTT, so
+/// Phase 2 normalizes all senders to the same MAX_RTT-sized fair-share window
+/// instead of tracking per-sender RTT here.
+const EMERGENCY_BUCKET_WINDOW: Duration = MAX_RTT;
 
-/// Per-key connection counter so compute_max_streams can divide quota evenly.
+struct EmergencySenderBucketState {
+    /// Monotonic identifier of the emergency episode that initialized the
+    /// current snapshot.
+    bucket_generation: u64,
+    /// Snapshot sender bucket for `bucket_generation`. We do not adjust it for
+    /// later connection-count churn until the next emergency generation.
+    sender_bucket: Option<Arc<TokenBucket>>,
+    /// Sender-wide bucket capacity snapped for `bucket_generation`, in streams
+    /// per fixed emergency bucket window.
+    bucket_capacity_streams: u64,
+}
+
+/// Per-key sender state shared across that sender's connections in one table.
 pub(crate) struct SwQosMaxStreamsStreamerCounter {
     connection_count: AtomicUsize,
+    emergency_state: StdMutex<EmergencySenderBucketState>,
+}
+
+impl SwQosMaxStreamsStreamerCounter {
+    fn new() -> Self {
+        Self {
+            connection_count: AtomicUsize::new(0),
+            emergency_state: StdMutex::new(EmergencySenderBucketState {
+                bucket_generation: 0,
+                sender_bucket: None,
+                bucket_capacity_streams: 0,
+            }),
+        }
+    }
 }
 impl OpaqueStreamerCounter for SwQosMaxStreamsStreamerCounter {}
 
@@ -66,6 +101,9 @@ pub struct SwQosMaxStreamsConfig {
     pub max_connections_per_unstaked_peer: usize,
     pub base_max_streams_staked: u32,
     pub base_max_streams_unstaked: u32,
+    /// Bucket level at which emergency sender buckets begin.
+    /// `None` = disabled. `Some(0)` = auto (`-burst_capacity`).
+    pub emergency_debt_threshold: Option<i64>,
 }
 
 impl Default for SwQosMaxStreamsConfig {
@@ -78,6 +116,7 @@ impl Default for SwQosMaxStreamsConfig {
             max_connections_per_unstaked_peer: DEFAULT_MAX_QUIC_CONNECTIONS_PER_UNSTAKED_PEER,
             base_max_streams_staked: DEFAULT_BASE_MAX_STREAMS_STAKED,
             base_max_streams_unstaked: DEFAULT_BASE_MAX_STREAMS_UNSTAKED,
+            emergency_debt_threshold: Some(0),
         }
     }
 }
@@ -96,6 +135,14 @@ impl SwQosMaxStreamsConfig {
 pub struct SwQosMaxStreams {
     config: SwQosMaxStreamsConfig,
     capacity_tps: u64,
+    /// Resolved threshold for emergency sender buckets (`None` = disabled).
+    emergency_debt_threshold: Option<i64>,
+    /// Sticky while saturated. Exit is evaluated lazily on accepted streams, so
+    /// this flag can remain true during idle recovery until the next stream.
+    emergency_active: AtomicBool,
+    emergency_generation: AtomicU64,
+    emergency_entered_us: AtomicU64,
+    emergency_transition_lock: StdMutex<()>,
     load_tracker: Arc<LoadDebtTracker>,
     stats: Arc<StreamerStats>,
     staked_nodes: Arc<RwLock<StakedNodes>>,
@@ -124,6 +171,15 @@ impl ConnectionContext for SwQosMaxStreamsConnectionContext {
 }
 
 impl SwQosMaxStreams {
+    fn monotonic_now_us() -> u64 {
+        static EPOCH: OnceLock<Instant> = OnceLock::new();
+        EPOCH
+            .get_or_init(Instant::now)
+            .elapsed()
+            .as_micros()
+            .min(u64::MAX as u128) as u64
+    }
+
     pub fn load_tracker(&self) -> &LoadDebtTracker {
         &self.load_tracker
     }
@@ -134,12 +190,22 @@ impl SwQosMaxStreams {
         staked_nodes: Arc<RwLock<StakedNodes>>,
         cancel: CancellationToken,
     ) -> Self {
-        let max_streams_per_second = config.max_streams_per_ms * 1000;
+        let max_streams_per_second = config.max_streams_per_ms.saturating_mul(1000);
         let burst_capacity = max_streams_per_second / 10;
+
+        // Resolve threshold: None → disabled, Some(0) → -burst_capacity.
+        let emergency_debt_threshold = config
+            .emergency_debt_threshold
+            .map(|t| if t == 0 { -(burst_capacity as i64) } else { t });
 
         Self {
             config,
             capacity_tps: max_streams_per_second,
+            emergency_debt_threshold,
+            emergency_active: AtomicBool::new(false),
+            emergency_generation: AtomicU64::new(0),
+            emergency_entered_us: AtomicU64::new(0),
+            emergency_transition_lock: StdMutex::new(()),
             load_tracker: Arc::new(LoadDebtTracker::new(
                 max_streams_per_second,
                 burst_capacity,
@@ -209,6 +275,201 @@ impl SwQosMaxStreams {
             Some(unsat_max.max(1))
         }
     }
+
+    fn sender_connection_count(context: &SwQosMaxStreamsConnectionContext) -> u32 {
+        context
+            .stream_counter
+            .as_ref()
+            .map(|c| c.connection_count.load(Ordering::Relaxed))
+            .unwrap_or(1)
+            .max(1) as u32
+    }
+
+    fn compute_sender_bucket_capacity_streams(
+        &self,
+        context: &SwQosMaxStreamsConnectionContext,
+    ) -> u64 {
+        let Some(per_connection_quota) =
+            self.compute_max_streams_for_rtt(context, EMERGENCY_BUCKET_WINDOW, true)
+        else {
+            return 0;
+        };
+
+        u64::from(per_connection_quota)
+            .saturating_mul(u64::from(Self::sender_connection_count(context)))
+    }
+
+    fn sender_bucket_snapshot(
+        &self,
+        context: &SwQosMaxStreamsConnectionContext,
+        generation: u64,
+    ) -> Option<(Arc<TokenBucket>, u64)> {
+        let stream_counter = context.stream_counter.as_ref()?;
+        let mut state = stream_counter.emergency_state.lock().unwrap();
+
+        if state.bucket_generation != generation {
+            state.bucket_generation = generation;
+            state.bucket_capacity_streams = self.compute_sender_bucket_capacity_streams(context);
+            state.sender_bucket = (state.bucket_capacity_streams > 0).then(|| {
+                let refill_per_second =
+                    state.bucket_capacity_streams as f64 / EMERGENCY_BUCKET_WINDOW.as_secs_f64();
+                Arc::new(TokenBucket::new(
+                    state.bucket_capacity_streams,
+                    state.bucket_capacity_streams,
+                    refill_per_second,
+                ))
+            });
+        }
+
+        state
+            .sender_bucket
+            .as_ref()
+            .map(|bucket| (bucket.clone(), state.bucket_capacity_streams))
+    }
+
+    fn consume_emergency_bucket_token(
+        &self,
+        context: &SwQosMaxStreamsConnectionContext,
+        generation: u64,
+        level: i64,
+    ) -> bool {
+        let should_close = self
+            .emergency_debt_threshold
+            .is_some_and(|threshold| level <= threshold);
+        let log_bucket_exhausted = |remaining_streams: u64, capacity_streams: u64| {
+            let peer = context
+                .remote_pubkey
+                .map_or_else(|| "unknown".to_string(), |pk| pk.to_string());
+            let window_ms = EMERGENCY_BUCKET_WINDOW.as_millis();
+            let now_us = Self::monotonic_now_us();
+            let emergency_entered_ms_ago =
+                now_us.saturating_sub(self.emergency_entered_us.load(Ordering::Relaxed)) as f64
+                    / 1_000.0;
+            log::warn!(
+                "SwQosMaxStreams: emergency sender bucket exhausted for peer={peer} \
+                 (bucket={level}, generation={generation}, remaining_streams={remaining_streams}, \
+                 allocated_streams_per_{window_ms}ms={capacity_streams}, \
+                 refill_streams_per_{window_ms}ms={capacity_streams}, \
+                 emergency_entered_ms_ago={emergency_entered_ms_ago:.3})",
+            );
+        };
+        let Some((bucket, capacity_streams)) = self.sender_bucket_snapshot(context, generation)
+        else {
+            if !should_close {
+                return false;
+            }
+            // A snapshot bucket is absent when the sender-wide emergency
+            // capacity is zero. In practice this is how unstaked senders
+            // appear in Phase 2, since saturated MAX_STREAMS parks them.
+            log_bucket_exhausted(0, 0);
+            return true;
+        };
+
+        if bucket.consume_tokens(1).is_ok() {
+            return false;
+        }
+
+        if !should_close {
+            return false;
+        }
+
+        log_bucket_exhausted(bucket.current_tokens(), capacity_streams);
+        true
+    }
+
+    fn current_emergency_generation(&self, level: i64) -> Option<u64> {
+        let threshold = self.emergency_debt_threshold?;
+
+        if level <= threshold {
+            if self.emergency_active.load(Ordering::Relaxed) {
+                return Some(self.emergency_generation.load(Ordering::Relaxed));
+            }
+
+            let entered_generation = {
+                let _guard = self.emergency_transition_lock.lock().unwrap();
+                if !self.emergency_active.load(Ordering::Relaxed) {
+                    let entered_us = Self::monotonic_now_us();
+                    let generation = self.emergency_generation.fetch_add(1, Ordering::Relaxed) + 1;
+                    self.emergency_active.store(true, Ordering::Relaxed);
+                    self.emergency_entered_us
+                        .store(entered_us, Ordering::Relaxed);
+                    Some(generation)
+                } else {
+                    None
+                }
+            };
+            if let Some(generation) = entered_generation {
+                log::warn!(
+                    "SwQosMaxStreams: emergency sender-bucket mode entered (bucket={level}, \
+                     generation={generation})"
+                );
+                return Some(generation);
+            }
+
+            return Some(self.emergency_generation.load(Ordering::Relaxed));
+        }
+
+        if self.emergency_active.load(Ordering::Relaxed) {
+            // Keep emergency active until saturation fully clears. The flag may
+            // therefore stay true during idle recovery until a later stream
+            // re-enters this path and observes that saturation is gone.
+            if self.load_tracker.is_saturated() {
+                return Some(self.emergency_generation.load(Ordering::Relaxed));
+            }
+
+            let exited_generation = {
+                let _guard = self.emergency_transition_lock.lock().unwrap();
+                if self.emergency_active.load(Ordering::Relaxed)
+                    && !self.load_tracker.is_saturated()
+                {
+                    self.emergency_active.store(false, Ordering::Relaxed);
+                    Some(self.emergency_generation.load(Ordering::Relaxed))
+                } else {
+                    None
+                }
+            };
+            if let Some(generation) = exited_generation {
+                log::info!(
+                    "SwQosMaxStreams: emergency sender-bucket mode exited (bucket={level}, \
+                     generation={generation})"
+                );
+                return None;
+            }
+
+            return Some(self.emergency_generation.load(Ordering::Relaxed));
+        }
+
+        None
+    }
+
+    fn consume_emergency_sender_bucket(&self, context: &SwQosMaxStreamsConnectionContext) -> bool {
+        let level = self.load_tracker.bucket_level();
+        let Some(generation) = self.current_emergency_generation(level) else {
+            return false;
+        };
+        self.consume_emergency_bucket_token(context, generation, level)
+    }
+
+    fn handle_accepted_stream(
+        &self,
+        context: &SwQosMaxStreamsConnectionContext,
+    ) -> StreamAcceptedAction {
+        if self.consume_emergency_sender_bucket(context) {
+            StreamAcceptedAction::CloseConnection
+        } else {
+            // Only charge debt for streams that actually enter processing. This
+            // means emergency entry can lag by one stream, which is acceptable
+            // because the tracker is already intentionally approximate.
+            self.load_tracker.acquire();
+            let saturated = self.load_tracker.is_saturated();
+            if matches!(context.peer_type, ConnectionPeerType::Staked(_)) && saturated {
+                self.stats
+                    .saturated_staked_streams
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            StreamAcceptedAction::Continue
+        }
+    }
 }
 
 impl SwQosMaxStreams {
@@ -241,11 +502,7 @@ impl SwQosMaxStreams {
                 conn_context.peer_type(),
                 conn_context.last_update.clone(),
                 max_connections_per_peer,
-                || {
-                    Arc::new(SwQosMaxStreamsStreamerCounter {
-                        connection_count: AtomicUsize::new(0),
-                    })
-                },
+                || Arc::new(SwQosMaxStreamsStreamerCounter::new()),
             )
         {
             stream_counter
@@ -406,8 +663,9 @@ impl QosController<SwQosMaxStreamsConnectionContext> for SwQosMaxStreams {
                         //
                         // NOTE: This fallback can place the same staked pubkey in both tables.
                         // The per-peer stream counter is table-local, so saturated per-connection
-                        // quota division can temporarily over-allocate for that pubkey (bounded
-                        // in practice by two tables). This is an accepted approximation.
+                        // quota division and emergency buckets can temporarily over-allocate
+                        // for that pubkey (bounded in practice by two tables). This is an
+                        // accepted approximation.
                         if let Ok((last_update, cancel_connection, stream_counter)) = self
                             .prune_unstaked_connections_and_add_new_connection(
                                 client_connection_tracker,
@@ -478,15 +736,11 @@ impl QosController<SwQosMaxStreamsConnectionContext> for SwQosMaxStreams {
         }
     }
 
-    fn on_stream_accepted(&self, context: &SwQosMaxStreamsConnectionContext) {
-        self.load_tracker.acquire();
-        if matches!(context.peer_type, ConnectionPeerType::Staked(_))
-            && self.load_tracker.is_saturated()
-        {
-            self.stats
-                .saturated_staked_streams
-                .fetch_add(1, Ordering::Relaxed);
-        }
+    fn on_stream_accepted(
+        &self,
+        context: &SwQosMaxStreamsConnectionContext,
+    ) -> StreamAcceptedAction {
+        self.handle_accepted_stream(context)
     }
 
     fn on_stream_error(&self, _conn_context: &SwQosMaxStreamsConnectionContext) {}
@@ -554,14 +808,84 @@ pub mod test {
         SwQosMaxStreams::new(config, stats, staked_nodes, cancel)
     }
 
+    fn shared_counter(num_connections: usize) -> Arc<SwQosMaxStreamsStreamerCounter> {
+        let counter = Arc::new(SwQosMaxStreamsStreamerCounter::new());
+        counter
+            .connection_count
+            .store(num_connections, Ordering::Relaxed);
+        counter
+    }
+
+    fn accept_stream(
+        swqos: &SwQosMaxStreams,
+        ctx: &SwQosMaxStreamsConnectionContext,
+    ) -> StreamAcceptedAction {
+        swqos.handle_accepted_stream(ctx)
+    }
+
+    fn emergency_sender_bucket(counter: &Arc<SwQosMaxStreamsStreamerCounter>) -> Arc<TokenBucket> {
+        counter
+            .emergency_state
+            .lock()
+            .unwrap()
+            .sender_bucket
+            .as_ref()
+            .cloned()
+            .expect("emergency bucket should be initialized")
+    }
+
+    fn wait_for_emergency_bucket_tokens(
+        counter: &Arc<SwQosMaxStreamsStreamerCounter>,
+        tokens: u64,
+    ) {
+        let bucket = emergency_sender_bucket(counter);
+        let start = Instant::now();
+        let timeout = Duration::from_secs(1);
+
+        loop {
+            if bucket.current_tokens() >= tokens {
+                return;
+            }
+
+            assert!(
+                start.elapsed() < timeout,
+                "timed out waiting for {tokens} emergency bucket tokens; current={}",
+                bucket.current_tokens()
+            );
+
+            let sleep_for = bucket
+                .us_to_have_tokens(tokens)
+                .map(Duration::from_micros)
+                .unwrap_or_else(|| Duration::from_millis(1))
+                .max(Duration::from_millis(1));
+            std::thread::sleep(sleep_for + Duration::from_millis(5));
+        }
+    }
+
+    fn force_load_tracker_recovery(swqos: &SwQosMaxStreams, delta: Duration) {
+        swqos.load_tracker().advance_time_for_tests(delta);
+        assert!(
+            !swqos.load_tracker().is_saturated(),
+            "load tracker did not recover after {:?}; bucket={}",
+            delta,
+            swqos.load_tracker().bucket_level()
+        );
+    }
+
     fn unstaked_context() -> SwQosMaxStreamsConnectionContext {
+        unstaked_context_with_counter(shared_counter(1))
+    }
+
+    fn unstaked_context_with_counter(
+        counter: Arc<SwQosMaxStreamsStreamerCounter>,
+    ) -> SwQosMaxStreamsConnectionContext {
         SwQosMaxStreamsConnectionContext {
             peer_type: ConnectionPeerType::Unstaked,
             remote_pubkey: None,
             total_stake: 0,
             in_staked_table: false,
             last_update: Arc::new(AtomicU64::new(0)),
-            stream_counter: None,
+            stream_counter: Some(counter),
         }
     }
 
@@ -570,17 +894,79 @@ pub mod test {
         total_stake: u64,
         num_connections: usize,
     ) -> SwQosMaxStreamsConnectionContext {
-        let counter = Arc::new(SwQosMaxStreamsStreamerCounter {
-            connection_count: AtomicUsize::new(num_connections),
-        });
+        staked_context_with_counter(stake, total_stake, shared_counter(num_connections))
+    }
+
+    fn staked_context_with_counter(
+        stake: u64,
+        total_stake: u64,
+        counter: Arc<SwQosMaxStreamsStreamerCounter>,
+    ) -> SwQosMaxStreamsConnectionContext {
+        staked_context_with_pubkey_and_counter(
+            stake,
+            total_stake,
+            solana_pubkey::Pubkey::new_unique(),
+            counter,
+        )
+    }
+
+    fn staked_context_with_pubkey_and_counter(
+        stake: u64,
+        total_stake: u64,
+        pubkey: solana_pubkey::Pubkey,
+        counter: Arc<SwQosMaxStreamsStreamerCounter>,
+    ) -> SwQosMaxStreamsConnectionContext {
         SwQosMaxStreamsConnectionContext {
             peer_type: ConnectionPeerType::Staked(stake),
-            remote_pubkey: Some(solana_pubkey::Pubkey::new_unique()),
+            remote_pubkey: Some(pubkey),
             total_stake,
             in_staked_table: true,
             last_update: Arc::new(AtomicU64::new(0)),
             stream_counter: Some(counter),
         }
+    }
+
+    fn staked_sender_counter_from_connection_table(
+        stake: u64,
+        num_connections: usize,
+    ) -> (solana_pubkey::Pubkey, Arc<SwQosMaxStreamsStreamerCounter>) {
+        let stats = Arc::new(StreamerStats::default());
+        stats
+            .open_connections
+            .store(num_connections, Ordering::Relaxed);
+        let mut table = ConnectionTable::new(ConnectionTableType::Staked, CancellationToken::new());
+        let pubkey = solana_pubkey::Pubkey::new_unique();
+        let key = ConnectionTableKey::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Some(pubkey),
+        );
+        let mut shared_counter = None;
+
+        for port_offset in 0..num_connections {
+            let (_, _, counter) = table
+                .try_add_connection(
+                    key,
+                    10_000 + port_offset as u16,
+                    ClientConnectionTracker {
+                        stats: stats.clone(),
+                    },
+                    None,
+                    ConnectionPeerType::Staked(stake),
+                    Arc::new(AtomicU64::new(0)),
+                    num_connections,
+                    || Arc::new(SwQosMaxStreamsStreamerCounter::new()),
+                )
+                .expect("connection should be added");
+            counter.connection_count.fetch_add(1, Ordering::Relaxed);
+
+            if let Some(existing) = &shared_counter {
+                assert!(Arc::ptr_eq(existing, &counter));
+            } else {
+                shared_counter = Some(counter.clone());
+            }
+        }
+
+        (pubkey, shared_counter.expect("shared counter should exist"))
     }
 
     /// Expected saturated quota: capacity_tps * stake/total_stake * rtt_secs / num_connections
@@ -862,6 +1248,403 @@ pub mod test {
             q_large > q_small * 20,
             "large/small ratio={}, expected large staker to dominate",
             q_large / q_small
+        );
+    }
+
+    // -- Emergency sender bucket --
+
+    /// Helper: build SwQosMaxStreams with a deep-negative bucket for emergency tests.
+    fn make_swqos_with_debt(config: SwQosMaxStreamsConfig, debt: u64) -> SwQosMaxStreams {
+        let swqos = make_swqos(config);
+        // Drive the bucket negative by acquiring many tokens.
+        let burst = swqos.load_tracker().bucket_level() as u64;
+        for _ in 0..burst.saturating_add(debt) {
+            swqos.load_tracker().acquire();
+        }
+        swqos
+    }
+
+    #[test]
+    fn emergency_bucket_capacity_matches_minimum_per_connection_floor() {
+        let swqos = make_swqos(SwQosMaxStreamsConfig {
+            max_streams_per_ms: 1,
+            ..SwQosMaxStreamsConfig::default()
+        });
+        let ctx = staked_context(1, 10_000, 4);
+        assert_eq!(swqos.compute_sender_bucket_capacity_streams(&ctx), 4);
+    }
+
+    #[test]
+    fn emergency_bucket_capacity_matches_capped_saturated_sender_quota() {
+        let swqos = make_swqos(SwQosMaxStreamsConfig {
+            max_streams_per_ms: 1_000,
+            base_max_streams_staked: 4,
+            ..SwQosMaxStreamsConfig::default()
+        });
+        let ctx = staked_context(100, 100, 1);
+        assert_eq!(swqos.compute_sender_bucket_capacity_streams(&ctx), 8);
+    }
+
+    #[test]
+    fn emergency_bucket_stays_inactive_above_threshold() {
+        let swqos = make_swqos(SwQosMaxStreamsConfig {
+            emergency_debt_threshold: Some(-10_000),
+            ..SwQosMaxStreamsConfig::default()
+        });
+        let ctx = staked_context(1_000, 100_000, 1);
+        assert_eq!(accept_stream(&swqos, &ctx), StreamAcceptedAction::Continue);
+    }
+
+    #[test]
+    fn emergency_bucket_can_be_disabled() {
+        let swqos = make_swqos_with_debt(
+            SwQosMaxStreamsConfig {
+                emergency_debt_threshold: None,
+                ..SwQosMaxStreamsConfig::default()
+            },
+            200_000,
+        );
+        let ctx = staked_context(1_000, 100_000, 1);
+        assert_eq!(accept_stream(&swqos, &ctx), StreamAcceptedAction::Continue);
+    }
+
+    #[test]
+    fn emergency_bucket_closes_sender_that_overspends_burst() {
+        let swqos = make_swqos_with_debt(
+            SwQosMaxStreamsConfig {
+                max_streams_per_ms: 1,
+                emergency_debt_threshold: Some(-10),
+                ..SwQosMaxStreamsConfig::default()
+            },
+            200,
+        );
+        let ctx = staked_context(10, 100, 1);
+        for _ in 0..swqos.compute_sender_bucket_capacity_streams(&ctx) {
+            assert_eq!(accept_stream(&swqos, &ctx), StreamAcceptedAction::Continue);
+        }
+        assert_eq!(
+            accept_stream(&swqos, &ctx),
+            StreamAcceptedAction::CloseConnection
+        );
+    }
+
+    #[test]
+    fn emergency_bucket_only_closes_while_debt_is_still_deep() {
+        let swqos = make_swqos_with_debt(
+            SwQosMaxStreamsConfig {
+                max_streams_per_ms: 1,
+                emergency_debt_threshold: Some(-10),
+                ..SwQosMaxStreamsConfig::default()
+            },
+            200,
+        );
+        let ctx = staked_context(10, 100, 1);
+
+        for _ in 0..swqos.compute_sender_bucket_capacity_streams(&ctx) {
+            assert_eq!(accept_stream(&swqos, &ctx), StreamAcceptedAction::Continue);
+        }
+
+        swqos
+            .load_tracker()
+            .advance_time_for_tests(Duration::from_millis(211));
+        assert!(swqos.load_tracker().bucket_level() > -10);
+        assert!(swqos.load_tracker().bucket_level() <= 0);
+        assert!(swqos.load_tracker().is_saturated());
+        assert!(swqos.emergency_active.load(Ordering::Relaxed));
+
+        // The sender has exhausted its emergency bucket, but closes are gated
+        // on the current global debt still being below the deep threshold.
+        assert_eq!(accept_stream(&swqos, &ctx), StreamAcceptedAction::Continue);
+
+        while swqos.load_tracker().bucket_level() > -10 {
+            swqos.load_tracker().acquire();
+        }
+
+        // Once debt falls back to the deep threshold, the still-exhausted
+        // sender bucket triggers a close on the next stream.
+        assert_eq!(
+            accept_stream(&swqos, &ctx),
+            StreamAcceptedAction::CloseConnection
+        );
+    }
+
+    #[test]
+    fn emergency_bucket_refills_for_fair_share_sender() {
+        let swqos = make_swqos_with_debt(
+            SwQosMaxStreamsConfig {
+                max_streams_per_ms: 10,
+                emergency_debt_threshold: Some(-10),
+                ..SwQosMaxStreamsConfig::default()
+            },
+            2_000,
+        );
+        let counter = shared_counter(1);
+        let ctx = staked_context_with_counter(1, 400, counter.clone());
+        let burst = swqos.compute_sender_bucket_capacity_streams(&ctx);
+
+        for _ in 0..burst {
+            assert_eq!(accept_stream(&swqos, &ctx), StreamAcceptedAction::Continue);
+        }
+        assert_eq!(
+            accept_stream(&swqos, &ctx),
+            StreamAcceptedAction::CloseConnection
+        );
+
+        wait_for_emergency_bucket_tokens(&counter, 1);
+        assert_eq!(accept_stream(&swqos, &ctx), StreamAcceptedAction::Continue);
+        assert_eq!(
+            accept_stream(&swqos, &ctx),
+            StreamAcceptedAction::CloseConnection
+        );
+    }
+
+    #[test]
+    fn emergency_bucket_does_not_close_fair_share_sender_while_saturated() {
+        let swqos = make_swqos_with_debt(
+            SwQosMaxStreamsConfig {
+                max_streams_per_ms: 10,
+                emergency_debt_threshold: Some(-10),
+                ..SwQosMaxStreamsConfig::default()
+            },
+            2_000,
+        );
+        let counter = shared_counter(1);
+        let ctx = staked_context_with_counter(1, 400, counter.clone());
+        let burst = swqos.compute_sender_bucket_capacity_streams(&ctx);
+
+        for _ in 0..burst {
+            assert_eq!(accept_stream(&swqos, &ctx), StreamAcceptedAction::Continue);
+        }
+
+        for _ in 0..5 {
+            wait_for_emergency_bucket_tokens(&counter, 1);
+            assert_eq!(accept_stream(&swqos, &ctx), StreamAcceptedAction::Continue);
+        }
+
+        assert!(swqos.load_tracker().is_saturated());
+        assert!(swqos.emergency_active.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn emergency_bucket_is_shared_across_connections() {
+        let swqos = make_swqos_with_debt(
+            SwQosMaxStreamsConfig {
+                max_streams_per_ms: 1,
+                emergency_debt_threshold: Some(-10),
+                ..SwQosMaxStreamsConfig::default()
+            },
+            200,
+        );
+        let (pubkey, counter) = staked_sender_counter_from_connection_table(10, 2);
+        let ctx1 = staked_context_with_pubkey_and_counter(10, 100, pubkey, counter.clone());
+        let ctx2 = staked_context_with_pubkey_and_counter(10, 100, pubkey, counter);
+
+        for i in 0..swqos.compute_sender_bucket_capacity_streams(&ctx1) {
+            let ctx = if i % 2 == 0 { &ctx1 } else { &ctx2 };
+            assert_eq!(accept_stream(&swqos, ctx), StreamAcceptedAction::Continue);
+        }
+        assert_eq!(
+            accept_stream(&swqos, &ctx1),
+            StreamAcceptedAction::CloseConnection
+        );
+    }
+
+    #[test]
+    fn emergency_bucket_respects_minimum_one_stream_per_connection() {
+        let swqos = make_swqos_with_debt(
+            SwQosMaxStreamsConfig {
+                max_streams_per_ms: 1,
+                emergency_debt_threshold: Some(-10),
+                ..SwQosMaxStreamsConfig::default()
+            },
+            200,
+        );
+        let ctx = staked_context(1, 10_000, 4);
+
+        for _ in 0..4 {
+            assert_eq!(accept_stream(&swqos, &ctx), StreamAcceptedAction::Continue);
+        }
+        assert_eq!(
+            accept_stream(&swqos, &ctx),
+            StreamAcceptedAction::CloseConnection
+        );
+    }
+
+    #[test]
+    fn emergency_bucket_respects_capped_saturated_sender_quota() {
+        let swqos = make_swqos_with_debt(
+            SwQosMaxStreamsConfig {
+                max_streams_per_ms: 1_000,
+                base_max_streams_staked: 4,
+                emergency_debt_threshold: Some(-10),
+                ..SwQosMaxStreamsConfig::default()
+            },
+            200_000,
+        );
+        let ctx = staked_context(100, 100, 1);
+
+        for _ in 0..swqos.compute_sender_bucket_capacity_streams(&ctx) {
+            assert_eq!(accept_stream(&swqos, &ctx), StreamAcceptedAction::Continue);
+        }
+        assert_eq!(
+            accept_stream(&swqos, &ctx),
+            StreamAcceptedAction::CloseConnection
+        );
+    }
+
+    #[test]
+    fn emergency_bucket_closes_unstaked_immediately() {
+        let swqos = make_swqos_with_debt(
+            SwQosMaxStreamsConfig {
+                max_streams_per_ms: 1,
+                emergency_debt_threshold: Some(-10),
+                ..SwQosMaxStreamsConfig::default()
+            },
+            200,
+        );
+        let ctx = unstaked_context();
+        assert_eq!(
+            accept_stream(&swqos, &ctx),
+            StreamAcceptedAction::CloseConnection
+        );
+    }
+
+    #[test]
+    fn emergency_bucket_gives_small_staker_one_stream() {
+        let swqos = make_swqos_with_debt(
+            SwQosMaxStreamsConfig {
+                max_streams_per_ms: 1,
+                emergency_debt_threshold: Some(-10),
+                ..SwQosMaxStreamsConfig::default()
+            },
+            200,
+        );
+        let ctx = staked_context(1, 10_000, 1);
+        assert_eq!(accept_stream(&swqos, &ctx), StreamAcceptedAction::Continue);
+        assert_eq!(
+            accept_stream(&swqos, &ctx),
+            StreamAcceptedAction::CloseConnection
+        );
+    }
+
+    #[test]
+    fn emergency_bucket_close_does_not_charge_load_debt_or_stats() {
+        let stats = Arc::new(StreamerStats::default());
+        let swqos = SwQosMaxStreams::new(
+            SwQosMaxStreamsConfig {
+                max_streams_per_ms: 1,
+                emergency_debt_threshold: Some(-10),
+                ..SwQosMaxStreamsConfig::default()
+            },
+            stats.clone(),
+            Arc::new(RwLock::new(crate::streamer::StakedNodes::default())),
+            CancellationToken::new(),
+        );
+        let burst = swqos.load_tracker().bucket_level() as u64;
+        for _ in 0..burst.saturating_add(200) {
+            swqos.load_tracker().acquire();
+        }
+
+        let ctx = staked_context(10, 100, 1);
+        for _ in 0..swqos.compute_sender_bucket_capacity_streams(&ctx) {
+            assert_eq!(accept_stream(&swqos, &ctx), StreamAcceptedAction::Continue);
+        }
+
+        let bucket_before_close = swqos.load_tracker().bucket_level();
+        let saturated_before_close = stats.saturated_staked_streams.load(Ordering::Relaxed);
+        assert_eq!(
+            accept_stream(&swqos, &ctx),
+            StreamAcceptedAction::CloseConnection
+        );
+        assert_eq!(swqos.load_tracker().bucket_level(), bucket_before_close);
+        assert_eq!(
+            stats.saturated_staked_streams.load(Ordering::Relaxed),
+            saturated_before_close
+        );
+    }
+
+    #[test]
+    fn emergency_bucket_snapshot_ignores_connection_count_churn_until_reentry() {
+        let swqos = make_swqos_with_debt(
+            SwQosMaxStreamsConfig {
+                max_streams_per_ms: 1,
+                emergency_debt_threshold: Some(-10),
+                ..SwQosMaxStreamsConfig::default()
+            },
+            200,
+        );
+        let counter = shared_counter(1);
+        let ctx = staked_context_with_counter(10, 100, counter.clone());
+        let initial_capacity = swqos.compute_sender_bucket_capacity_streams(&ctx);
+
+        assert_eq!(accept_stream(&swqos, &ctx), StreamAcceptedAction::Continue);
+        counter.connection_count.store(5, Ordering::Relaxed);
+
+        for _ in 1..initial_capacity {
+            assert_eq!(accept_stream(&swqos, &ctx), StreamAcceptedAction::Continue);
+        }
+        assert_eq!(
+            accept_stream(&swqos, &ctx),
+            StreamAcceptedAction::CloseConnection
+        );
+
+        let state = counter.emergency_state.lock().unwrap();
+        assert_eq!(state.bucket_generation, 1);
+        assert_eq!(state.bucket_capacity_streams, initial_capacity);
+    }
+
+    #[test]
+    fn emergency_bucket_auto_threshold_defaults_to_negative_burst_capacity() {
+        let config = SwQosMaxStreamsConfig {
+            max_streams_per_ms: 7,
+            emergency_debt_threshold: Some(0),
+            ..SwQosMaxStreamsConfig::default()
+        };
+        let swqos = make_swqos(config.clone());
+        let expected_threshold = -((config.max_streams_per_ms * 1000 / 10) as i64);
+        assert_eq!(swqos.emergency_debt_threshold, Some(expected_threshold));
+    }
+
+    #[test]
+    fn emergency_bucket_reentry_resets_sender_burst() {
+        let swqos = make_swqos_with_debt(
+            SwQosMaxStreamsConfig {
+                max_streams_per_ms: 1,
+                emergency_debt_threshold: Some(-10),
+                ..SwQosMaxStreamsConfig::default()
+            },
+            20,
+        );
+        let counter = shared_counter(1);
+        let ctx = staked_context_with_counter(10, 100, counter.clone());
+
+        for _ in 0..swqos.compute_sender_bucket_capacity_streams(&ctx) {
+            assert_eq!(accept_stream(&swqos, &ctx), StreamAcceptedAction::Continue);
+        }
+        assert_eq!(
+            accept_stream(&swqos, &ctx),
+            StreamAcceptedAction::CloseConnection
+        );
+        assert_eq!(swqos.emergency_generation.load(Ordering::Relaxed), 1);
+        assert_eq!(counter.emergency_state.lock().unwrap().bucket_generation, 1);
+
+        force_load_tracker_recovery(&swqos, Duration::from_millis(250));
+        assert!(!swqos.consume_emergency_sender_bucket(&ctx));
+        assert!(!swqos.emergency_active.load(Ordering::Relaxed));
+
+        for _ in 0..110 {
+            swqos.load_tracker().acquire();
+        }
+
+        assert_eq!(accept_stream(&swqos, &ctx), StreamAcceptedAction::Continue);
+        assert_eq!(swqos.emergency_generation.load(Ordering::Relaxed), 2);
+        assert_eq!(counter.emergency_state.lock().unwrap().bucket_generation, 2);
+        for _ in 1..swqos.compute_sender_bucket_capacity_streams(&ctx) {
+            assert_eq!(accept_stream(&swqos, &ctx), StreamAcceptedAction::Continue);
+        }
+        assert_eq!(
+            accept_stream(&swqos, &ctx),
+            StreamAcceptedAction::CloseConnection
         );
     }
 }

@@ -1,7 +1,7 @@
 use {
     crate::{
         nonblocking::{
-            qos::{ConnectionContext, QosController},
+            qos::{ConnectionContext, QosController, StreamAcceptedAction},
             quic::{
                 CONNECTION_CLOSE_CODE_DISALLOWED, CONNECTION_CLOSE_REASON_DISALLOWED,
                 ClientConnectionTracker, ConnectionHandlerError, ConnectionPeerType,
@@ -444,7 +444,7 @@ impl QosController<SwQosConnectionContext> for SwQos {
         }
     }
 
-    fn on_stream_accepted(&self, conn_context: &SwQosConnectionContext) {
+    fn on_stream_accepted(&self, conn_context: &SwQosConnectionContext) -> StreamAcceptedAction {
         self.staked_stream_load_ema
             .increment_load(conn_context.peer_type);
         conn_context
@@ -453,6 +453,7 @@ impl QosController<SwQosConnectionContext> for SwQos {
             .unwrap()
             .stream_count
             .fetch_add(1, Ordering::Relaxed);
+        StreamAcceptedAction::Continue
     }
 
     fn on_stream_error(&self, _conn_context: &SwQosConnectionContext) {
