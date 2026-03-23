@@ -48,8 +48,8 @@ const MIN_RTT_STAKED_UNSATURATED: Duration = Duration::from_millis(50);
 
 /// Base MAX_STREAMS at REFERENCE_RTT. At 100ms, 1024 matches the old SWQoS
 /// ceiling for the highest-staked peers; scaling remains linear with RTT.
-const DEFAULT_BASE_MAX_STREAMS_STAKED: u32 = 1024;
-const DEFAULT_BASE_MAX_STREAMS_UNSTAKED: u32 = 20;
+const DEFAULT_BASE_MAX_STREAMS_STAKED: u32 = 2048;
+const DEFAULT_BASE_MAX_STREAMS_UNSTAKED: u32 = 100;
 
 /// Per-key connection counter so compute_max_streams can divide quota evenly.
 pub(crate) struct SwQosMaxStreamsStreamerCounter {
@@ -71,7 +71,7 @@ pub struct SwQosMaxStreamsConfig {
 impl Default for SwQosMaxStreamsConfig {
     fn default() -> Self {
         SwQosMaxStreamsConfig {
-            max_streams_per_ms: DEFAULT_MAX_STREAMS_PER_MS,
+            max_streams_per_ms: 2 * DEFAULT_MAX_STREAMS_PER_MS,
             max_staked_connections: DEFAULT_MAX_STAKED_CONNECTIONS,
             max_unstaked_connections: DEFAULT_MAX_UNSTAKED_CONNECTIONS,
             max_connections_per_staked_peer: DEFAULT_MAX_QUIC_CONNECTIONS_PER_STAKED_PEER,
@@ -134,7 +134,8 @@ impl SwQosMaxStreams {
         staked_nodes: Arc<RwLock<StakedNodes>>,
         cancel: CancellationToken,
     ) -> Self {
-        let max_streams_per_second = config.max_streams_per_ms * 1000;
+        let max_streams_per_ms = config.max_streams_per_ms.max(2 * DEFAULT_MAX_STREAMS_PER_MS);
+        let max_streams_per_second = max_streams_per_ms * 1000;
         let burst_capacity = max_streams_per_second / 10;
 
         Self {
