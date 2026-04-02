@@ -261,7 +261,7 @@ impl SwQosMaxStreams {
 
         if saturated {
             match context.peer_type {
-                ConnectionPeerType::Unstaked => Some(0), // park
+                ConnectionPeerType::Unstaked => Some(0), // no new credit
                 ConnectionPeerType::Staked(stake) => {
                     // Saturated quota uses true BDP (no 50ms floor) for tight
                     // flow control under load.
@@ -273,7 +273,8 @@ impl SwQosMaxStreams {
                     let quota = (share_tps as f64 * sat_rtt.as_secs_f64()) as u32;
                     let num_connections = Self::sender_connection_count(context);
                     // At least 1: peers that passed the min-stake threshold in
-                    // build_connection_context should not be parked.
+                    // build_connection_context should not be driven to zero new
+                    // credit under saturation.
                     let per_conn = (quota / num_connections).max(1);
                     // Don't exceed the unsaturated limit.
                     Some(per_conn.min(unsat_max.max(1)))
@@ -442,7 +443,8 @@ impl SwQosMaxStreams {
         else {
             // A snapshot bucket is absent when the sender-wide emergency
             // capacity is zero. In practice this is how unstaked senders
-            // appear in Phase 2, since saturated MAX_STREAMS parks them.
+            // appear in Phase 2, since saturated MAX_STREAMS gives them zero
+            // new credit.
             //
             // An exhausted Phase 2 bucket only closes while the global debt is
             // still below the deep emergency threshold.
@@ -747,7 +749,6 @@ impl QosController<SwQosMaxStreamsConnectionContext> for SwQosMaxStreams {
     ) -> MaxStreamsAction {
         let saturated = self.load_tracker.is_saturated();
         match self.compute_max_streams_for_rtt(context, rtt, saturated) {
-            Some(0) => MaxStreamsAction::Park,
             Some(max_streams) => MaxStreamsAction::Set(max_streams),
             None => MaxStreamsAction::Unmanaged,
         }

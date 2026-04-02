@@ -17,10 +17,9 @@ pub(crate) trait ConnectionContext: Clone + Send + Sync {
 pub(crate) enum MaxStreamsAction {
     /// This QoS implementation does not manage MAX_STREAMS on this path.
     Unmanaged,
-    /// Apply a MAX_STREAMS value.
+    /// Apply a MAX_STREAMS value. `0` withholds new stream credit while still
+    /// allowing the connection task to observe already-issued streams.
     Set(u32),
-    /// Park the connection (MAX_STREAMS=0 and park behavior).
-    Park,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

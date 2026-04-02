@@ -54,11 +54,12 @@ use {
 
 pub const DEFAULT_WAIT_FOR_CHUNK_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Parked re-check base progression: 10 -> 20 -> 40 -> 80ms (cap at 80ms).
-/// Jitter of up to 20ms is added to spread wakeups and avoid herd behavior.
-const PARK_RECHECK_BASE_MS: u64 = 10;
-const PARK_RECHECK_BASE_CAP_MS: u64 = 80;
-const PARK_RECHECK_JITTER_MAX_MS: u64 = 20;
+/// Zero-credit re-check base progression: 10 -> 20 -> 40 -> 80ms (cap at
+/// 80ms). Jitter of up to 20ms is added to spread wakeups and avoid herd
+/// behavior.
+const ZERO_CREDIT_RECHECK_BASE_MS: u64 = 10;
+const ZERO_CREDIT_RECHECK_BASE_CAP_MS: u64 = 80;
+const ZERO_CREDIT_RECHECK_JITTER_MAX_MS: u64 = 20;
 
 pub const ALPN_TPU_PROTOCOL_ID: &[u8] = b"solana-tpu";
 
@@ -97,24 +98,28 @@ const QUIC_CONNECTION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const LATE_REASSEMBLY_THRESHOLD: f32 = 1.5;
 
 #[derive(Debug, Clone)]
-struct ParkRecheckBackoff {
+struct ZeroCreditRecheckBackoff {
     base_ms: u64,
 }
 
-impl ParkRecheckBackoff {
+impl ZeroCreditRecheckBackoff {
     fn new() -> Self {
         Self {
-            base_ms: PARK_RECHECK_BASE_MS,
+            base_ms: ZERO_CREDIT_RECHECK_BASE_MS,
         }
     }
 
     fn reset(&mut self) {
-        self.base_ms = PARK_RECHECK_BASE_MS;
+        self.base_ms = ZERO_CREDIT_RECHECK_BASE_MS;
     }
 
     fn next_delay(&mut self) -> Duration {
-        let delay_ms = rng().random_range(self.base_ms..=self.base_ms + PARK_RECHECK_JITTER_MAX_MS);
-        self.base_ms = self.base_ms.saturating_mul(2).min(PARK_RECHECK_BASE_CAP_MS);
+        let delay_ms =
+            rng().random_range(self.base_ms..=self.base_ms + ZERO_CREDIT_RECHECK_JITTER_MAX_MS);
+        self.base_ms = self
+            .base_ms
+            .saturating_mul(2)
+            .min(ZERO_CREDIT_RECHECK_BASE_CAP_MS);
         Duration::from_millis(delay_ms)
     }
 
@@ -609,7 +614,7 @@ async fn handle_connection<Q, C>(
     C: ConnectionContext + Send + Sync + 'static,
 {
     let peer_type = context.peer_type();
-    let mut park_recheck_backoff = ParkRecheckBackoff::new();
+    let mut zero_credit_recheck_backoff = ZeroCreditRecheckBackoff::new();
     let mut last_applied_max_streams: Option<u32> = None;
     debug!(
         "quic new connection {} streams: {} connections: {}",
@@ -626,36 +631,39 @@ async fn handle_connection<Q, C>(
     // periodically.
     let rtt = connection.rtt();
     'conn: loop {
+        let mut zero_credit_recheck_delay = None;
         match qos.compute_max_streams(&context, rtt) {
             MaxStreamsAction::Unmanaged => {}
             MaxStreamsAction::Set(max_streams) => {
-                debug_assert!(max_streams > 0, "Set(0) should use Park");
-                if max_streams > 0 && last_applied_max_streams != Some(max_streams) {
+                if last_applied_max_streams != Some(max_streams) {
                     connection.set_max_concurrent_uni_streams(VarInt::from_u32(max_streams));
                     last_applied_max_streams = Some(max_streams);
                 }
-                // Unparked: restore fast re-checks for the next time this connection parks.
-                park_recheck_backoff.reset();
-            }
-            MaxStreamsAction::Park => {
-                if last_applied_max_streams != Some(0) {
-                    connection.set_max_concurrent_uni_streams(VarInt::from_u32(0));
-                    last_applied_max_streams = Some(0);
-                }
-                // Park: don't accept streams, wait for load to drop.
-                stats
-                    .unstaked_connections_parked
-                    .fetch_add(1, Ordering::Relaxed);
-                let recheck_delay = park_recheck_backoff.next_delay();
-                select! {
-                    _ = tokio::time::sleep(recheck_delay) => continue,
-                    _ = cancel.cancelled() => break,
+                if max_streams == 0 {
+                    // No new credit: keep re-checking saturation, but still
+                    // observe any streams that were already opened under prior
+                    // credit so Phase 2 can act on them.
+                    stats
+                        .unstaked_connections_parked
+                        .fetch_add(1, Ordering::Relaxed);
+                    zero_credit_recheck_delay = Some(zero_credit_recheck_backoff.next_delay());
+                } else {
+                    // Positive credit restored: reset the backoff so the next
+                    // zero-credit episode rechecks quickly.
+                    zero_credit_recheck_backoff.reset();
                 }
             }
         }
 
         // Wait for new streams. If the peer is disconnected we get a cancellation signal and stop
         // the connection task.
+        let recheck = async {
+            if let Some(delay) = zero_credit_recheck_delay {
+                tokio::time::sleep(delay).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
         let mut stream = select! {
             stream = connection.accept_uni() => match stream {
                 Ok(stream) => stream,
@@ -664,6 +672,7 @@ async fn handle_connection<Q, C>(
                     break;
                 }
             },
+            _ = recheck => continue,
             _ = cancel.cancelled() => break,
         };
 
@@ -1208,8 +1217,8 @@ pub mod test {
     };
 
     #[test]
-    fn test_park_recheck_backoff_progression_and_bounds() {
-        let mut backoff = ParkRecheckBackoff::new();
+    fn test_zero_credit_recheck_backoff_progression_and_bounds() {
+        let mut backoff = ZeroCreditRecheckBackoff::new();
 
         for expected_base in [10_u64, 20, 40, 80, 80, 80] {
             assert_eq!(backoff.base_ms(), expected_base);
@@ -1219,28 +1228,28 @@ pub mod test {
                 "delay_ms={delay_ms}, expected_base={expected_base}"
             );
             assert!(
-                delay_ms <= expected_base + PARK_RECHECK_JITTER_MAX_MS,
+                delay_ms <= expected_base + ZERO_CREDIT_RECHECK_JITTER_MAX_MS,
                 "delay_ms={delay_ms}, expected_base={expected_base}"
             );
         }
 
-        assert_eq!(backoff.base_ms(), PARK_RECHECK_BASE_CAP_MS);
+        assert_eq!(backoff.base_ms(), ZERO_CREDIT_RECHECK_BASE_CAP_MS);
     }
 
     #[test]
-    fn test_park_recheck_backoff_reset() {
-        let mut backoff = ParkRecheckBackoff::new();
+    fn test_zero_credit_recheck_backoff_reset() {
+        let mut backoff = ZeroCreditRecheckBackoff::new();
         for _ in 0..4 {
             let _ = backoff.next_delay();
         }
-        assert_eq!(backoff.base_ms(), PARK_RECHECK_BASE_CAP_MS);
+        assert_eq!(backoff.base_ms(), ZERO_CREDIT_RECHECK_BASE_CAP_MS);
 
         backoff.reset();
-        assert_eq!(backoff.base_ms(), PARK_RECHECK_BASE_MS);
+        assert_eq!(backoff.base_ms(), ZERO_CREDIT_RECHECK_BASE_MS);
 
         let delay_ms = backoff.next_delay().as_millis() as u64;
-        assert!(delay_ms >= PARK_RECHECK_BASE_MS);
-        assert!(delay_ms <= PARK_RECHECK_BASE_MS + PARK_RECHECK_JITTER_MAX_MS);
+        assert!(delay_ms >= ZERO_CREDIT_RECHECK_BASE_MS);
+        assert!(delay_ms <= ZERO_CREDIT_RECHECK_BASE_MS + ZERO_CREDIT_RECHECK_JITTER_MAX_MS);
         assert_eq!(backoff.base_ms(), 20);
     }
 
