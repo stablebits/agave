@@ -988,6 +988,8 @@ pub fn execute(
     let tpu_max_connections_per_ipaddr_per_minute: u64 =
         value_t_or_exit!(matches, "tpu_max_connections_per_ipaddr_per_minute", u64);
     let max_streams_per_ms = value_t_or_exit!(matches, "tpu_max_streams_per_ms", u64);
+    let burst_window_ms = value_t_or_exit!(matches, "tpu_burst_window_ms", u64);
+    let emergency_window_ms = value_t_or_exit!(matches, "tpu_emergency_window_ms", u64);
     let tpu_swqos_mode = matches.value_of("tpu_swqos_mode").unwrap();
     info!("TPU SwQoS mode: {tpu_swqos_mode}");
 
@@ -1102,6 +1104,8 @@ pub fn execute(
                 max_staked_connections: global_max_staked.try_into().unwrap(),
                 max_unstaked_connections: global_max_unstaked.try_into().unwrap(),
                 max_streams_per_ms,
+                burst_window_ms,
+                emergency_window_ms,
                 ..Default::default()
             }),
         }

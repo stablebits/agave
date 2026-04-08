@@ -27,6 +27,9 @@ use {
     solana_hash::Hash,
     solana_net_utils::{MINIMUM_VALIDATOR_PORT_RANGE_WIDTH, VALIDATOR_PORT_RANGE},
     solana_send_transaction_service::send_transaction_service::{self},
+    solana_streamer::nonblocking::swqos_max_streams::{
+        DEFAULT_BURST_WINDOW_MS, DEFAULT_EMERGENCY_WINDOW_MS,
+    },
     solana_streamer::quic::{
         DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE,
         DEFAULT_MAX_QUIC_CONNECTIONS_PER_STAKED_PEER,
@@ -228,6 +231,8 @@ pub struct DefaultArgs {
     pub tpu_max_fwd_staked_connections: String,
     pub tpu_max_fwd_unstaked_connections: String,
     pub tpu_max_streams_per_ms: String,
+    pub tpu_burst_window_ms: String,
+    pub tpu_emergency_window_ms: String,
 
     pub num_quic_endpoints: String,
     pub vote_use_quic: String,
@@ -282,6 +287,8 @@ impl DefaultArgs {
                 .to_string(),
             tpu_max_fwd_unstaked_connections: 0.to_string(),
             tpu_max_streams_per_ms: DEFAULT_MAX_STREAMS_PER_MS.to_string(),
+            tpu_burst_window_ms: DEFAULT_BURST_WINDOW_MS.to_string(),
+            tpu_emergency_window_ms: DEFAULT_EMERGENCY_WINDOW_MS.to_string(),
             num_quic_endpoints: DEFAULT_QUIC_ENDPOINTS.to_string(),
             banking_trace_dir_byte_limit: BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT.to_string(),
             block_production_pacing_fill_time_millis: BankingStage::default_fill_time_millis()

@@ -757,6 +757,28 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("Controls the max number of streams for a TPU service."),
     )
     .arg(
+        Arg::with_name("tpu_burst_window_ms")
+            .long("tpu-burst-window-ms")
+            .takes_value(true)
+            .default_value(&default_args.tpu_burst_window_ms)
+            .validator(is_parsable::<u64>)
+            .hidden(hidden_unless_forced())
+            .help(
+                "Controls the Phase 1 burst budget for TPU SWQoS, in milliseconds of configured ingress capacity.",
+            ),
+    )
+    .arg(
+        Arg::with_name("tpu_emergency_window_ms")
+            .long("tpu-emergency-window-ms")
+            .takes_value(true)
+            .default_value(&default_args.tpu_emergency_window_ms)
+            .validator(is_parsable::<u64>)
+            .hidden(hidden_unless_forced())
+            .help(
+                "Controls the additional Phase 2 debt budget for TPU SWQoS, in milliseconds of configured ingress capacity.",
+            ),
+    )
+    .arg(
         Arg::with_name("tpu_swqos_mode")
             .long("tpu-swqos-mode")
             .takes_value(true)

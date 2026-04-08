@@ -54,6 +54,8 @@ const MIN_RTT_STAKED_UNSATURATED: Duration = Duration::from_millis(50);
 /// ceiling for the highest-staked peers; scaling remains linear with RTT.
 const DEFAULT_BASE_MAX_STREAMS_STAKED: u32 = 1024;
 const DEFAULT_BASE_MAX_STREAMS_UNSTAKED: u32 = 20;
+pub const DEFAULT_BURST_WINDOW_MS: u64 = 100;
+pub const DEFAULT_EMERGENCY_WINDOW_MS: u64 = 100;
 /// Sender-wide minimum Phase 2 burst for staked senders.
 ///
 /// The Phase 2 refill rate still comes from the sender's saturated fair share.
@@ -159,6 +161,11 @@ impl OpaqueStreamerCounter for SwQosMaxStreamsStreamerCounter {}
 #[derive(Clone)]
 pub struct SwQosMaxStreamsConfig {
     pub max_streams_per_ms: u64,
+    /// Phase 1 burst budget, in milliseconds of configured ingress capacity.
+    pub burst_window_ms: u64,
+    /// Additional Phase 2 debt budget, in milliseconds of configured ingress
+    /// capacity, used when `emergency_debt_threshold` is auto.
+    pub emergency_window_ms: u64,
     pub max_staked_connections: usize,
     pub max_unstaked_connections: usize,
     pub max_connections_per_staked_peer: usize,
@@ -177,7 +184,7 @@ pub struct SwQosMaxStreamsConfig {
     /// issued credit before closing them.
     pub emergency_burst_unstaked: u32,
     /// Bucket level at which emergency sender buckets begin.
-    /// `None` = disabled. `Some(0)` = auto (`-burst_capacity`).
+    /// `None` = disabled. `Some(0)` = auto (`-capacity * emergency_window_ms`).
     pub emergency_debt_threshold: Option<i64>,
 }
 
@@ -185,6 +192,8 @@ impl Default for SwQosMaxStreamsConfig {
     fn default() -> Self {
         SwQosMaxStreamsConfig {
             max_streams_per_ms: DEFAULT_MAX_STREAMS_PER_MS,
+            burst_window_ms: DEFAULT_BURST_WINDOW_MS,
+            emergency_window_ms: DEFAULT_EMERGENCY_WINDOW_MS,
             max_staked_connections: DEFAULT_MAX_STAKED_CONNECTIONS,
             max_unstaked_connections: DEFAULT_MAX_UNSTAKED_CONNECTIONS,
             max_connections_per_staked_peer: DEFAULT_MAX_QUIC_CONNECTIONS_PER_STAKED_PEER,
@@ -257,6 +266,26 @@ impl SwQosMaxStreams {
             .min(u64::MAX as u128) as u64
     }
 
+    fn burst_capacity_streams(config: &SwQosMaxStreamsConfig) -> u64 {
+        assert!(config.burst_window_ms > 0, "burst_window_ms must be > 0");
+        config
+            .max_streams_per_ms
+            .saturating_mul(config.burst_window_ms)
+    }
+
+    fn resolve_emergency_debt_threshold(config: &SwQosMaxStreamsConfig) -> Option<i64> {
+        config.emergency_debt_threshold.map(|threshold| {
+            if threshold != 0 {
+                return threshold;
+            }
+
+            let auto_threshold = config
+                .max_streams_per_ms
+                .saturating_mul(config.emergency_window_ms);
+            -i64::try_from(auto_threshold).expect("auto emergency debt threshold must fit i64")
+        })
+    }
+
     pub fn load_tracker(&self) -> &LoadDebtTracker {
         &self.load_tracker
     }
@@ -268,12 +297,8 @@ impl SwQosMaxStreams {
         cancel: CancellationToken,
     ) -> Self {
         let max_streams_per_second = config.max_streams_per_ms.saturating_mul(1000);
-        let burst_capacity = max_streams_per_second / 10;
-
-        // Resolve threshold: None → disabled, Some(0) → -burst_capacity.
-        let emergency_debt_threshold = config
-            .emergency_debt_threshold
-            .map(|t| if t == 0 { -(burst_capacity as i64) } else { t });
+        let burst_capacity = Self::burst_capacity_streams(&config);
+        let emergency_debt_threshold = Self::resolve_emergency_debt_threshold(&config);
 
         Self {
             config,
@@ -1141,6 +1166,30 @@ pub mod test {
             swqos.compute_max_streams_for_rtt(&ctx, Duration::from_millis(50), true),
             Some(1),
         );
+    }
+
+    #[test]
+    fn test_default_threshold_windows_preserve_legacy_behavior() {
+        let swqos = make_swqos(SwQosMaxStreamsConfig {
+            max_streams_per_ms: 500,
+            ..SwQosMaxStreamsConfig::default()
+        });
+
+        assert_eq!(swqos.load_tracker().bucket_level(), 50_000);
+        assert_eq!(swqos.emergency_debt_threshold, Some(-50_000));
+    }
+
+    #[test]
+    fn test_custom_threshold_windows_scale_burst_and_auto_emergency_threshold() {
+        let swqos = make_swqos(SwQosMaxStreamsConfig {
+            max_streams_per_ms: 500,
+            burst_window_ms: 200,
+            emergency_window_ms: 400,
+            ..SwQosMaxStreamsConfig::default()
+        });
+
+        assert_eq!(swqos.load_tracker().bucket_level(), 100_000);
+        assert_eq!(swqos.emergency_debt_threshold, Some(-200_000));
     }
 
     // -- Unsaturated path --
