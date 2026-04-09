@@ -89,13 +89,19 @@ struct Cli {
     log_file: String,
 
     #[arg(short, long, value_parser = parse_duration)]
-    test_duration: Duration,
+    test_duration: Option<Duration>,
+
+    #[arg(long, value_parser = parse_duration, default_value = "1.0")]
+    grace_period: Duration,
 
     #[arg(short, long)]
     stake_amounts: String,
 
     #[arg(long, value_enum, default_value_t = SwQosMode::Sleep)]
     swqos_mode: SwQosMode,
+
+    #[arg(long)]
+    max_streams_per_ms: Option<u64>,
 }
 
 // number of threads as in fn default_num_tpu_transaction_forward_receive_threads
@@ -110,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .expect("should bind");
 
-    let (sender, receiver) = bounded(1024);
+    let (sender, receiver) = bounded(1024 * 1024);
     let keypair = Keypair::new();
 
     let staked_nodes = {
@@ -128,16 +134,28 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn the server with the selected SwQoS mode.
     let qos_config = match cli.swqos_mode {
-        SwQosMode::MaxStreams => SwQosConfig::MaxStreams(SwQosMaxStreamsConfig {
-            max_connections_per_staked_peer: cli.max_connections_per_staked_peer,
-            max_connections_per_unstaked_peer: cli.max_connections_per_unstaked_peer,
-            ..Default::default()
-        }),
-        SwQosMode::Sleep => SwQosConfig::Sleep(SwQosSleepConfig {
-            max_connections_per_staked_peer: cli.max_connections_per_staked_peer,
-            max_connections_per_unstaked_peer: cli.max_connections_per_unstaked_peer,
-            ..Default::default()
-        }),
+        SwQosMode::MaxStreams => {
+            let mut cfg = SwQosMaxStreamsConfig {
+                max_connections_per_staked_peer: cli.max_connections_per_staked_peer,
+                max_connections_per_unstaked_peer: cli.max_connections_per_unstaked_peer,
+                ..Default::default()
+            };
+            if let Some(v) = cli.max_streams_per_ms {
+                cfg.max_streams_per_ms = v;
+            }
+            SwQosConfig::MaxStreams(cfg)
+        }
+        SwQosMode::Sleep => {
+            let mut cfg = SwQosSleepConfig {
+                max_connections_per_staked_peer: cli.max_connections_per_staked_peer,
+                max_connections_per_unstaked_peer: cli.max_connections_per_unstaked_peer,
+                ..Default::default()
+            };
+            if let Some(v) = cli.max_streams_per_ms {
+                cfg.max_streams_per_ms = v;
+            }
+            SwQosConfig::Sleep(cfg)
+        }
     };
 
     let SpawnNonBlockingServerResult {
@@ -190,11 +208,22 @@ async fn main() -> anyhow::Result<()> {
         Ok(())
     });
     // wait for test to finish, report errors early if they occur
+    let duration_or_signal = async {
+        match cli.test_duration {
+            Some(d) => {
+                sleep(d).await;
+                info!("Test duration expired");
+            }
+            None => {
+                tokio::signal::ctrl_c()
+                    .await
+                    .expect("failed to listen for ctrl-c");
+                info!("Received shutdown signal");
+            }
+        }
+    };
     let status = tokio::select! {
-        _ = sleep(cli.test_duration)=>{
-            info!("Test duration expired");
-            Ok(())
-        },
+        _ = duration_or_signal => Ok(()),
         _ = run_thread => {
             Err(anyhow::anyhow!("Server thread exited too early"))
         },
@@ -205,7 +234,13 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     };
-    info!("Server terminating");
+    // Grace period: keep endpoints alive so in-flight QUIC streams can finish,
+    // and the logger can drain the channel.
+    info!("Entering grace period ({:?}), draining in-flight streams...", cli.grace_period);
+    stats.report("pre_grace_period");
+    sleep(cli.grace_period).await;
+    info!("Grace period ended");
+    stats.report("post_grace_period");
     cancel.cancel();
     drop(endpoints);
     stats.report("final_stats");
