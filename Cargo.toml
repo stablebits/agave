@@ -325,7 +325,7 @@ prost = "0.14.3"
 prost-types = "0.14.3"
 protobuf-src = "1.1.0"
 qualifier_attr = { version = "0.2.2", default-features = false }
-quinn = "0.11.9"
+quinn = "0.12.0"
 rand = "0.9.2"
 rand_chacha = "0.9.0"
 rayon = "1.11.0"
@@ -624,3 +624,5 @@ codegen-units = 1
 [patch.crates-io]
 # for details, see https://github.com/anza-xyz/crossbeam/commit/fd279d707025f0e60951e429bf778b4813d1b6bf
 crossbeam-epoch = { git = "https://github.com/anza-xyz/crossbeam", rev = "fd279d707025f0e60951e429bf778b4813d1b6bf" }
+quinn = { git = "https://github.com/stablebits/quinn.git", branch = "endpoint-lock-optimization-accept-split" }
+quinn-proto = { git = "https://github.com/stablebits/quinn.git", branch = "endpoint-lock-optimization-accept-split" }
