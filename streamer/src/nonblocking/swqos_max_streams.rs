@@ -52,8 +52,8 @@ const MIN_RTT_STAKED_UNSATURATED: Duration = Duration::from_millis(50);
 
 /// Base MAX_STREAMS at REFERENCE_RTT. At 100ms, 1024 matches the old SWQoS
 /// ceiling for the highest-staked peers; scaling remains linear with RTT.
-const DEFAULT_BASE_MAX_STREAMS_STAKED: u32 = 10_000;
-const DEFAULT_BASE_MAX_STREAMS_UNSTAKED: u32 = 10_000;
+const DEFAULT_BASE_MAX_STREAMS_STAKED: u32 = 1024;
+const DEFAULT_BASE_MAX_STREAMS_UNSTAKED: u32 = 20;
 pub const DEFAULT_BURST_WINDOW_MS: u64 = 100;
 pub const DEFAULT_EMERGENCY_WINDOW_MS: u64 = 100;
 /// Sender-wide minimum Phase 2 burst for staked senders.
@@ -194,10 +194,10 @@ impl Default for SwQosMaxStreamsConfig {
             max_streams_per_ms: DEFAULT_MAX_STREAMS_PER_MS,
             burst_window_ms: DEFAULT_BURST_WINDOW_MS,
             emergency_window_ms: DEFAULT_EMERGENCY_WINDOW_MS,
-            max_staked_connections: 10_000,
-            max_unstaked_connections: 10_000,
-            max_connections_per_staked_peer: 128,
-            max_connections_per_unstaked_peer: 128,
+            max_staked_connections: DEFAULT_MAX_STAKED_CONNECTIONS,
+            max_unstaked_connections: DEFAULT_MAX_UNSTAKED_CONNECTIONS,
+            max_connections_per_staked_peer: DEFAULT_MAX_QUIC_CONNECTIONS_PER_STAKED_PEER,
+            max_connections_per_unstaked_peer: DEFAULT_MAX_QUIC_CONNECTIONS_PER_UNSTAKED_PEER,
             base_max_streams_staked: DEFAULT_BASE_MAX_STREAMS_STAKED,
             base_max_streams_unstaked: DEFAULT_BASE_MAX_STREAMS_UNSTAKED,
             emergency_min_burst_staked: DEFAULT_EMERGENCY_MIN_BURST_STAKED,
