@@ -49,7 +49,7 @@ use {
     },
     solana_streamer::{
         quic::{
-            SchedulerPfFloor, SimpleQosQuicStreamerConfig, SpawnServerResult,
+            SchedulerSaturationFeedback, SimpleQosQuicStreamerConfig, SpawnServerResult,
             SwQosQuicStreamerConfig, spawn_simple_qos_server, spawn_stake_weighted_qos_server,
         },
         quic_socket::QuicSocket,
@@ -164,7 +164,7 @@ impl Tpu {
         let (packet_sender, packet_receiver) = bounded(TPU_CHANNEL_SIZE);
         let (vote_packet_sender, vote_packet_receiver) = unbounded();
         let (forwarded_packet_sender, forwarded_packet_receiver) = unbounded();
-        let scheduler_pf_floor = Arc::new(SchedulerPfFloor::default());
+        let scheduler_pf_floor = Arc::new(SchedulerSaturationFeedback::default());
         let fetch_stage = FetchStage::new_with_sender(
             tpu_vote_sockets,
             exit.clone(),
@@ -325,7 +325,7 @@ impl Tpu {
             log_messages_bytes_limit,
             bank_forks.clone(),
             prioritization_fee_cache,
-            Some(scheduler_pf_floor),
+            scheduler_pf_floor,
         );
 
         #[cfg(unix)]

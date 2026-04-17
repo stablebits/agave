@@ -249,6 +249,7 @@ fn bench_banking(
         None,
         bank_forks,
         None,
+        Arc::new(solana_streamer::quic::SchedulerSaturationFeedback::default()),
     );
 
     let chunk_len = verified.len() / CHUNKS;

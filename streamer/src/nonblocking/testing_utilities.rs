@@ -4,8 +4,8 @@ use {
     crate::{
         nonblocking::{quic::spawn_server, swqos::SwQos, swqos_max_streams::SwQosMaxStreams},
         quic::{
-            QUIC_MAX_TIMEOUT, QuicServerError, QuicStreamerConfig, SchedulerPfFloor, StreamerStats,
-            SwQosConfig,
+            QUIC_MAX_TIMEOUT, QuicServerError, QuicStreamerConfig, SchedulerSaturationFeedback,
+            StreamerStats, SwQosConfig,
         },
         quic_socket::QuicSocket,
         streamer::StakedNodes,
@@ -45,7 +45,7 @@ pub fn spawn_stake_weighted_qos_server(
     staked_nodes: Arc<RwLock<StakedNodes>>,
     quic_server_params: QuicStreamerConfig,
     qos_config: SwQosConfig,
-    scheduler_pf_floor: Option<Arc<SchedulerPfFloor>>,
+    scheduler_pf_floor: Option<Arc<SchedulerSaturationFeedback>>,
     cancel: CancellationToken,
 ) -> Result<SpawnNonBlockingServerResult, QuicServerError> {
     let stats = Arc::<StreamerStats>::default();

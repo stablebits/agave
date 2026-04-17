@@ -24,7 +24,7 @@ use {
     solana_cost_model::cost_tracker::SharedBlockCost,
     solana_measure::measure_us,
     solana_runtime::{bank::Bank, bank_forks::SharableBanks},
-    solana_streamer::quic::SchedulerPfFloor,
+    solana_streamer::quic::SchedulerSaturationFeedback,
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
     std::{
         num::{NonZeroU64, Saturating},
@@ -90,7 +90,8 @@ where
     recheck_cursor: Option<TransactionPriorityId>,
     /// Recheck IDs scratch space.
     recheck_chunk: Vec<TransactionPriorityId>,
-    scheduler_pf_floor: Option<Arc<SchedulerPfFloor>>,
+    saturated: bool,
+    pf_floor: Arc<SchedulerSaturationFeedback>,
 }
 
 impl<R, S> SchedulerController<R, S>
@@ -106,7 +107,7 @@ where
         sharable_banks: SharableBanks,
         scheduler: S,
         worker_metrics: Vec<Arc<ConsumeWorkerMetrics>>,
-        scheduler_pf_floor: Option<Arc<SchedulerPfFloor>>,
+        scheduler_pf_floor: Arc<SchedulerSaturationFeedback>,
     ) -> Self {
         Self {
             exit,
@@ -122,7 +123,8 @@ where
             scheduling_details: SchedulingDetails::default(),
             recheck_cursor: None,
             recheck_chunk: Vec::with_capacity(CHECK_CHUNK),
-            scheduler_pf_floor,
+            saturated: false,
+            pf_floor: scheduler_pf_floor,
         }
     }
 
@@ -275,22 +277,20 @@ where
     }
 
     fn update_scheduler_saturation_feedback(&mut self, priority_min_max: Option<(u64, u64)>) {
-        let Some(scheduler_pf_floor) = self.scheduler_pf_floor.as_ref() else {
-            return;
-        };
         let queue_size = self.container.queue_size();
-        let was_saturated = scheduler_pf_floor.is_active();
         if queue_size >= SCHEDULER_QUEUE_HIGH_WATERMARK {
+            self.saturated = true;
             // Once the queue is saturated, publish the weakest priority currently
             // still admitted to the scheduler's queue as the current floor.
             let floor = priority_min_max.map(|(min, _)| min);
             if let Some(floor) = floor {
-                scheduler_pf_floor.set_priority_floor(floor);
+                self.pf_floor.set_priority_floor(floor);
             } else {
-                scheduler_pf_floor.clear();
+                self.pf_floor.clear();
             }
-        } else if queue_size <= SCHEDULER_QUEUE_LOW_WATERMARK && was_saturated {
-            scheduler_pf_floor.clear();
+        } else if queue_size <= SCHEDULER_QUEUE_LOW_WATERMARK && self.saturated {
+            self.saturated = false;
+            self.pf_floor.clear();
         }
     }
 
@@ -601,7 +601,7 @@ mod tests {
             bank_forks.read().unwrap().sharable_banks(),
             scheduler,
             vec![], // no actual workers with metrics to report, this can be empty
-            None,
+            Arc::new(SchedulerSaturationFeedback::default()),
         );
 
         (test_frame, scheduler_controller)
