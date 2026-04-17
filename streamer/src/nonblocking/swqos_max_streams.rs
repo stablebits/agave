@@ -16,7 +16,8 @@ use {
         quic::{
             DEFAULT_MAX_QUIC_CONNECTIONS_PER_STAKED_PEER,
             DEFAULT_MAX_QUIC_CONNECTIONS_PER_UNSTAKED_PEER, DEFAULT_MAX_STAKED_CONNECTIONS,
-            DEFAULT_MAX_STREAMS_PER_MS, DEFAULT_MAX_UNSTAKED_CONNECTIONS, StreamerStats,
+            DEFAULT_MAX_STREAMS_PER_MS, DEFAULT_MAX_UNSTAKED_CONNECTIONS, SchedulerPfFloor,
+            StreamerStats,
         },
         streamer::StakedNodes,
     },
@@ -230,6 +231,7 @@ pub struct SwQosMaxStreams {
     emergency_entered_us: AtomicU64,
     emergency_transition_lock: StdMutex<()>,
     load_tracker: Arc<LoadDebtTracker>,
+    scheduler_pf_floor: Option<Arc<SchedulerPfFloor>>,
     stats: Arc<StreamerStats>,
     staked_nodes: Arc<RwLock<StakedNodes>>,
     unstaked_connection_table: Arc<Mutex<ConnectionTable<SwQosMaxStreamsStreamerCounter>>>,
@@ -292,6 +294,7 @@ impl SwQosMaxStreams {
 
     pub fn new(
         config: SwQosMaxStreamsConfig,
+        scheduler_pf_floor: Option<Arc<SchedulerPfFloor>>,
         stats: Arc<StreamerStats>,
         staked_nodes: Arc<RwLock<StakedNodes>>,
         cancel: CancellationToken,
@@ -313,6 +316,7 @@ impl SwQosMaxStreams {
                 burst_capacity,
                 Duration::from_millis(1),
             )),
+            scheduler_pf_floor,
             stats,
             staked_nodes,
             unstaked_connection_table: Arc::new(Mutex::new(ConnectionTable::new(
@@ -324,6 +328,14 @@ impl SwQosMaxStreams {
                 cancel,
             ))),
         }
+    }
+
+    fn is_saturated(&self) -> bool {
+        self.load_tracker.is_saturated()
+            || self
+                .scheduler_pf_floor
+                .as_ref()
+                .is_some_and(|scheduler_pf_floor| scheduler_pf_floor.is_active())
     }
 
     /// Core MAX_STREAMS computation (testable without a quinn::Connection).
@@ -610,7 +622,7 @@ impl SwQosMaxStreams {
             // means emergency entry can lag by one stream, which is acceptable
             // because the tracker is already intentionally approximate.
             self.load_tracker.acquire();
-            let saturated = self.load_tracker.is_saturated();
+            let saturated = self.is_saturated();
             if matches!(context.peer_type, ConnectionPeerType::Staked(_)) && saturated {
                 self.stats
                     .saturated_staked_streams
@@ -877,7 +889,7 @@ impl QosController<SwQosMaxStreamsConnectionContext> for SwQosMaxStreams {
         context: &SwQosMaxStreamsConnectionContext,
         rtt: Duration,
     ) -> MaxStreamsAction {
-        let saturated = self.load_tracker.is_saturated();
+        let saturated = self.is_saturated();
         match self.compute_max_streams_for_rtt(context, rtt, saturated) {
             Some(max_streams) => MaxStreamsAction::Set(max_streams),
             None => MaxStreamsAction::Unmanaged,
@@ -950,10 +962,17 @@ pub mod test {
     use super::*;
 
     fn make_swqos(config: SwQosMaxStreamsConfig) -> SwQosMaxStreams {
+        make_swqos_with_scheduler_pf_floor(config, None)
+    }
+
+    fn make_swqos_with_scheduler_pf_floor(
+        config: SwQosMaxStreamsConfig,
+        scheduler_pf_floor: Option<Arc<SchedulerPfFloor>>,
+    ) -> SwQosMaxStreams {
         let cancel = CancellationToken::new();
         let stats = Arc::new(StreamerStats::default());
         let staked_nodes = Arc::new(RwLock::new(crate::streamer::StakedNodes::default()));
-        SwQosMaxStreams::new(config, stats, staked_nodes, cancel)
+        SwQosMaxStreams::new(config, scheduler_pf_floor, stats, staked_nodes, cancel)
     }
 
     fn shared_counter(num_connections: usize) -> Arc<SwQosMaxStreamsStreamerCounter> {
@@ -1098,6 +1117,31 @@ pub mod test {
             swqos.compute_max_streams_for_rtt(&ctx, Duration::from_millis(50), true),
             Some(0),
         );
+    }
+
+    #[test]
+    fn test_scheduler_pf_floor_parks_unstaked_without_replacing_load_tracker() {
+        let scheduler_pf_floor = Arc::new(SchedulerPfFloor::default());
+        let swqos = make_swqos_with_scheduler_pf_floor(
+            SwQosMaxStreamsConfig::default(),
+            Some(scheduler_pf_floor.clone()),
+        );
+        let ctx = unstaked_context();
+
+        assert!(!swqos.load_tracker().is_saturated());
+        assert!(!swqos.is_saturated());
+
+        scheduler_pf_floor.set_priority_floor(100);
+        assert!(swqos.is_saturated());
+        assert_eq!(
+            swqos.compute_max_streams_for_rtt(
+                &ctx,
+                Duration::from_millis(50),
+                swqos.is_saturated()
+            ),
+            Some(0),
+        );
+        assert!(!swqos.load_tracker().is_saturated());
     }
 
     #[test]
@@ -1648,6 +1692,7 @@ pub mod test {
                 emergency_debt_threshold: Some(-10),
                 ..SwQosMaxStreamsConfig::default()
             },
+            None,
             stats.clone(),
             Arc::new(RwLock::new(crate::streamer::StakedNodes::default())),
             CancellationToken::new(),

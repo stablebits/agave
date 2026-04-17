@@ -153,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
         staked_nodes,
         quic_server_params,
         qos_config,
+        None,
         cancel.clone(),
     )?;
     info!("Server listening on {}", socket.local_addr()?);

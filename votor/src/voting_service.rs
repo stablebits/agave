@@ -385,6 +385,7 @@ mod tests {
             staked_nodes,
             QuicStreamerConfig::default_for_tests(),
             SwQosConfig::default(),
+            None,
             cancel.clone(),
         )
         .unwrap();

@@ -25,7 +25,7 @@ use {
         num::NonZeroUsize,
         sync::{
             Arc, RwLock,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicU64, AtomicUsize, Ordering},
         },
         thread::{self},
         time::Duration,
@@ -33,6 +33,33 @@ use {
     tokio::runtime::Runtime,
     tokio_util::sync::CancellationToken,
 };
+
+#[derive(Debug, Default)]
+pub struct SchedulerPfFloor {
+    // Encode `Some(floor)` as `floor + 1` so `0` remains the disabled sentinel.
+    // Priority `0` is still representable under some fee configurations/tests,
+    // but shouldn't occur in real environment.
+    encoded_floor: AtomicU64,
+}
+
+impl SchedulerPfFloor {
+    pub fn set_priority_floor(&self, floor: u64) {
+        self.encoded_floor
+            .store(floor.saturating_add(1), Ordering::Relaxed);
+    }
+
+    pub fn clear(&self) {
+        self.encoded_floor.store(0, Ordering::Relaxed);
+    }
+
+    pub fn priority_floor(&self) -> Option<u64> {
+        self.encoded_floor.load(Ordering::Relaxed).checked_sub(1)
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.encoded_floor.load(Ordering::Relaxed) != 0
+    }
+}
 
 /// QUIC connection idle timeout. The connection will be closed if there are no activities on it
 /// within the timeout window. The chosen value is default for quinn.
@@ -689,6 +716,7 @@ pub fn spawn_stake_weighted_qos_server(
     staked_nodes: Arc<RwLock<StakedNodes>>,
     quic_server_params: QuicStreamerConfig,
     qos_config: SwQosConfig,
+    scheduler_pf_floor: Option<Arc<SchedulerPfFloor>>,
     cancel: CancellationToken,
 ) -> Result<SpawnServerResult, QuicServerError> {
     let stats = Arc::<StreamerStats>::default();
@@ -708,7 +736,13 @@ pub fn spawn_stake_weighted_qos_server(
             )
         }
         SwQosConfig::MaxStreams(config) => {
-            let qos = SwQosMaxStreams::new(config, stats.clone(), staked_nodes, cancel.clone());
+            let qos = SwQosMaxStreams::new(
+                config,
+                scheduler_pf_floor,
+                stats.clone(),
+                staked_nodes,
+                cancel.clone(),
+            );
             spawn_runtime_and_server(
                 thread_name,
                 metrics_name,
@@ -859,6 +893,7 @@ mod test {
             staked_nodes,
             server_params,
             SwQosConfig::default_for_tests(),
+            None,
             cancel.clone(),
         )
         .unwrap();
@@ -920,6 +955,7 @@ mod test {
                 max_connections_per_unstaked_peer: 2,
                 ..Default::default()
             }),
+            None,
             cancel.clone(),
         )
         .unwrap();
@@ -1112,6 +1148,7 @@ mod test {
                 max_unstaked_connections: 0,
                 ..Default::default()
             }),
+            None,
             cancel.clone(),
         )
         .unwrap();

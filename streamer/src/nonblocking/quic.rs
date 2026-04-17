@@ -1713,6 +1713,7 @@ pub mod test {
                 max_unstaked_connections: 0, // Do not allow any connection from unstaked clients/nodes
                 ..Default::default()
             }),
+            None,
             cancel.clone(),
         )
         .unwrap();
@@ -1749,6 +1750,7 @@ pub mod test {
                 max_connections_per_unstaked_peer: 2,
                 ..Default::default()
             }),
+            None,
             cancel.clone(),
         )
         .unwrap();

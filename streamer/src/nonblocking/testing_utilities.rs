@@ -3,7 +3,10 @@ use {
     super::quic::{ALPN_TPU_PROTOCOL_ID, SpawnNonBlockingServerResult},
     crate::{
         nonblocking::{quic::spawn_server, swqos::SwQos, swqos_max_streams::SwQosMaxStreams},
-        quic::{QUIC_MAX_TIMEOUT, QuicServerError, QuicStreamerConfig, StreamerStats, SwQosConfig},
+        quic::{
+            QUIC_MAX_TIMEOUT, QuicServerError, QuicStreamerConfig, SchedulerPfFloor, StreamerStats,
+            SwQosConfig,
+        },
         quic_socket::QuicSocket,
         streamer::StakedNodes,
     },
@@ -42,6 +45,7 @@ pub fn spawn_stake_weighted_qos_server(
     staked_nodes: Arc<RwLock<StakedNodes>>,
     quic_server_params: QuicStreamerConfig,
     qos_config: SwQosConfig,
+    scheduler_pf_floor: Option<Arc<SchedulerPfFloor>>,
     cancel: CancellationToken,
 ) -> Result<SpawnNonBlockingServerResult, QuicServerError> {
     let stats = Arc::<StreamerStats>::default();
@@ -61,7 +65,13 @@ pub fn spawn_stake_weighted_qos_server(
             )
         }
         SwQosConfig::MaxStreams(config) => {
-            let qos = SwQosMaxStreams::new(config, stats.clone(), staked_nodes, cancel.clone());
+            let qos = SwQosMaxStreams::new(
+                config,
+                scheduler_pf_floor,
+                stats.clone(),
+                staked_nodes,
+                cancel.clone(),
+            );
             spawn_server(
                 name,
                 stats,
@@ -151,6 +161,7 @@ pub fn setup_quic_server(
         staked_nodes,
         quic_server_params,
         qos_config,
+        None,
         cancel.clone(),
     )
     .unwrap();
