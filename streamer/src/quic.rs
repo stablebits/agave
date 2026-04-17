@@ -35,14 +35,14 @@ use {
 };
 
 #[derive(Debug, Default)]
-pub struct SchedulerPfFloor {
+pub struct SchedulerSaturationFeedback {
     // Encode `Some(floor)` as `floor + 1` so `0` remains the disabled sentinel.
     // Priority `0` is still representable under some fee configurations/tests,
     // but shouldn't occur in real environment.
     encoded_floor: AtomicU64,
 }
 
-impl SchedulerPfFloor {
+impl SchedulerSaturationFeedback {
     pub fn set_priority_floor(&self, floor: u64) {
         self.encoded_floor
             .store(floor.saturating_add(1), Ordering::Relaxed);
@@ -52,12 +52,15 @@ impl SchedulerPfFloor {
         self.encoded_floor.store(0, Ordering::Relaxed);
     }
 
-    pub fn priority_floor(&self) -> Option<u64> {
-        self.encoded_floor.load(Ordering::Relaxed).checked_sub(1)
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.encoded_floor.load(Ordering::Relaxed) != 0
+    // Return a single-load snapshot so saturation and floor stay in sync.
+    // The floor is only meaningful when the saturated bit is true.
+    pub fn get(&self) -> (bool, u64) {
+        let encoded_floor = self.encoded_floor.load(Ordering::Relaxed);
+        if encoded_floor == 0 {
+            (false, 0)
+        } else {
+            (true, encoded_floor - 1)
+        }
     }
 }
 
@@ -716,7 +719,7 @@ pub fn spawn_stake_weighted_qos_server(
     staked_nodes: Arc<RwLock<StakedNodes>>,
     quic_server_params: QuicStreamerConfig,
     qos_config: SwQosConfig,
-    scheduler_pf_floor: Option<Arc<SchedulerPfFloor>>,
+    scheduler_pf_floor: Option<Arc<SchedulerSaturationFeedback>>,
     cancel: CancellationToken,
 ) -> Result<SpawnServerResult, QuicServerError> {
     let stats = Arc::<StreamerStats>::default();

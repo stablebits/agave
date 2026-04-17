@@ -16,8 +16,8 @@ use {
         quic::{
             DEFAULT_MAX_QUIC_CONNECTIONS_PER_STAKED_PEER,
             DEFAULT_MAX_QUIC_CONNECTIONS_PER_UNSTAKED_PEER, DEFAULT_MAX_STAKED_CONNECTIONS,
-            DEFAULT_MAX_STREAMS_PER_MS, DEFAULT_MAX_UNSTAKED_CONNECTIONS, SchedulerPfFloor,
-            StreamerStats,
+            DEFAULT_MAX_STREAMS_PER_MS, DEFAULT_MAX_UNSTAKED_CONNECTIONS,
+            SchedulerSaturationFeedback, StreamerStats,
         },
         streamer::StakedNodes,
     },
@@ -231,7 +231,7 @@ pub struct SwQosMaxStreams {
     emergency_entered_us: AtomicU64,
     emergency_transition_lock: StdMutex<()>,
     load_tracker: Arc<LoadDebtTracker>,
-    scheduler_pf_floor: Option<Arc<SchedulerPfFloor>>,
+    scheduler_pf_floor: Option<Arc<SchedulerSaturationFeedback>>,
     stats: Arc<StreamerStats>,
     staked_nodes: Arc<RwLock<StakedNodes>>,
     unstaked_connection_table: Arc<Mutex<ConnectionTable<SwQosMaxStreamsStreamerCounter>>>,
@@ -294,7 +294,7 @@ impl SwQosMaxStreams {
 
     pub fn new(
         config: SwQosMaxStreamsConfig,
-        scheduler_pf_floor: Option<Arc<SchedulerPfFloor>>,
+        scheduler_pf_floor: Option<Arc<SchedulerSaturationFeedback>>,
         stats: Arc<StreamerStats>,
         staked_nodes: Arc<RwLock<StakedNodes>>,
         cancel: CancellationToken,
@@ -335,7 +335,7 @@ impl SwQosMaxStreams {
             || self
                 .scheduler_pf_floor
                 .as_ref()
-                .is_some_and(|scheduler_pf_floor| scheduler_pf_floor.is_active())
+                .is_some_and(|scheduler_pf_floor| scheduler_pf_floor.get().0)
     }
 
     /// Core MAX_STREAMS computation (testable without a quinn::Connection).
@@ -967,7 +967,7 @@ pub mod test {
 
     fn make_swqos_with_scheduler_pf_floor(
         config: SwQosMaxStreamsConfig,
-        scheduler_pf_floor: Option<Arc<SchedulerPfFloor>>,
+        scheduler_pf_floor: Option<Arc<SchedulerSaturationFeedback>>,
     ) -> SwQosMaxStreams {
         let cancel = CancellationToken::new();
         let stats = Arc::new(StreamerStats::default());
@@ -1121,7 +1121,7 @@ pub mod test {
 
     #[test]
     fn test_scheduler_pf_floor_parks_unstaked_without_replacing_load_tracker() {
-        let scheduler_pf_floor = Arc::new(SchedulerPfFloor::default());
+        let scheduler_pf_floor = Arc::new(SchedulerSaturationFeedback::default());
         let swqos = make_swqos_with_scheduler_pf_floor(
             SwQosMaxStreamsConfig::default(),
             Some(scheduler_pf_floor.clone()),

@@ -38,7 +38,7 @@ use {
         bank::Bank, bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache,
         vote_sender_types::ReplayVoteSender,
     },
-    solana_streamer::quic::SchedulerPfFloor,
+    solana_streamer::quic::SchedulerSaturationFeedback,
     solana_time_utils::AtomicInterval,
     solana_unified_scheduler_logic::SchedulingMode,
     std::{
@@ -380,7 +380,7 @@ pub struct BankingStage {
     bank_forks: Arc<RwLock<BankForks>>,
     committer: Committer,
     log_messages_bytes_limit: Option<usize>,
-    scheduler_pf_floor: Option<Arc<SchedulerPfFloor>>,
+    scheduler_pf_floor: Arc<SchedulerSaturationFeedback>,
     threads: FuturesUnordered<NamedTask<std::thread::Result<()>>>,
 }
 
@@ -401,7 +401,7 @@ impl BankingStage {
         log_messages_bytes_limit: Option<usize>,
         bank_forks: Arc<RwLock<BankForks>>,
         prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
-        scheduler_pf_floor: Option<Arc<SchedulerPfFloor>>,
+        scheduler_pf_floor: Arc<SchedulerSaturationFeedback>,
     ) -> BankingStageHandle {
         let committer = Committer::new(
             transaction_status_sender,
@@ -510,9 +510,7 @@ impl BankingStage {
     }
 
     fn spawn_scheduler(&mut self, args: BankingControlMsg) -> Result<(), ()> {
-        if let Some(scheduler_pf_floor) = self.scheduler_pf_floor.as_ref() {
-            scheduler_pf_floor.clear();
-        }
+        self.scheduler_pf_floor.clear();
         let threads = (match args {
             BankingControlMsg::Internal {
                 block_production_method,
@@ -551,7 +549,7 @@ impl BankingStage {
         use_greedy_scheduler: bool,
         num_workers: NonZeroUsize,
         scheduler_config: SchedulerConfig,
-        scheduler_pf_floor: Option<Arc<SchedulerPfFloor>>,
+        scheduler_pf_floor: Arc<SchedulerSaturationFeedback>,
     ) -> Result<Vec<JoinHandle<()>>, ()> {
         info!("Spawning internal central scheduler");
         // Toggling unified scheduler into the disabled state should always be a safe and idempotent
@@ -1006,7 +1004,7 @@ mod tests {
             None,
             bank_forks,
             None,
-            None,
+            Arc::new(SchedulerSaturationFeedback::default()),
         );
         drop(non_vote_sender);
         drop(tpu_vote_sender);
@@ -1067,7 +1065,7 @@ mod tests {
             None,
             bank_forks, // keep a local-copy of bank-forks so worker threads do not lose weak access to bank-forks
             None,
-            None,
+            Arc::new(SchedulerSaturationFeedback::default()),
         );
 
         // good tx, and no verify
@@ -1222,7 +1220,7 @@ mod tests {
                 None,
                 bank_forks,
                 None,
-                None,
+                Arc::new(SchedulerSaturationFeedback::default()),
             );
 
             // wait for banking_stage to eat the packets
@@ -1376,7 +1374,7 @@ mod tests {
             None,
             bank_forks,
             None,
-            None,
+            Arc::new(SchedulerSaturationFeedback::default()),
         );
 
         let keypairs = (0..100).map(|_| Keypair::new()).collect_vec();

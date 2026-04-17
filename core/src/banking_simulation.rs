@@ -866,7 +866,7 @@ impl BankingSimulator {
             None,
             bank_forks.clone(),
             None,
-            None,
+            Arc::new(solana_streamer::quic::SchedulerSaturationFeedback::default()),
         );
 
         let (&_slot, &raw_base_event_time) = freeze_time_by_slot
