@@ -38,6 +38,7 @@ use {
         bank::Bank, bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache,
         vote_sender_types::ReplayVoteSender,
     },
+    solana_streamer::quic::SchedulerPfFloor,
     solana_time_utils::AtomicInterval,
     solana_unified_scheduler_logic::SchedulingMode,
     std::{
@@ -379,6 +380,7 @@ pub struct BankingStage {
     bank_forks: Arc<RwLock<BankForks>>,
     committer: Committer,
     log_messages_bytes_limit: Option<usize>,
+    scheduler_pf_floor: Option<Arc<SchedulerPfFloor>>,
     threads: FuturesUnordered<NamedTask<std::thread::Result<()>>>,
 }
 
@@ -399,6 +401,7 @@ impl BankingStage {
         log_messages_bytes_limit: Option<usize>,
         bank_forks: Arc<RwLock<BankForks>>,
         prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
+        scheduler_pf_floor: Option<Arc<SchedulerPfFloor>>,
     ) -> BankingStageHandle {
         let committer = Committer::new(
             transaction_status_sender,
@@ -420,6 +423,7 @@ impl BankingStage {
             bank_forks,
             committer,
             log_messages_bytes_limit,
+            scheduler_pf_floor,
             threads: FuturesUnordered::default(),
         };
 
@@ -506,18 +510,27 @@ impl BankingStage {
     }
 
     fn spawn_scheduler(&mut self, args: BankingControlMsg) -> Result<(), ()> {
+        if let Some(scheduler_pf_floor) = self.scheduler_pf_floor.as_ref() {
+            scheduler_pf_floor.clear();
+        }
         let threads = (match args {
             BankingControlMsg::Internal {
                 block_production_method,
                 num_workers,
                 config,
             } => match block_production_method {
-                BlockProductionMethod::CentralScheduler => {
-                    self.spawn_internal_central(false, num_workers, config)
-                }
-                BlockProductionMethod::CentralSchedulerGreedy => {
-                    self.spawn_internal_central(true, num_workers, config)
-                }
+                BlockProductionMethod::CentralScheduler => self.spawn_internal_central(
+                    false,
+                    num_workers,
+                    config,
+                    self.scheduler_pf_floor.clone(),
+                ),
+                BlockProductionMethod::CentralSchedulerGreedy => self.spawn_internal_central(
+                    true,
+                    num_workers,
+                    config,
+                    self.scheduler_pf_floor.clone(),
+                ),
             },
             #[cfg(unix)]
             BankingControlMsg::External { session } => self.spawn_external(session),
@@ -538,6 +551,7 @@ impl BankingStage {
         use_greedy_scheduler: bool,
         num_workers: NonZeroUsize,
         scheduler_config: SchedulerConfig,
+        scheduler_pf_floor: Option<Arc<SchedulerPfFloor>>,
     ) -> Result<Vec<JoinHandle<()>>, ()> {
         info!("Spawning internal central scheduler");
         // Toggling unified scheduler into the disabled state should always be a safe and idempotent
@@ -616,6 +630,7 @@ impl BankingStage {
                                 sharable_banks,
                                 $scheduler,
                                 worker_metrics,
+                                scheduler_pf_floor,
                             );
 
                             match scheduler_controller.run() {
@@ -991,6 +1006,7 @@ mod tests {
             None,
             bank_forks,
             None,
+            None,
         );
         drop(non_vote_sender);
         drop(tpu_vote_sender);
@@ -1050,6 +1066,7 @@ mod tests {
             replay_vote_sender,
             None,
             bank_forks, // keep a local-copy of bank-forks so worker threads do not lose weak access to bank-forks
+            None,
             None,
         );
 
@@ -1205,6 +1222,7 @@ mod tests {
                 None,
                 bank_forks,
                 None,
+                None,
             );
 
             // wait for banking_stage to eat the packets
@@ -1357,6 +1375,7 @@ mod tests {
             replay_vote_sender,
             None,
             bank_forks,
+            None,
             None,
         );
 

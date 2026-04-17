@@ -83,6 +83,7 @@ mod tests {
             staked_nodes,
             QuicStreamerConfig::default_for_tests(),
             SwQosConfig::default(),
+            None,
             cancel.clone(),
         )
         .unwrap();
@@ -164,6 +165,7 @@ mod tests {
             staked_nodes,
             QuicStreamerConfig::default_for_tests(),
             SwQosConfig::default(),
+            None,
             cancel.clone(),
         )
         .unwrap();
@@ -223,6 +225,7 @@ mod tests {
             staked_nodes.clone(),
             QuicStreamerConfig::default_for_tests(),
             SwQosConfig::default(),
+            None,
             request_recv_cancel.clone(),
         )
         .unwrap();
@@ -248,6 +251,7 @@ mod tests {
             staked_nodes,
             QuicStreamerConfig::default_for_tests(),
             SwQosConfig::default(),
+            None,
             response_recv_cancel.clone(),
         )
         .unwrap();
@@ -335,6 +339,7 @@ mod tests {
             staked_nodes,
             QuicStreamerConfig::default_for_tests(),
             SwQosConfig::default(),
+            None,
             cancel.clone(),
         )
         .unwrap();
