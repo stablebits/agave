@@ -45,7 +45,7 @@ pub fn spawn_stake_weighted_qos_server(
     staked_nodes: Arc<RwLock<StakedNodes>>,
     quic_server_params: QuicStreamerConfig,
     qos_config: SwQosConfig,
-    scheduler_pf_floor: Option<Arc<SchedulerSaturationFeedback>>,
+    scheduler_saturation_feedback: Option<Arc<SchedulerSaturationFeedback>>,
     cancel: CancellationToken,
 ) -> Result<SpawnNonBlockingServerResult, QuicServerError> {
     let stats = Arc::<StreamerStats>::default();
@@ -67,7 +67,7 @@ pub fn spawn_stake_weighted_qos_server(
         SwQosConfig::MaxStreams(config) => {
             let qos = SwQosMaxStreams::new(
                 config,
-                scheduler_pf_floor,
+                scheduler_saturation_feedback,
                 stats.clone(),
                 staked_nodes,
                 cancel.clone(),

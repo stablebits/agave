@@ -91,7 +91,7 @@ where
     /// Recheck IDs scratch space.
     recheck_chunk: Vec<TransactionPriorityId>,
     saturated: bool,
-    pf_floor: Arc<SchedulerSaturationFeedback>,
+    saturation_feedback: Arc<SchedulerSaturationFeedback>,
 }
 
 impl<R, S> SchedulerController<R, S>
@@ -107,7 +107,7 @@ where
         sharable_banks: SharableBanks,
         scheduler: S,
         worker_metrics: Vec<Arc<ConsumeWorkerMetrics>>,
-        scheduler_pf_floor: Arc<SchedulerSaturationFeedback>,
+        scheduler_saturation_feedback: Arc<SchedulerSaturationFeedback>,
     ) -> Self {
         Self {
             exit,
@@ -124,7 +124,7 @@ where
             recheck_cursor: None,
             recheck_chunk: Vec::with_capacity(CHECK_CHUNK),
             saturated: false,
-            pf_floor: scheduler_pf_floor,
+            saturation_feedback: scheduler_saturation_feedback,
         }
     }
 
@@ -284,13 +284,13 @@ where
             // still admitted to the scheduler's queue as the current floor.
             let floor = priority_min_max.map(|(min, _)| min);
             if let Some(floor) = floor {
-                self.pf_floor.set_priority_floor(floor);
+                self.saturation_feedback.set_priority_floor(floor);
             } else {
-                self.pf_floor.clear();
+                self.saturation_feedback.clear();
             }
         } else if queue_size <= SCHEDULER_QUEUE_LOW_WATERMARK && self.saturated {
             self.saturated = false;
-            self.pf_floor.clear();
+            self.saturation_feedback.clear();
         }
     }
 
