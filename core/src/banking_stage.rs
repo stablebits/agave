@@ -380,7 +380,7 @@ pub struct BankingStage {
     bank_forks: Arc<RwLock<BankForks>>,
     committer: Committer,
     log_messages_bytes_limit: Option<usize>,
-    scheduler_pf_floor: Arc<SchedulerSaturationFeedback>,
+    scheduler_saturation_feedback: Arc<SchedulerSaturationFeedback>,
     threads: FuturesUnordered<NamedTask<std::thread::Result<()>>>,
 }
 
@@ -401,7 +401,7 @@ impl BankingStage {
         log_messages_bytes_limit: Option<usize>,
         bank_forks: Arc<RwLock<BankForks>>,
         prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
-        scheduler_pf_floor: Arc<SchedulerSaturationFeedback>,
+        scheduler_saturation_feedback: Arc<SchedulerSaturationFeedback>,
     ) -> BankingStageHandle {
         let committer = Committer::new(
             transaction_status_sender,
@@ -423,7 +423,7 @@ impl BankingStage {
             bank_forks,
             committer,
             log_messages_bytes_limit,
-            scheduler_pf_floor,
+            scheduler_saturation_feedback,
             threads: FuturesUnordered::default(),
         };
 
@@ -510,7 +510,7 @@ impl BankingStage {
     }
 
     fn spawn_scheduler(&mut self, args: BankingControlMsg) -> Result<(), ()> {
-        self.scheduler_pf_floor.clear();
+        self.scheduler_saturation_feedback.clear();
         let threads = (match args {
             BankingControlMsg::Internal {
                 block_production_method,
@@ -521,13 +521,13 @@ impl BankingStage {
                     false,
                     num_workers,
                     config,
-                    self.scheduler_pf_floor.clone(),
+                    self.scheduler_saturation_feedback.clone(),
                 ),
                 BlockProductionMethod::CentralSchedulerGreedy => self.spawn_internal_central(
                     true,
                     num_workers,
                     config,
-                    self.scheduler_pf_floor.clone(),
+                    self.scheduler_saturation_feedback.clone(),
                 ),
             },
             #[cfg(unix)]
@@ -549,7 +549,7 @@ impl BankingStage {
         use_greedy_scheduler: bool,
         num_workers: NonZeroUsize,
         scheduler_config: SchedulerConfig,
-        scheduler_pf_floor: Arc<SchedulerSaturationFeedback>,
+        scheduler_saturation_feedback: Arc<SchedulerSaturationFeedback>,
     ) -> Result<Vec<JoinHandle<()>>, ()> {
         info!("Spawning internal central scheduler");
         // Toggling unified scheduler into the disabled state should always be a safe and idempotent
@@ -628,7 +628,7 @@ impl BankingStage {
                                 sharable_banks,
                                 $scheduler,
                                 worker_metrics,
-                                scheduler_pf_floor,
+                                scheduler_saturation_feedback,
                             );
 
                             match scheduler_controller.run() {
