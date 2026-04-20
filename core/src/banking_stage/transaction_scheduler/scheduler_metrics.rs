@@ -93,7 +93,7 @@ pub struct SchedulerCountMetricsInner {
 
 impl IntervalSchedulerCountMetrics {
     fn maybe_report_and_reset(&mut self, should_report: bool) {
-        const REPORT_INTERVAL_MS: u64 = 1000;
+        const REPORT_INTERVAL_MS: u64 = 100;
         if self.interval.should_update(REPORT_INTERVAL_MS) {
             if should_report {
                 self.metrics.report("banking_stage_scheduler_counts", None);
@@ -311,7 +311,7 @@ pub struct SchedulerTimingMetricsInner {
 
 impl IntervalSchedulerTimingMetrics {
     fn maybe_report_and_reset(&mut self, should_report: bool) {
-        const REPORT_INTERVAL_MS: u64 = 1000;
+        const REPORT_INTERVAL_MS: u64 = 100;
         if self.interval.should_update(REPORT_INTERVAL_MS) {
             if should_report {
                 self.metrics.report("banking_stage_scheduler_timing", None);

@@ -349,7 +349,7 @@ impl SigVerifyStage {
                             _ => error!("{e:?}"),
                         }
                     }
-                    if last_print.elapsed().as_secs() > 2 {
+                    if last_print.elapsed().as_millis() > 100 {
                         stats.maybe_report_and_reset(metrics_name);
                         last_print = Instant::now();
                     }
