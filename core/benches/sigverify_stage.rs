@@ -200,7 +200,7 @@ fn bench_sigverify_stage(bencher: &mut Bencher, use_same_tx: bool) {
         completed: completed.clone(),
         thread_pool: Arc::new(sigverify::threadpool_for_benches()),
     };
-    let stage = SigVerifyStage::new(packet_r, verifier, "solSigVerBench", "bench");
+    let stage = SigVerifyStage::new(packet_r, verifier, "solSigVerBench", "bench", None);
     let packet_s = packet_s;
     let packet_s_for_bench = packet_s.clone();
     let completed_for_bench = completed.clone();

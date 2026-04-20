@@ -277,7 +277,13 @@ impl Tpu {
                 non_vote_sender,
                 enable_block_production_forwarding.then(|| forward_stage_sender.clone()),
             );
-            SigVerifyStage::new(packet_receiver, verifier, "solSigVerTpu", "tpu-verifier")
+            SigVerifyStage::new(
+                packet_receiver,
+                verifier,
+                "solSigVerTpu",
+                "tpu-verifier",
+                Some(scheduler_saturation_feedback.clone()),
+            )
         };
 
         let vote_sigverify_stage = {
@@ -291,6 +297,7 @@ impl Tpu {
                 verifier,
                 "solSigVerTpuVot",
                 "tpu-vote-verifier",
+                None,
             )
         };
 
