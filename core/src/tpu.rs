@@ -277,12 +277,15 @@ impl Tpu {
                 non_vote_sender,
                 enable_block_production_forwarding.then(|| forward_stage_sender.clone()),
             );
+            let feedback_for_sigverify = block_production_scheduler_config
+                .pf_floor_enabled
+                .then(|| scheduler_saturation_feedback.clone());
             SigVerifyStage::new(
                 packet_receiver,
                 verifier,
                 "solSigVerTpu",
                 "tpu-verifier",
-                Some(scheduler_saturation_feedback.clone()),
+                feedback_for_sigverify,
             )
         };
 

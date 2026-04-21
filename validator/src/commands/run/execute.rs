@@ -885,12 +885,30 @@ pub fn execute(
             BlockProductionMethod
         ),
         block_production_num_workers,
-        block_production_scheduler_config: SchedulerConfig {
-            scheduler_pacing: value_t_or_exit!(
-                matches,
-                "block_production_pacing_fill_time_millis",
-                SchedulerPacing
-            ),
+        block_production_scheduler_config: {
+            let high = value_t_or_exit!(matches, "scheduler_pf_floor_high_watermark_pct", u8);
+            let low = value_t_or_exit!(matches, "scheduler_pf_floor_low_watermark_pct", u8);
+            if high == 0 || high > 100 {
+                Err(format!(
+                    "--scheduler-pf-floor-high-watermark-pct must be in (0, 100], got {high}"
+                ))?;
+            }
+            if low >= high {
+                Err(format!(
+                    "--scheduler-pf-floor-low-watermark-pct ({low}) must be strictly less than \
+                     --scheduler-pf-floor-high-watermark-pct ({high})"
+                ))?;
+            }
+            SchedulerConfig {
+                scheduler_pacing: value_t_or_exit!(
+                    matches,
+                    "block_production_pacing_fill_time_millis",
+                    SchedulerPacing
+                ),
+                pf_floor_enabled: !matches.is_present("scheduler_pf_floor_disable"),
+                pf_floor_high_watermark_percent: high,
+                pf_floor_low_watermark_percent: low,
+            }
         },
         enable_block_production_forwarding: staked_nodes_overrides_path.is_some(),
         enable_scheduler_bindings: matches.is_present("enable_scheduler_bindings"),

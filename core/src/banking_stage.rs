@@ -998,6 +998,7 @@ mod tests {
             DEFAULT_NUM_WORKERS,
             SchedulerConfig {
                 scheduler_pacing: SchedulerPacing::Disabled,
+                ..SchedulerConfig::default()
             },
             None,
             replay_vote_sender,
@@ -1059,6 +1060,7 @@ mod tests {
             DEFAULT_NUM_WORKERS,
             SchedulerConfig {
                 scheduler_pacing: SchedulerPacing::Disabled,
+                ..SchedulerConfig::default()
             },
             None,
             replay_vote_sender,
@@ -1214,6 +1216,7 @@ mod tests {
                 DEFAULT_NUM_WORKERS,
                 SchedulerConfig {
                     scheduler_pacing: SchedulerPacing::Disabled,
+                    ..SchedulerConfig::default()
                 },
                 None,
                 replay_vote_sender,
@@ -1368,6 +1371,7 @@ mod tests {
             DEFAULT_NUM_WORKERS,
             SchedulerConfig {
                 scheduler_pacing: SchedulerPacing::Disabled,
+                ..SchedulerConfig::default()
             },
             None,
             replay_vote_sender,

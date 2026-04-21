@@ -790,6 +790,43 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("scheduler_pf_floor_disable")
+            .long("scheduler-pf-floor-disable")
+            .takes_value(false)
+            .hidden(hidden_unless_forced())
+            .help(
+                "Disable sigverify-stage dropping of transactions below the scheduler's \
+                 published priority floor. The scheduler continues to publish the floor for \
+                 other consumers (e.g. SWQoS MAX_STREAMS).",
+            ),
+    )
+    .arg(
+        Arg::with_name("scheduler_pf_floor_high_watermark_pct")
+            .long("scheduler-pf-floor-high-watermark-pct")
+            .takes_value(true)
+            .default_value(&default_args.scheduler_pf_floor_high_watermark_pct)
+            .validator(is_parsable::<u8>)
+            .hidden(hidden_unless_forced())
+            .help(
+                "Scheduler queue occupancy (percent of total capacity) at which the scheduler \
+                 enters the saturated state and publishes a priority floor. Must be in \
+                 (low-watermark, 100].",
+            ),
+    )
+    .arg(
+        Arg::with_name("scheduler_pf_floor_low_watermark_pct")
+            .long("scheduler-pf-floor-low-watermark-pct")
+            .takes_value(true)
+            .default_value(&default_args.scheduler_pf_floor_low_watermark_pct)
+            .validator(is_parsable::<u8>)
+            .hidden(hidden_unless_forced())
+            .help(
+                "Scheduler queue occupancy (percent of total capacity) at which the scheduler \
+                 leaves the saturated state and clears the published floor. Must be strictly \
+                 less than --scheduler-pf-floor-high-watermark-pct (gap provides hysteresis).",
+            ),
+    )
+    .arg(
         Arg::with_name("num_quic_endpoints")
             .long("num-quic-endpoints")
             .takes_value(true)

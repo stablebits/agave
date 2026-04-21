@@ -37,12 +37,44 @@ use {
 };
 
 const CHECK_CHUNK: usize = 128;
-const SCHEDULER_QUEUE_HIGH_WATERMARK: usize = TOTAL_BUFFERED_PACKETS * 8 / 10;
-const SCHEDULER_QUEUE_LOW_WATERMARK: usize = TOTAL_BUFFERED_PACKETS * 6 / 10;
+
+/// Default fraction of `TOTAL_BUFFERED_PACKETS` at which the scheduler
+/// publishes a priority floor (enters the "saturated" state).
+pub const DEFAULT_PF_FLOOR_HIGH_WATERMARK_PERCENT: u8 = 80;
+/// Default fraction of `TOTAL_BUFFERED_PACKETS` at which the scheduler clears
+/// the published floor (exits the "saturated" state). Must be strictly less
+/// than the high watermark — the gap provides hysteresis.
+pub const DEFAULT_PF_FLOOR_LOW_WATERMARK_PERCENT: u8 = 60;
 
 #[derive(Clone)]
 pub struct SchedulerConfig {
     pub scheduler_pacing: SchedulerPacing,
+    /// When true, sigverify drops incoming packets whose approximated priority
+    /// is below the published floor. When false, the scheduler still publishes
+    /// the floor (for other consumers like SWQoS MAX_STREAMS), but the
+    /// sigverify-side drop is disabled.
+    pub pf_floor_enabled: bool,
+    /// Queue-size percentage at which the scheduler enters the saturated state
+    /// and publishes a priority floor. In `(low, 100]`.
+    pub pf_floor_high_watermark_percent: u8,
+    /// Queue-size percentage at which the scheduler leaves the saturated state
+    /// and clears the published floor. In `[0, high)`. Must be strictly less
+    /// than `pf_floor_high_watermark_percent` to provide hysteresis.
+    pub pf_floor_low_watermark_percent: u8,
+}
+
+impl SchedulerConfig {
+    fn queue_high_watermark(&self) -> usize {
+        TOTAL_BUFFERED_PACKETS
+            .saturating_mul(self.pf_floor_high_watermark_percent as usize)
+            / 100
+    }
+
+    fn queue_low_watermark(&self) -> usize {
+        TOTAL_BUFFERED_PACKETS
+            .saturating_mul(self.pf_floor_low_watermark_percent as usize)
+            / 100
+    }
 }
 
 impl Default for SchedulerConfig {
@@ -51,6 +83,9 @@ impl Default for SchedulerConfig {
             scheduler_pacing: SchedulerPacing::FillTimeMillis(
                 DEFAULT_SCHEDULER_PACING_FILL_TIME_MILLIS,
             ),
+            pf_floor_enabled: true,
+            pf_floor_high_watermark_percent: DEFAULT_PF_FLOOR_HIGH_WATERMARK_PERCENT,
+            pf_floor_low_watermark_percent: DEFAULT_PF_FLOOR_LOW_WATERMARK_PERCENT,
         }
     }
 }
@@ -278,7 +313,7 @@ where
 
     fn update_scheduler_saturation_feedback(&mut self, priority_min_max: Option<(u64, u64)>) {
         let queue_size = self.container.queue_size();
-        if queue_size >= SCHEDULER_QUEUE_HIGH_WATERMARK {
+        if queue_size >= self.config.queue_high_watermark() {
             self.saturated = true;
             // Once the queue is saturated, publish the weakest priority currently
             // still admitted to the scheduler's queue as the current floor.
@@ -288,7 +323,7 @@ where
             } else {
                 self.saturation_feedback.clear();
             }
-        } else if queue_size <= SCHEDULER_QUEUE_LOW_WATERMARK && self.saturated {
+        } else if queue_size <= self.config.queue_low_watermark() && self.saturated {
             self.saturated = false;
             self.saturation_feedback.clear();
         }

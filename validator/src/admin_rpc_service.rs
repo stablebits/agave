@@ -818,7 +818,13 @@ impl AdminRpc for AdminRpcImpl {
                 .try_send(BankingControlMsg::Internal {
                     block_production_method,
                     num_workers,
-                    config: SchedulerConfig { scheduler_pacing },
+                    // manage_block_production only accepts scheduler_pacing; other
+                    // SchedulerConfig fields (pf_floor_*) reset to defaults here.
+                    // Extend the RPC if runtime control of those fields is needed.
+                    config: SchedulerConfig {
+                        scheduler_pacing,
+                        ..SchedulerConfig::default()
+                    },
                 })
                 .is_err()
             {
