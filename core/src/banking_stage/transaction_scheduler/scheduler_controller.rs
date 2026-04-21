@@ -126,6 +126,10 @@ where
     /// Recheck IDs scratch space.
     recheck_chunk: Vec<TransactionPriorityId>,
     saturated: bool,
+    /// Timestamp of the last `update_scheduler_saturation_feedback` call while
+    /// saturated. Used to accumulate `saturation_time_us` across iterations.
+    /// `None` when the scheduler is not currently saturated.
+    saturation_last_tick: Option<Instant>,
     saturation_feedback: Arc<SchedulerSaturationFeedback>,
 }
 
@@ -159,6 +163,7 @@ where
             recheck_cursor: None,
             recheck_chunk: Vec::with_capacity(CHECK_CHUNK),
             saturated: false,
+            saturation_last_tick: None,
             saturation_feedback: scheduler_saturation_feedback,
         }
     }
@@ -313,18 +318,46 @@ where
 
     fn update_scheduler_saturation_feedback(&mut self, priority_min_max: Option<(u64, u64)>) {
         let queue_size = self.container.queue_size();
+        let now = Instant::now();
+
+        // If we were already saturated on the previous iteration, attribute the
+        // elapsed wall-time since that iteration to `saturation_time_us`. This
+        // runs regardless of whether we're about to transition out so that
+        // mid-range (between low and high watermarks) time is also counted.
+        if self.saturated {
+            if let Some(last) = self.saturation_last_tick {
+                let elapsed_us = now.duration_since(last).as_micros() as u64;
+                self.timing_metrics.update(|timing_metrics| {
+                    timing_metrics.saturation_time_us += Saturating(elapsed_us);
+                });
+            }
+            self.saturation_last_tick = Some(now);
+        }
+
         if queue_size >= self.config.queue_high_watermark() {
-            self.saturated = true;
+            if !self.saturated {
+                // Transition 0 → 1
+                self.saturated = true;
+                self.saturation_last_tick = Some(now);
+                self.count_metrics.update(|count_metrics| {
+                    count_metrics.num_saturation_entries += Saturating(1);
+                });
+            }
             // Once the queue is saturated, publish the weakest priority currently
             // still admitted to the scheduler's queue as the current floor.
             let floor = priority_min_max.map(|(min, _)| min);
             if let Some(floor) = floor {
                 self.saturation_feedback.set_priority_floor(floor);
+                self.count_metrics.update(|count_metrics| {
+                    count_metrics.last_saturation_floor = floor;
+                });
             } else {
                 self.saturation_feedback.clear();
             }
         } else if queue_size <= self.config.queue_low_watermark() && self.saturated {
+            // Transition 1 → 0
             self.saturated = false;
+            self.saturation_last_tick = None;
             self.saturation_feedback.clear();
         }
     }

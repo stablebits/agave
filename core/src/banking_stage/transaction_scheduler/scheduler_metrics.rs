@@ -89,6 +89,11 @@ pub struct SchedulerCountMetricsInner {
     pub min_prioritization_fees: u64,
     /// Max prioritization fees in the transaction container
     pub max_prioritization_fees: u64,
+    /// Number of times the scheduler entered the saturated state (0→1 edge).
+    pub num_saturation_entries: Saturating<usize>,
+    /// Most recent priority floor published during the interval. 0 means no
+    /// floor was published.
+    pub last_saturation_floor: u64,
 }
 
 impl IntervalSchedulerCountMetrics {
@@ -142,6 +147,8 @@ impl SchedulerCountMetricsInner {
             num_dropped_on_capacity: Saturating(num_dropped_on_capacity),
             min_prioritization_fees: _min_prioritization_fees,
             max_prioritization_fees: _max_prioritization_fees,
+            num_saturation_entries: Saturating(num_saturation_entries),
+            last_saturation_floor,
         } = self;
         let mut datapoint = create_datapoint!(
             @point name,
@@ -192,7 +199,9 @@ impl SchedulerCountMetricsInner {
             ),
             ("num_dropped_on_capacity", num_dropped_on_capacity, i64),
             ("min_priority", self.get_min_priority(), i64),
-            ("max_priority", self.get_max_priority(), i64)
+            ("max_priority", self.get_max_priority(), i64),
+            ("num_saturation_entries", num_saturation_entries, i64),
+            ("last_saturation_floor", last_saturation_floor, i64)
         );
         if let Some(slot) = slot {
             datapoint.add_field_i64("slot", slot as i64);
@@ -209,6 +218,7 @@ impl SchedulerCountMetricsInner {
             || self.num_schedule_filtered_out != Saturating(0)
             || self.num_finished != Saturating(0)
             || self.num_retryable != Saturating(0)
+            || self.num_saturation_entries != Saturating(0)
     }
 
     fn reset(&mut self) {
@@ -232,6 +242,8 @@ impl SchedulerCountMetricsInner {
         self.num_dropped_on_capacity = Saturating(0);
         self.min_prioritization_fees = u64::MAX;
         self.max_prioritization_fees = 0;
+        self.num_saturation_entries = Saturating(0);
+        self.last_saturation_floor = 0;
     }
 
     pub fn update_priority_stats(&mut self, min_max_fees: Option<(u64, u64)>) {
@@ -307,6 +319,8 @@ pub struct SchedulerTimingMetricsInner {
     pub clean_time_us: Saturating<u64>,
     /// Time spent receiving completed transactions.
     pub receive_completed_time_us: Saturating<u64>,
+    /// Total wall-clock time spent in the scheduler-saturated state.
+    pub saturation_time_us: Saturating<u64>,
 }
 
 impl IntervalSchedulerTimingMetrics {
@@ -346,6 +360,7 @@ impl SchedulerTimingMetricsInner {
             clear_time_us: Saturating(clear_time_us),
             clean_time_us: Saturating(clean_time_us),
             receive_completed_time_us: Saturating(receive_completed_time_us),
+            saturation_time_us: Saturating(saturation_time_us),
         } = self;
         let mut datapoint = create_datapoint!(
             @point name,
@@ -360,7 +375,8 @@ impl SchedulerTimingMetricsInner {
                 "receive_completed_time_us",
                 receive_completed_time_us,
                 i64
-            )
+            ),
+            ("saturation_time_us", saturation_time_us, i64)
         );
         if let Some(slot) = slot {
             datapoint.add_field_i64("slot", slot as i64);
@@ -377,6 +393,7 @@ impl SchedulerTimingMetricsInner {
         self.clear_time_us = Saturating(0);
         self.clean_time_us = Saturating(0);
         self.receive_completed_time_us = Saturating(0);
+        self.saturation_time_us = Saturating(0);
     }
 }
 
