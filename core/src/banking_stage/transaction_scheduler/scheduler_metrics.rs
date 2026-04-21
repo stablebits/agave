@@ -94,6 +94,16 @@ pub struct SchedulerCountMetricsInner {
     /// Most recent priority floor published during the interval. 0 means no
     /// floor was published.
     pub last_saturation_floor: u64,
+    /// Sum of base (signature) fees collected across leader-produced slots
+    /// that ended during the interval, in lamports.
+    pub collected_transaction_fees: Saturating<u64>,
+    /// Sum of prioritization fees collected across leader-produced slots that
+    /// ended during the interval, in lamports.
+    pub collected_priority_fees: Saturating<u64>,
+    /// Sum of the deposit portion of fees (priority + non-burned base fee),
+    /// i.e. the lamports this validator actually earned from block production
+    /// during slots that ended in the interval.
+    pub collected_leader_rewards: Saturating<u64>,
 }
 
 impl IntervalSchedulerCountMetrics {
@@ -149,6 +159,9 @@ impl SchedulerCountMetricsInner {
             max_prioritization_fees: _max_prioritization_fees,
             num_saturation_entries: Saturating(num_saturation_entries),
             last_saturation_floor,
+            collected_transaction_fees: Saturating(collected_transaction_fees),
+            collected_priority_fees: Saturating(collected_priority_fees),
+            collected_leader_rewards: Saturating(collected_leader_rewards),
         } = self;
         let mut datapoint = create_datapoint!(
             @point name,
@@ -201,7 +214,10 @@ impl SchedulerCountMetricsInner {
             ("min_priority", self.get_min_priority(), i64),
             ("max_priority", self.get_max_priority(), i64),
             ("num_saturation_entries", num_saturation_entries, i64),
-            ("last_saturation_floor", last_saturation_floor, i64)
+            ("last_saturation_floor", last_saturation_floor, i64),
+            ("collected_transaction_fees", collected_transaction_fees, i64),
+            ("collected_priority_fees", collected_priority_fees, i64),
+            ("collected_leader_rewards", collected_leader_rewards, i64)
         );
         if let Some(slot) = slot {
             datapoint.add_field_i64("slot", slot as i64);
@@ -219,6 +235,8 @@ impl SchedulerCountMetricsInner {
             || self.num_finished != Saturating(0)
             || self.num_retryable != Saturating(0)
             || self.num_saturation_entries != Saturating(0)
+            || self.collected_transaction_fees != Saturating(0)
+            || self.collected_priority_fees != Saturating(0)
     }
 
     fn reset(&mut self) {
@@ -244,6 +262,9 @@ impl SchedulerCountMetricsInner {
         self.max_prioritization_fees = 0;
         self.num_saturation_entries = Saturating(0);
         self.last_saturation_floor = 0;
+        self.collected_transaction_fees = Saturating(0);
+        self.collected_priority_fees = Saturating(0);
+        self.collected_leader_rewards = Saturating(0);
     }
 
     pub fn update_priority_stats(&mut self, min_max_fees: Option<(u64, u64)>) {

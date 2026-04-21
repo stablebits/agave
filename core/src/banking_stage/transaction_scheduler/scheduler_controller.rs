@@ -170,6 +170,10 @@ where
 
     pub fn run(&mut self) -> Result<(), SchedulerError> {
         let mut most_recent_leader_slot = None;
+        // Tracks the leader bank we are currently producing into, so that when
+        // the leader slot transitions we can fold the bank's collected fees
+        // into slot/interval metrics before the slot datapoint is reported.
+        let mut current_leader_bank: Option<Arc<Bank>> = None;
         let mut cost_pacer = None;
 
         while !self.exit.load(Ordering::Relaxed) {
@@ -190,12 +194,36 @@ where
                 timing_metrics.decision_time_us += decision_time_us;
             });
             let new_leader_slot = decision.bank().map(|b| b.slot());
+
+            // If the leader slot is about to change, capture the finished
+            // bank's fee totals into the slot+interval count metrics before
+            // `maybe_report_and_reset_slot` emits the datapoint and resets.
+            let leader_slot_ending = current_leader_bank.as_ref().map(|b| b.slot())
+                != new_leader_slot;
+            if leader_slot_ending {
+                if let Some(finished_bank) = current_leader_bank.as_ref() {
+                    let fee_details = finished_bank.get_collector_fee_details();
+                    let total = fee_details.total_transaction_fee();
+                    let priority = fee_details.total_priority_fee();
+                    let base = total.saturating_sub(priority);
+                    let leader_deposit = finished_bank
+                        .calculate_reward_and_burn_fee_details(&fee_details)
+                        .get_deposit();
+                    self.count_metrics.update(|count_metrics| {
+                        count_metrics.collected_transaction_fees += Saturating(base);
+                        count_metrics.collected_priority_fees += Saturating(priority);
+                        count_metrics.collected_leader_rewards += Saturating(leader_deposit);
+                    });
+                }
+            }
+
             self.count_metrics
                 .maybe_report_and_reset_slot(new_leader_slot);
             self.timing_metrics
                 .maybe_report_and_reset_slot(new_leader_slot);
 
             if most_recent_leader_slot != new_leader_slot {
+                current_leader_bank = decision.bank().cloned();
                 self.container.flush_held_transactions();
                 most_recent_leader_slot = new_leader_slot;
                 cost_pacer = decision.bank().map(|b| {
