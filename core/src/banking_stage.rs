@@ -38,7 +38,7 @@ use {
         bank::Bank, bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache,
         vote_sender_types::ReplayVoteSender,
     },
-    solana_streamer::quic::SchedulerSaturationFeedback,
+    solana_streamer::quic::{SchedulerSaturationFeedback, SigverifyBankingChannelDepth},
     solana_time_utils::AtomicInterval,
     solana_unified_scheduler_logic::SchedulingMode,
     std::{
@@ -381,6 +381,7 @@ pub struct BankingStage {
     committer: Committer,
     log_messages_bytes_limit: Option<usize>,
     scheduler_saturation_feedback: Arc<SchedulerSaturationFeedback>,
+    sigverify_banking_channel_depth: Arc<SigverifyBankingChannelDepth>,
     threads: FuturesUnordered<NamedTask<std::thread::Result<()>>>,
 }
 
@@ -402,6 +403,7 @@ impl BankingStage {
         bank_forks: Arc<RwLock<BankForks>>,
         prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
         scheduler_saturation_feedback: Arc<SchedulerSaturationFeedback>,
+        sigverify_banking_channel_depth: Arc<SigverifyBankingChannelDepth>,
     ) -> BankingStageHandle {
         let committer = Committer::new(
             transaction_status_sender,
@@ -424,6 +426,7 @@ impl BankingStage {
             committer,
             log_messages_bytes_limit,
             scheduler_saturation_feedback,
+            sigverify_banking_channel_depth,
             threads: FuturesUnordered::default(),
         };
 
@@ -522,12 +525,14 @@ impl BankingStage {
                     num_workers,
                     config,
                     self.scheduler_saturation_feedback.clone(),
+                    self.sigverify_banking_channel_depth.clone(),
                 ),
                 BlockProductionMethod::CentralSchedulerGreedy => self.spawn_internal_central(
                     true,
                     num_workers,
                     config,
                     self.scheduler_saturation_feedback.clone(),
+                    self.sigverify_banking_channel_depth.clone(),
                 ),
             },
             #[cfg(unix)]
@@ -550,6 +555,7 @@ impl BankingStage {
         num_workers: NonZeroUsize,
         scheduler_config: SchedulerConfig,
         scheduler_saturation_feedback: Arc<SchedulerSaturationFeedback>,
+        sigverify_banking_channel_depth: Arc<SigverifyBankingChannelDepth>,
     ) -> Result<Vec<JoinHandle<()>>, ()> {
         info!("Spawning internal central scheduler");
         // Toggling unified scheduler into the disabled state should always be a safe and idempotent
@@ -566,6 +572,7 @@ impl BankingStage {
         let receive_and_buffer = TransactionViewReceiveAndBuffer {
             receiver: self.non_vote_receiver.clone(),
             sharable_banks: sharable_banks.clone(),
+            sigverify_banking_channel_depth: sigverify_banking_channel_depth.clone(),
         };
 
         // Spawn vote worker.
@@ -629,6 +636,7 @@ impl BankingStage {
                                 $scheduler,
                                 worker_metrics,
                                 scheduler_saturation_feedback,
+                                sigverify_banking_channel_depth,
                             );
 
                             match scheduler_controller.run() {
@@ -1006,6 +1014,7 @@ mod tests {
             bank_forks,
             None,
             Arc::new(SchedulerSaturationFeedback::default()),
+            Arc::new(SigverifyBankingChannelDepth::default()),
         );
         drop(non_vote_sender);
         drop(tpu_vote_sender);
@@ -1068,6 +1077,7 @@ mod tests {
             bank_forks, // keep a local-copy of bank-forks so worker threads do not lose weak access to bank-forks
             None,
             Arc::new(SchedulerSaturationFeedback::default()),
+            Arc::new(SigverifyBankingChannelDepth::default()),
         );
 
         // good tx, and no verify
@@ -1224,6 +1234,7 @@ mod tests {
                 bank_forks,
                 None,
                 Arc::new(SchedulerSaturationFeedback::default()),
+                Arc::new(SigverifyBankingChannelDepth::default()),
             );
 
             // wait for banking_stage to eat the packets
@@ -1379,6 +1390,7 @@ mod tests {
             bank_forks,
             None,
             Arc::new(SchedulerSaturationFeedback::default()),
+            Arc::new(SigverifyBankingChannelDepth::default()),
         );
 
         let keypairs = (0..100).map(|_| Keypair::new()).collect_vec();

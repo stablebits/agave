@@ -668,7 +668,7 @@ mod tests {
         let (packet_s, packet_r) = unbounded();
         let (verified_s, verified_r) = BankingTracer::channel_for_test();
         let threadpool = Arc::new(sigverify::threadpool_for_tests());
-        let verifier = TransactionSigVerifier::new(threadpool, verified_s, None);
+        let verifier = TransactionSigVerifier::new(threadpool, verified_s, None, None);
         let stage = SigVerifyStage::new(packet_r, verifier, "solSigVerTest", "test", None);
 
         let now = Instant::now();

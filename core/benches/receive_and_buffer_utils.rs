@@ -141,6 +141,9 @@ impl ReceiveAndBufferCreator for TransactionViewReceiveAndBuffer {
         TransactionViewReceiveAndBuffer {
             receiver,
             sharable_banks: bank_forks.read().unwrap().sharable_banks(),
+            sigverify_banking_channel_depth: Arc::new(
+                solana_streamer::quic::SigverifyBankingChannelDepth::default(),
+            ),
         }
     }
 }

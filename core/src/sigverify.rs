@@ -17,6 +17,7 @@ use {
         packet::PacketBatch,
         sigverify::{self},
     },
+    solana_streamer::quic::SigverifyBankingChannelDepth,
     std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -28,6 +29,10 @@ pub struct TransactionSigVerifier {
     banking_stage_sender: BankingPacketSender,
     forward_stage_sender: Option<Sender<(BankingPacketBatch, bool)>>,
     reject_non_vote: bool,
+    /// Optional counter of non-discarded packets in flight between this
+    /// sigverify stage and the banking-stage scheduler. `None` for the vote
+    /// path (which has its own channel).
+    channel_depth: Option<Arc<SigverifyBankingChannelDepth>>,
 }
 
 impl TransactionSigVerifier {
@@ -36,7 +41,7 @@ impl TransactionSigVerifier {
         packet_sender: BankingPacketSender,
         forward_stage_sender: Option<Sender<(BankingPacketBatch, bool)>>,
     ) -> Self {
-        let mut new_self = Self::new(thread_pool, packet_sender, forward_stage_sender);
+        let mut new_self = Self::new(thread_pool, packet_sender, forward_stage_sender, None);
         new_self.reject_non_vote = true;
         new_self
     }
@@ -45,12 +50,14 @@ impl TransactionSigVerifier {
         thread_pool: Arc<rayon::ThreadPool>,
         banking_stage_sender: BankingPacketSender,
         forward_stage_sender: Option<Sender<(BankingPacketBatch, bool)>>,
+        channel_depth: Option<Arc<SigverifyBankingChannelDepth>>,
     ) -> Self {
         Self {
             thread_pool,
             banking_stage_sender,
             forward_stage_sender,
             reject_non_vote: false,
+            channel_depth,
         }
     }
 }
@@ -68,6 +75,7 @@ impl SigVerifier for TransactionSigVerifier {
         let banking_stage_sender = self.banking_stage_sender.clone();
         let forward_stage_sender = self.forward_stage_sender.clone();
         let reject_non_vote = self.reject_non_vote;
+        let channel_depth = self.channel_depth.clone();
 
         in_flight_count.fetch_add(valid_packets, Ordering::Release);
 
@@ -94,6 +102,12 @@ impl SigVerifier for TransactionSigVerifier {
                 error!("sigverify send failed: {err:?}");
                 in_flight_count.fetch_sub(valid_packets, Ordering::Release);
                 return;
+            }
+            // Reaching this point means banking_stage_sender.send succeeded;
+            // account for packets entering the sigverify→banking channel.
+            // Matched by a sub() in receive_and_buffer on drain.
+            if let Some(depth) = channel_depth.as_ref() {
+                depth.add(num_valid_packets);
             }
 
             total_valid_packets.fetch_add(num_valid_packets, Ordering::Relaxed);

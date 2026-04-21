@@ -24,7 +24,7 @@ use {
     solana_cost_model::cost_tracker::SharedBlockCost,
     solana_measure::measure_us,
     solana_runtime::{bank::Bank, bank_forks::SharableBanks},
-    solana_streamer::quic::SchedulerSaturationFeedback,
+    solana_streamer::quic::{SchedulerSaturationFeedback, SigverifyBankingChannelDepth},
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
     std::{
         num::{NonZeroU64, Saturating},
@@ -45,6 +45,24 @@ pub const DEFAULT_PF_FLOOR_HIGH_WATERMARK_PERCENT: u8 = 80;
 /// the published floor (exits the "saturated" state). Must be strictly less
 /// than the high watermark — the gap provides hysteresis.
 pub const DEFAULT_PF_FLOOR_LOW_WATERMARK_PERCENT: u8 = 60;
+/// Default sigverify→banking channel depth (in packets) at which the scheduler
+/// enters the saturated state when `saturation_signal == ChannelDepth`.
+pub const DEFAULT_CHANNEL_DEPTH_HIGH_WATERMARK: usize = 50_000;
+/// Default sigverify→banking channel depth (in packets) at which the scheduler
+/// leaves the saturated state when `saturation_signal == ChannelDepth`.
+pub const DEFAULT_CHANNEL_DEPTH_LOW_WATERMARK: usize = 20_000;
+
+/// Signal used by the scheduler to decide when the pipeline is saturated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaturationSignal {
+    /// Use the size of the scheduler's own transaction priority queue (current
+    /// default, percent of `TOTAL_BUFFERED_PACKETS`).
+    QueueSize,
+    /// Use the depth of the sigverify→banking channel in packets. Intended to
+    /// better reflect the rate at which small transactions arrive faster than
+    /// the scheduler can drain them.
+    ChannelDepth,
+}
 
 #[derive(Clone)]
 pub struct SchedulerConfig {
@@ -54,13 +72,20 @@ pub struct SchedulerConfig {
     /// the floor (for other consumers like SWQoS MAX_STREAMS), but the
     /// sigverify-side drop is disabled.
     pub pf_floor_enabled: bool,
+    /// Which signal drives saturation state transitions.
+    pub saturation_signal: SaturationSignal,
     /// Queue-size percentage at which the scheduler enters the saturated state
-    /// and publishes a priority floor. In `(low, 100]`.
+    /// (only used when `saturation_signal == QueueSize`). In `(low, 100]`.
     pub pf_floor_high_watermark_percent: u8,
     /// Queue-size percentage at which the scheduler leaves the saturated state
-    /// and clears the published floor. In `[0, high)`. Must be strictly less
-    /// than `pf_floor_high_watermark_percent` to provide hysteresis.
+    /// (only used when `saturation_signal == QueueSize`). In `[0, high)`.
     pub pf_floor_low_watermark_percent: u8,
+    /// Packet count at which the scheduler enters the saturated state
+    /// (only used when `saturation_signal == ChannelDepth`).
+    pub channel_depth_high_watermark: usize,
+    /// Packet count at which the scheduler leaves the saturated state
+    /// (only used when `saturation_signal == ChannelDepth`).
+    pub channel_depth_low_watermark: usize,
 }
 
 impl SchedulerConfig {
@@ -84,8 +109,11 @@ impl Default for SchedulerConfig {
                 DEFAULT_SCHEDULER_PACING_FILL_TIME_MILLIS,
             ),
             pf_floor_enabled: true,
+            saturation_signal: SaturationSignal::QueueSize,
             pf_floor_high_watermark_percent: DEFAULT_PF_FLOOR_HIGH_WATERMARK_PERCENT,
             pf_floor_low_watermark_percent: DEFAULT_PF_FLOOR_LOW_WATERMARK_PERCENT,
+            channel_depth_high_watermark: DEFAULT_CHANNEL_DEPTH_HIGH_WATERMARK,
+            channel_depth_low_watermark: DEFAULT_CHANNEL_DEPTH_LOW_WATERMARK,
         }
     }
 }
@@ -131,6 +159,9 @@ where
     /// `None` when the scheduler is not currently saturated.
     saturation_last_tick: Option<Instant>,
     saturation_feedback: Arc<SchedulerSaturationFeedback>,
+    /// Counter of packets in the sigverify → banking-stage channel. Used as an
+    /// alternative saturation signal to the scheduler queue size.
+    sigverify_banking_channel_depth: Arc<SigverifyBankingChannelDepth>,
 }
 
 impl<R, S> SchedulerController<R, S>
@@ -147,6 +178,7 @@ where
         scheduler: S,
         worker_metrics: Vec<Arc<ConsumeWorkerMetrics>>,
         scheduler_saturation_feedback: Arc<SchedulerSaturationFeedback>,
+        sigverify_banking_channel_depth: Arc<SigverifyBankingChannelDepth>,
     ) -> Self {
         Self {
             exit,
@@ -165,6 +197,7 @@ where
             saturated: false,
             saturation_last_tick: None,
             saturation_feedback: scheduler_saturation_feedback,
+            sigverify_banking_channel_depth,
         }
     }
 
@@ -345,7 +378,25 @@ where
     }
 
     fn update_scheduler_saturation_feedback(&mut self, priority_min_max: Option<(u64, u64)>) {
-        let queue_size = self.container.queue_size();
+        let channel_depth = self.sigverify_banking_channel_depth.load();
+        // Track channel depth as a gauge regardless of which signal drives
+        // saturation — useful for observability and tuning.
+        self.count_metrics.update(|count_metrics| {
+            count_metrics.last_channel_depth = channel_depth;
+        });
+
+        let (high_watermark, low_watermark, signal_value) = match self.config.saturation_signal {
+            SaturationSignal::QueueSize => (
+                self.config.queue_high_watermark(),
+                self.config.queue_low_watermark(),
+                self.container.queue_size(),
+            ),
+            SaturationSignal::ChannelDepth => (
+                self.config.channel_depth_high_watermark,
+                self.config.channel_depth_low_watermark,
+                channel_depth,
+            ),
+        };
         let now = Instant::now();
 
         // If we were already saturated on the previous iteration, attribute the
@@ -362,7 +413,7 @@ where
             self.saturation_last_tick = Some(now);
         }
 
-        if queue_size >= self.config.queue_high_watermark() {
+        if signal_value >= high_watermark {
             if !self.saturated {
                 // Transition 0 → 1
                 self.saturated = true;
@@ -371,8 +422,8 @@ where
                     count_metrics.num_saturation_entries += Saturating(1);
                 });
             }
-            // Once the queue is saturated, publish the weakest priority currently
-            // still admitted to the scheduler's queue as the current floor.
+            // Once saturated, publish the weakest priority currently still
+            // admitted to the scheduler's queue as the current floor.
             let floor = priority_min_max.map(|(min, _)| min);
             if let Some(floor) = floor {
                 self.saturation_feedback.set_priority_floor(floor);
@@ -382,7 +433,7 @@ where
             } else {
                 self.saturation_feedback.clear();
             }
-        } else if queue_size <= self.config.queue_low_watermark() && self.saturated {
+        } else if signal_value <= low_watermark && self.saturated {
             // Transition 1 → 0
             self.saturated = false;
             self.saturation_last_tick = None;
@@ -643,6 +694,7 @@ mod tests {
         TransactionViewReceiveAndBuffer {
             receiver,
             sharable_banks: bank_forks.read().unwrap().sharable_banks(),
+            sigverify_banking_channel_depth: Arc::new(SigverifyBankingChannelDepth::default()),
         }
     }
 
@@ -698,6 +750,7 @@ mod tests {
             scheduler,
             vec![], // no actual workers with metrics to report, this can be empty
             Arc::new(SchedulerSaturationFeedback::default()),
+            Arc::new(SigverifyBankingChannelDepth::default()),
         );
 
         (test_frame, scheduler_controller)

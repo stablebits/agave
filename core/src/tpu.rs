@@ -49,8 +49,9 @@ use {
     },
     solana_streamer::{
         quic::{
-            SchedulerSaturationFeedback, SimpleQosQuicStreamerConfig, SpawnServerResult,
-            SwQosQuicStreamerConfig, spawn_simple_qos_server, spawn_stake_weighted_qos_server,
+            SchedulerSaturationFeedback, SigverifyBankingChannelDepth, SimpleQosQuicStreamerConfig,
+            SpawnServerResult, SwQosQuicStreamerConfig, spawn_simple_qos_server,
+            spawn_stake_weighted_qos_server,
         },
         quic_socket::QuicSocket,
         streamer::StakedNodes,
@@ -165,6 +166,7 @@ impl Tpu {
         let (vote_packet_sender, vote_packet_receiver) = unbounded();
         let (forwarded_packet_sender, forwarded_packet_receiver) = unbounded();
         let scheduler_saturation_feedback = Arc::new(SchedulerSaturationFeedback::default());
+        let sigverify_banking_channel_depth = Arc::new(SigverifyBankingChannelDepth::default());
         let fetch_stage = FetchStage::new_with_sender(
             tpu_vote_sockets,
             exit.clone(),
@@ -276,6 +278,7 @@ impl Tpu {
                 sigverify_threadpool.clone(),
                 non_vote_sender,
                 enable_block_production_forwarding.then(|| forward_stage_sender.clone()),
+                Some(sigverify_banking_channel_depth.clone()),
             );
             let feedback_for_sigverify = block_production_scheduler_config
                 .pf_floor_enabled
@@ -336,6 +339,7 @@ impl Tpu {
             bank_forks.clone(),
             prioritization_fee_cache,
             scheduler_saturation_feedback,
+            sigverify_banking_channel_depth,
         );
 
         #[cfg(unix)]

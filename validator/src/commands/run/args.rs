@@ -827,6 +827,44 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("scheduler_saturation_signal")
+            .long("scheduler-saturation-signal")
+            .takes_value(true)
+            .possible_values(&["queue", "channel"])
+            .default_value("queue")
+            .hidden(hidden_unless_forced())
+            .help(
+                "Which signal drives scheduler saturation transitions. 'queue' uses the \
+                 scheduler's priority-queue occupancy (default); 'channel' uses the depth of \
+                 the sigverify→banking channel in packets.",
+            ),
+    )
+    .arg(
+        Arg::with_name("scheduler_channel_depth_high_watermark")
+            .long("scheduler-channel-depth-high-watermark")
+            .takes_value(true)
+            .default_value(&default_args.scheduler_channel_depth_high_watermark)
+            .validator(is_parsable::<usize>)
+            .hidden(hidden_unless_forced())
+            .help(
+                "When --scheduler-saturation-signal=channel, sigverify→banking channel depth \
+                 (in packets) at which the scheduler enters the saturated state.",
+            ),
+    )
+    .arg(
+        Arg::with_name("scheduler_channel_depth_low_watermark")
+            .long("scheduler-channel-depth-low-watermark")
+            .takes_value(true)
+            .default_value(&default_args.scheduler_channel_depth_low_watermark)
+            .validator(is_parsable::<usize>)
+            .hidden(hidden_unless_forced())
+            .help(
+                "When --scheduler-saturation-signal=channel, sigverify→banking channel depth \
+                 (in packets) at which the scheduler leaves the saturated state. Must be \
+                 strictly less than --scheduler-channel-depth-high-watermark.",
+            ),
+    )
+    .arg(
         Arg::with_name("num_quic_endpoints")
             .long("num-quic-endpoints")
             .takes_value(true)

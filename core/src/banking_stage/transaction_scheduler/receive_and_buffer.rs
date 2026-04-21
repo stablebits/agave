@@ -34,11 +34,12 @@ use {
         transaction_meta::{TransactionConfiguration, TransactionMeta},
         transaction_with_meta::TransactionWithMeta,
     },
+    solana_streamer::quic::SigverifyBankingChannelDepth,
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
     solana_svm_transaction::svm_message::SVMMessage,
     solana_transaction::sanitized::MessageHash,
     solana_transaction_error::TransactionError,
-    std::time::Instant,
+    std::{sync::Arc, time::Instant},
 };
 
 #[derive(Debug)]
@@ -105,6 +106,7 @@ pub(crate) trait ReceiveAndBuffer {
 pub(crate) struct TransactionViewReceiveAndBuffer {
     pub receiver: BankingPacketReceiver,
     pub sharable_banks: SharableBanks,
+    pub sigverify_banking_channel_depth: Arc<SigverifyBankingChannelDepth>,
 }
 
 impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
@@ -159,6 +161,13 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
             match self.receiver.recv_timeout(TIMEOUT) {
                 Ok(packet_batch_message) => {
                     received_message = true;
+                    // Match the fetch_add in TransactionSigVerifier: the
+                    // sender added `count_valid_packets` when the batch entered
+                    // the channel; subtract the same count as we drain it.
+                    let drained = solana_perf::sigverify::count_valid_packets(
+                        packet_batch_message.iter(),
+                    );
+                    self.sigverify_banking_channel_depth.sub(drained);
                     stats.accumulate(self.handle_packet_batch_message(
                         container,
                         decision,
@@ -183,6 +192,10 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
                     Ok(packet_batch_message) => {
                         stats.receive_time_us += receive_start.elapsed().as_micros() as u64;
                         received_message = true;
+                        let drained = solana_perf::sigverify::count_valid_packets(
+                            packet_batch_message.iter(),
+                        );
+                        self.sigverify_banking_channel_depth.sub(drained);
                         let batch_stats = self.handle_packet_batch_message(
                             container,
                             decision,
@@ -610,6 +623,7 @@ mod tests {
         let receive_and_buffer = TransactionViewReceiveAndBuffer {
             receiver,
             sharable_banks: bank_forks.read().unwrap().sharable_banks(),
+            sigverify_banking_channel_depth: Arc::new(SigverifyBankingChannelDepth::default()),
         };
         let container = TransactionViewStateContainer::with_capacity(TEST_CONTAINER_CAPACITY);
         (receive_and_buffer, container)

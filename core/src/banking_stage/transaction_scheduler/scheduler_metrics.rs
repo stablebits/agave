@@ -104,6 +104,10 @@ pub struct SchedulerCountMetricsInner {
     /// i.e. the lamports this validator actually earned from block production
     /// during slots that ended in the interval.
     pub collected_leader_rewards: Saturating<u64>,
+    /// Latest reading of the sigverify→banking-stage channel depth (packets).
+    /// Emitted as a gauge for observability/tuning of the channel-depth
+    /// saturation signal.
+    pub last_channel_depth: usize,
 }
 
 impl IntervalSchedulerCountMetrics {
@@ -162,6 +166,7 @@ impl SchedulerCountMetricsInner {
             collected_transaction_fees: Saturating(collected_transaction_fees),
             collected_priority_fees: Saturating(collected_priority_fees),
             collected_leader_rewards: Saturating(collected_leader_rewards),
+            last_channel_depth,
         } = self;
         let mut datapoint = create_datapoint!(
             @point name,
@@ -217,7 +222,8 @@ impl SchedulerCountMetricsInner {
             ("last_saturation_floor", last_saturation_floor, i64),
             ("collected_transaction_fees", collected_transaction_fees, i64),
             ("collected_priority_fees", collected_priority_fees, i64),
-            ("collected_leader_rewards", collected_leader_rewards, i64)
+            ("collected_leader_rewards", collected_leader_rewards, i64),
+            ("last_channel_depth", last_channel_depth, i64)
         );
         if let Some(slot) = slot {
             datapoint.add_field_i64("slot", slot as i64);
@@ -265,6 +271,7 @@ impl SchedulerCountMetricsInner {
         self.collected_transaction_fees = Saturating(0);
         self.collected_priority_fees = Saturating(0);
         self.collected_leader_rewards = Saturating(0);
+        self.last_channel_depth = 0;
     }
 
     pub fn update_priority_stats(&mut self, min_max_fees: Option<(u64, u64)>) {

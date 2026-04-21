@@ -35,7 +35,9 @@ use {
     },
     solana_clock::{DEFAULT_SLOTS_PER_EPOCH, Slot},
     solana_core::{
-        banking_stage::transaction_scheduler::scheduler_controller::SchedulerConfig,
+        banking_stage::transaction_scheduler::scheduler_controller::{
+            SaturationSignal, SchedulerConfig,
+        },
         banking_trace::DISABLED_BAKING_TRACE_DIR,
         consensus::tower_storage,
         repair::repair_handler::RepairHandlerType,
@@ -899,6 +901,33 @@ pub fn execute(
                      --scheduler-pf-floor-high-watermark-pct ({high})"
                 ))?;
             }
+
+            let channel_depth_high =
+                value_t_or_exit!(matches, "scheduler_channel_depth_high_watermark", usize);
+            let channel_depth_low =
+                value_t_or_exit!(matches, "scheduler_channel_depth_low_watermark", usize);
+            if channel_depth_high == 0 {
+                Err("--scheduler-channel-depth-high-watermark must be > 0".to_string())?;
+            }
+            if channel_depth_low >= channel_depth_high {
+                Err(format!(
+                    "--scheduler-channel-depth-low-watermark ({channel_depth_low}) must be \
+                     strictly less than --scheduler-channel-depth-high-watermark \
+                     ({channel_depth_high})"
+                ))?;
+            }
+
+            let saturation_signal = match matches
+                .value_of("scheduler_saturation_signal")
+                .unwrap_or("queue")
+            {
+                "queue" => SaturationSignal::QueueSize,
+                "channel" => SaturationSignal::ChannelDepth,
+                other => Err(format!(
+                    "--scheduler-saturation-signal must be 'queue' or 'channel', got {other:?}"
+                ))?,
+            };
+
             SchedulerConfig {
                 scheduler_pacing: value_t_or_exit!(
                     matches,
@@ -906,8 +935,11 @@ pub fn execute(
                     SchedulerPacing
                 ),
                 pf_floor_enabled: !matches.is_present("scheduler_pf_floor_disable"),
+                saturation_signal,
                 pf_floor_high_watermark_percent: high,
                 pf_floor_low_watermark_percent: low,
+                channel_depth_high_watermark: channel_depth_high,
+                channel_depth_low_watermark: channel_depth_low,
             }
         },
         enable_block_production_forwarding: staked_nodes_overrides_path.is_some(),

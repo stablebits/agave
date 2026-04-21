@@ -41,6 +41,33 @@ pub struct SchedulerSaturationFeedback {
     priority_floor: AtomicU64,
 }
 
+/// Shared counter of packets in flight between the sigverify stage and the
+/// banking-stage scheduler. Sigverify increments when sending a batch into the
+/// (unbounded) banking channel; the scheduler's receive-and-buffer decrements
+/// when draining a batch. Exposed as an alternative saturation signal to the
+/// scheduler queue size — under very small transactions (few accounts/sigs)
+/// sigverify TPS can outpace the scheduler even when the queue itself is fine.
+#[derive(Debug, Default)]
+pub struct SigverifyBankingChannelDepth {
+    packets: std::sync::atomic::AtomicUsize,
+}
+
+impl SigverifyBankingChannelDepth {
+    pub fn add(&self, n: usize) {
+        self.packets
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn sub(&self, n: usize) {
+        self.packets
+            .fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn load(&self) -> usize {
+        self.packets.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 impl SchedulerSaturationFeedback {
     pub fn set_priority_floor(&self, floor: u64) {
         debug_assert!(floor > 0, "scheduler priority floor must be positive");

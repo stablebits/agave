@@ -251,6 +251,7 @@ fn bench_banking(
         bank_forks,
         None,
         Arc::new(solana_streamer::quic::SchedulerSaturationFeedback::default()),
+        Arc::new(solana_streamer::quic::SigverifyBankingChannelDepth::default()),
     );
 
     let chunk_len = verified.len() / CHUNKS;
