@@ -234,7 +234,9 @@ impl Tpu {
             staked_nodes.clone(),
             tpu_quic_server_config.quic_streamer_config,
             tpu_quic_server_config.qos_config,
-            Some(scheduler_saturation_feedback.clone()),
+            block_production_scheduler_config
+                .streamer_feedback_enabled
+                .then(|| scheduler_saturation_feedback.clone()),
             cancel.clone(),
         )
         .unwrap();
@@ -258,7 +260,9 @@ impl Tpu {
             staked_nodes.clone(),
             tpu_fwd_quic_server_config.quic_streamer_config,
             tpu_fwd_quic_server_config.qos_config,
-            Some(scheduler_saturation_feedback.clone()),
+            block_production_scheduler_config
+                .streamer_feedback_enabled
+                .then(|| scheduler_saturation_feedback.clone()),
             cancel,
         )
         .unwrap();

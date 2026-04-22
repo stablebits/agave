@@ -935,6 +935,8 @@ pub fn execute(
                     SchedulerPacing
                 ),
                 pf_floor_enabled: !matches.is_present("scheduler_pf_floor_disable"),
+                streamer_feedback_enabled: !matches
+                    .is_present("scheduler_streamer_feedback_disable"),
                 saturation_signal,
                 pf_floor_high_watermark_percent: high,
                 pf_floor_low_watermark_percent: low,

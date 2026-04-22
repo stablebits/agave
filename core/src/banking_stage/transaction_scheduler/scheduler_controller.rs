@@ -72,6 +72,11 @@ pub struct SchedulerConfig {
     /// the floor (for other consumers like SWQoS MAX_STREAMS), but the
     /// sigverify-side drop is disabled.
     pub pf_floor_enabled: bool,
+    /// When true, the TPU and TPU-forwards QUIC streamer servers receive the
+    /// scheduler saturation feedback Arc and use it to throttle MAX_STREAMS.
+    /// When false, `None` is passed to the streamer, which behaves as if the
+    /// scheduler were never saturated.
+    pub streamer_feedback_enabled: bool,
     /// Which signal drives saturation state transitions.
     pub saturation_signal: SaturationSignal,
     /// Queue-size percentage at which the scheduler enters the saturated state
@@ -109,6 +114,7 @@ impl Default for SchedulerConfig {
                 DEFAULT_SCHEDULER_PACING_FILL_TIME_MILLIS,
             ),
             pf_floor_enabled: true,
+            streamer_feedback_enabled: true,
             saturation_signal: SaturationSignal::QueueSize,
             pf_floor_high_watermark_percent: DEFAULT_PF_FLOOR_HIGH_WATERMARK_PERCENT,
             pf_floor_low_watermark_percent: DEFAULT_PF_FLOOR_LOW_WATERMARK_PERCENT,

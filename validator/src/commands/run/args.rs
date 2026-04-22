@@ -801,6 +801,17 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("scheduler_streamer_feedback_disable")
+            .long("scheduler-streamer-feedback-disable")
+            .takes_value(false)
+            .hidden(hidden_unless_forced())
+            .help(
+                "Disable propagation of the scheduler saturation feedback to the TPU and \
+                 TPU-forwards QUIC streamer servers. When set, SWQoS MAX_STREAMS throttling \
+                 behaves as if the scheduler were never saturated.",
+            ),
+    )
+    .arg(
         Arg::with_name("scheduler_pf_floor_high_watermark_pct")
             .long("scheduler-pf-floor-high-watermark-pct")
             .takes_value(true)
