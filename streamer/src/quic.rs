@@ -49,13 +49,20 @@ pub struct SchedulerSaturationFeedback {
 /// sigverify TPS can outpace the scheduler even when the queue itself is fine.
 #[derive(Debug, Default)]
 pub struct SigverifyBankingChannelDepth {
+    /// Current in-flight depth (incremented on send, decremented on drain).
     packets: std::sync::atomic::AtomicUsize,
+    /// Monotonic total of packets ever sent into the channel. Used by the
+    /// token-bucket saturation signal to measure incoming-packet rate without
+    /// tracking its own sampling state on the push side.
+    total_received: std::sync::atomic::AtomicU64,
 }
 
 impl SigverifyBankingChannelDepth {
     pub fn add(&self, n: usize) {
         self.packets
             .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        self.total_received
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn sub(&self, n: usize) {
@@ -65,6 +72,11 @@ impl SigverifyBankingChannelDepth {
 
     pub fn load(&self) -> usize {
         self.packets.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn total_received(&self) -> u64 {
+        self.total_received
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

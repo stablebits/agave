@@ -841,13 +841,14 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
         Arg::with_name("scheduler_saturation_signal")
             .long("scheduler-saturation-signal")
             .takes_value(true)
-            .possible_values(&["queue", "channel"])
+            .possible_values(&["queue", "channel", "token_bucket"])
             .default_value("queue")
             .hidden(hidden_unless_forced())
             .help(
                 "Which signal drives scheduler saturation transitions. 'queue' uses the \
                  scheduler's priority-queue occupancy (default); 'channel' uses the depth of \
-                 the sigverify→banking channel in packets.",
+                 the sigverify→banking channel in packets; 'token_bucket' uses a token bucket \
+                 driven by incoming packet arrivals vs the configured refill rate.",
             ),
     )
     .arg(
@@ -873,6 +874,32 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                 "When --scheduler-saturation-signal=channel, sigverify→banking channel depth \
                  (in packets) at which the scheduler leaves the saturated state. Must be \
                  strictly less than --scheduler-channel-depth-high-watermark.",
+            ),
+    )
+    .arg(
+        Arg::with_name("scheduler_token_bucket_refill_tps")
+            .long("scheduler-token-bucket-refill-tps")
+            .takes_value(true)
+            .default_value(&default_args.scheduler_token_bucket_refill_tps)
+            .validator(is_parsable::<u64>)
+            .hidden(hidden_unless_forced())
+            .help(
+                "When --scheduler-saturation-signal=token_bucket, the target incoming-packet \
+                 rate (packets per second) the scheduler can sustain. Arrivals above this \
+                 rate deplete the bucket and trigger saturation.",
+            ),
+    )
+    .arg(
+        Arg::with_name("scheduler_token_bucket_burst")
+            .long("scheduler-token-bucket-burst")
+            .takes_value(true)
+            .default_value(&default_args.scheduler_token_bucket_burst)
+            .validator(is_parsable::<u64>)
+            .hidden(hidden_unless_forced())
+            .help(
+                "When --scheduler-saturation-signal=token_bucket, the burst tolerance in \
+                 packets. Short-term arrival spikes up to this many packets are absorbed \
+                 before saturation triggers.",
             ),
     )
     .arg(

@@ -923,10 +923,23 @@ pub fn execute(
             {
                 "queue" => SaturationSignal::QueueSize,
                 "channel" => SaturationSignal::ChannelDepth,
+                "token_bucket" => SaturationSignal::TokenBucket,
                 other => Err(format!(
-                    "--scheduler-saturation-signal must be 'queue' or 'channel', got {other:?}"
+                    "--scheduler-saturation-signal must be one of 'queue', 'channel', \
+                     'token_bucket'; got {other:?}"
                 ))?,
             };
+
+            let token_bucket_refill_tps =
+                value_t_or_exit!(matches, "scheduler_token_bucket_refill_tps", u64);
+            let token_bucket_burst =
+                value_t_or_exit!(matches, "scheduler_token_bucket_burst", u64);
+            if token_bucket_refill_tps == 0 {
+                Err("--scheduler-token-bucket-refill-tps must be > 0".to_string())?;
+            }
+            if token_bucket_burst == 0 {
+                Err("--scheduler-token-bucket-burst must be > 0".to_string())?;
+            }
 
             SchedulerConfig {
                 scheduler_pacing: value_t_or_exit!(
@@ -942,6 +955,8 @@ pub fn execute(
                 pf_floor_low_watermark_percent: low,
                 channel_depth_high_watermark: channel_depth_high,
                 channel_depth_low_watermark: channel_depth_low,
+                token_bucket_refill_tps,
+                token_bucket_burst,
             }
         },
         enable_block_production_forwarding: staked_nodes_overrides_path.is_some(),

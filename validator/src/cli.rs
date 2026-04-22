@@ -25,6 +25,7 @@ use {
         banking_stage::transaction_scheduler::scheduler_controller::{
             DEFAULT_CHANNEL_DEPTH_HIGH_WATERMARK, DEFAULT_CHANNEL_DEPTH_LOW_WATERMARK,
             DEFAULT_PF_FLOOR_HIGH_WATERMARK_PERCENT, DEFAULT_PF_FLOOR_LOW_WATERMARK_PERCENT,
+            DEFAULT_TOKEN_BUCKET_BURST, DEFAULT_TOKEN_BUCKET_REFILL_TPS,
         },
         banking_trace::BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT,
     },
@@ -243,6 +244,8 @@ pub struct DefaultArgs {
     pub scheduler_pf_floor_low_watermark_pct: String,
     pub scheduler_channel_depth_high_watermark: String,
     pub scheduler_channel_depth_low_watermark: String,
+    pub scheduler_token_bucket_refill_tps: String,
+    pub scheduler_token_bucket_burst: String,
 
     pub num_quic_endpoints: String,
     pub vote_use_quic: String,
@@ -307,6 +310,8 @@ impl DefaultArgs {
                 .to_string(),
             scheduler_channel_depth_low_watermark: DEFAULT_CHANNEL_DEPTH_LOW_WATERMARK
                 .to_string(),
+            scheduler_token_bucket_refill_tps: DEFAULT_TOKEN_BUCKET_REFILL_TPS.to_string(),
+            scheduler_token_bucket_burst: DEFAULT_TOKEN_BUCKET_BURST.to_string(),
             num_quic_endpoints: DEFAULT_QUIC_ENDPOINTS.to_string(),
             banking_trace_dir_byte_limit: BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT.to_string(),
             block_production_pacing_fill_time_millis: BankingStage::default_fill_time_millis()

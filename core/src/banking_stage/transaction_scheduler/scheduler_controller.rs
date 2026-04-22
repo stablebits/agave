@@ -23,6 +23,7 @@ use {
     },
     solana_cost_model::cost_tracker::SharedBlockCost,
     solana_measure::measure_us,
+    solana_net_utils::token_bucket::TokenBucket,
     solana_runtime::{bank::Bank, bank_forks::SharableBanks},
     solana_streamer::quic::{SchedulerSaturationFeedback, SigverifyBankingChannelDepth},
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
@@ -51,6 +52,14 @@ pub const DEFAULT_CHANNEL_DEPTH_HIGH_WATERMARK: usize = 50_000;
 /// Default sigverify→banking channel depth (in packets) at which the scheduler
 /// leaves the saturated state when `saturation_signal == ChannelDepth`.
 pub const DEFAULT_CHANNEL_DEPTH_LOW_WATERMARK: usize = 20_000;
+/// Default token-bucket refill rate (packets per second) when
+/// `saturation_signal == TokenBucket`. Approximates the rate at which the
+/// scheduler can drain its receive+parse+schedule loop.
+pub const DEFAULT_TOKEN_BUCKET_REFILL_TPS: u64 = 100_000;
+/// Default token-bucket burst capacity (packets) when
+/// `saturation_signal == TokenBucket`. Controls how much of a short-term spike
+/// is absorbed before we declare saturation.
+pub const DEFAULT_TOKEN_BUCKET_BURST: u64 = 25_000;
 
 /// Signal used by the scheduler to decide when the pipeline is saturated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +71,11 @@ pub enum SaturationSignal {
     /// better reflect the rate at which small transactions arrive faster than
     /// the scheduler can drain them.
     ChannelDepth,
+    /// Use a token bucket fed at `token_bucket_refill_tps` and consumed by
+    /// packet arrivals. Saturate when the bucket cannot cover the arrivals of
+    /// the current tick (i.e. incoming rate exceeded the refill rate past the
+    /// configured burst tolerance).
+    TokenBucket,
 }
 
 #[derive(Clone)]
@@ -91,6 +105,12 @@ pub struct SchedulerConfig {
     /// Packet count at which the scheduler leaves the saturated state
     /// (only used when `saturation_signal == ChannelDepth`).
     pub channel_depth_low_watermark: usize,
+    /// Token-bucket refill rate (packets per second)
+    /// (only used when `saturation_signal == TokenBucket`).
+    pub token_bucket_refill_tps: u64,
+    /// Token-bucket burst capacity (packets)
+    /// (only used when `saturation_signal == TokenBucket`).
+    pub token_bucket_burst: u64,
 }
 
 impl SchedulerConfig {
@@ -120,6 +140,8 @@ impl Default for SchedulerConfig {
             pf_floor_low_watermark_percent: DEFAULT_PF_FLOOR_LOW_WATERMARK_PERCENT,
             channel_depth_high_watermark: DEFAULT_CHANNEL_DEPTH_HIGH_WATERMARK,
             channel_depth_low_watermark: DEFAULT_CHANNEL_DEPTH_LOW_WATERMARK,
+            token_bucket_refill_tps: DEFAULT_TOKEN_BUCKET_REFILL_TPS,
+            token_bucket_burst: DEFAULT_TOKEN_BUCKET_BURST,
         }
     }
 }
@@ -168,6 +190,12 @@ where
     /// Counter of packets in the sigverify → banking-stage channel. Used as an
     /// alternative saturation signal to the scheduler queue size.
     sigverify_banking_channel_depth: Arc<SigverifyBankingChannelDepth>,
+    /// Token bucket driving the `TokenBucket` saturation signal. `None` for
+    /// other signals to avoid paying for unused state.
+    saturation_token_bucket: Option<TokenBucket>,
+    /// Last observed value of `SigverifyBankingChannelDepth::total_received`,
+    /// used to compute per-tick arrivals for the token bucket.
+    prev_total_received: u64,
 }
 
 impl<R, S> SchedulerController<R, S>
@@ -186,6 +214,20 @@ where
         scheduler_saturation_feedback: Arc<SchedulerSaturationFeedback>,
         sigverify_banking_channel_depth: Arc<SigverifyBankingChannelDepth>,
     ) -> Self {
+        let saturation_token_bucket = matches!(
+            config.saturation_signal,
+            SaturationSignal::TokenBucket
+        )
+        .then(|| {
+            // Start with a full bucket so we don't spuriously saturate on the
+            // first tick before the refill path has accumulated any credit.
+            TokenBucket::new(
+                config.token_bucket_burst,
+                config.token_bucket_burst,
+                config.token_bucket_refill_tps as f64,
+            )
+        });
+        let prev_total_received = sigverify_banking_channel_depth.total_received();
         Self {
             exit,
             config,
@@ -204,6 +246,8 @@ where
             saturation_last_tick: None,
             saturation_feedback: scheduler_saturation_feedback,
             sigverify_banking_channel_depth,
+            saturation_token_bucket,
+            prev_total_received,
         }
     }
 
@@ -391,6 +435,10 @@ where
             count_metrics.last_channel_depth = channel_depth;
         });
 
+        // Three-way dispatch: each signal computes its own `signal_high /
+        // signal_low` and `signal_value` so the downstream hysteresis logic is
+        // shared. For `TokenBucket` we bolt in the bucket state and translate
+        // "over-budget this tick" into the signal_value ≥ high threshold.
         let (high_watermark, low_watermark, signal_value) = match self.config.saturation_signal {
             SaturationSignal::QueueSize => (
                 self.config.queue_high_watermark(),
@@ -402,6 +450,51 @@ where
                 self.config.channel_depth_low_watermark,
                 channel_depth,
             ),
+            SaturationSignal::TokenBucket => {
+                let total_received = self
+                    .sigverify_banking_channel_depth
+                    .total_received();
+                let arrivals = total_received.saturating_sub(self.prev_total_received);
+                self.prev_total_received = total_received;
+                let bucket = self
+                    .saturation_token_bucket
+                    .as_mut()
+                    .expect("token bucket must be Some when signal == TokenBucket");
+                let over_budget = match bucket.consume_tokens(arrivals) {
+                    Ok(_remaining) => 0u64,
+                    Err(missing) => {
+                        // Partial-consume: take what's available so the bucket
+                        // accurately reflects backlog. `current_tokens` re-reads
+                        // state, so this is safe for our single-consumer (the
+                        // scheduler thread) even though the library is
+                        // concurrency-safe.
+                        let available = arrivals.saturating_sub(missing);
+                        let _ = bucket.consume_tokens(available);
+                        missing
+                    }
+                };
+                let current_tokens = bucket.current_tokens();
+                self.count_metrics.update(|count_metrics| {
+                    count_metrics.current_tokens = current_tokens;
+                });
+                // Map to the shared hysteresis machinery: signal_value = 1 when
+                // over budget (high_watermark=1 triggers saturation); when
+                // tokens refill past burst/2 signal_value falls below
+                // low_watermark (=0) and we de-saturate.
+                let refilled_to_hysteresis = current_tokens
+                    >= self.config.token_bucket_burst.saturating_div(2);
+                let signal_value: usize = if over_budget > 0 {
+                    1
+                } else if refilled_to_hysteresis {
+                    0
+                } else {
+                    // In the mid-range between "over budget" and "refilled to
+                    // hysteresis" — preserve current saturation state via the
+                    // same value the caller would see in that mid-range.
+                    if self.saturated { 1 } else { 0 }
+                };
+                (1usize, 0usize, signal_value)
+            }
         };
         let now = Instant::now();
 
