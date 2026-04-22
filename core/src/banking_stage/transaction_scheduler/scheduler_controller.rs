@@ -60,6 +60,10 @@ pub const DEFAULT_TOKEN_BUCKET_REFILL_TPS: u64 = 100_000;
 /// `saturation_signal == TokenBucket`. Controls how much of a short-term spike
 /// is absorbed before we declare saturation.
 pub const DEFAULT_TOKEN_BUCKET_BURST: u64 = 25_000;
+/// Default AND-guard on saturation entry: require the scheduler queue to hold
+/// at least this percentage of `TOTAL_BUFFERED_PACKETS` before the chosen
+/// signal is allowed to drive saturation. `0` disables the guard.
+pub const DEFAULT_SATURATION_MIN_QUEUE_PCT: u8 = 0;
 
 /// Signal used by the scheduler to decide when the pipeline is saturated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +115,13 @@ pub struct SchedulerConfig {
     /// Token-bucket burst capacity (packets)
     /// (only used when `saturation_signal == TokenBucket`).
     pub token_bucket_burst: u64,
+    /// AND-guard on saturation entry: the chosen signal must fire AND the
+    /// scheduler queue must contain at least this percentage of
+    /// `TOTAL_BUFFERED_PACKETS`. Prevents publishing a priority floor derived
+    /// from a near-empty queue (which would be noise, not signal) — mainly
+    /// relevant under `ChannelDepth`/`TokenBucket` where the signal can fire
+    /// while the queue is virtually empty. `0` disables the guard.
+    pub saturation_min_queue_pct: u8,
 }
 
 impl SchedulerConfig {
@@ -142,6 +153,7 @@ impl Default for SchedulerConfig {
             channel_depth_low_watermark: DEFAULT_CHANNEL_DEPTH_LOW_WATERMARK,
             token_bucket_refill_tps: DEFAULT_TOKEN_BUCKET_REFILL_TPS,
             token_bucket_burst: DEFAULT_TOKEN_BUCKET_BURST,
+            saturation_min_queue_pct: DEFAULT_SATURATION_MIN_QUEUE_PCT,
         }
     }
 }
@@ -512,7 +524,17 @@ where
             self.saturation_last_tick = Some(now);
         }
 
-        if signal_value >= high_watermark {
+        // AND-guard: the published floor is the min priority currently in the
+        // queue. If the queue is near-empty that min is arbitrary / stale, so
+        // we require the queue to be at least `saturation_min_queue_pct`
+        // before letting the chosen signal drive saturation. When the guard
+        // is 0 (default) the condition is trivially satisfied.
+        let queue_guard_threshold = TOTAL_BUFFERED_PACKETS
+            .saturating_mul(self.config.saturation_min_queue_pct as usize)
+            / 100;
+        let queue_guard_met = self.container.queue_size() >= queue_guard_threshold;
+
+        if signal_value >= high_watermark && queue_guard_met {
             if !self.saturated {
                 // Transition 0 → 1
                 self.saturated = true;
@@ -532,8 +554,9 @@ where
             } else {
                 self.saturation_feedback.clear();
             }
-        } else if signal_value <= low_watermark && self.saturated {
-            // Transition 1 → 0
+        } else if self.saturated && (signal_value <= low_watermark || !queue_guard_met) {
+            // Transition 1 → 0: either the signal deactivated or the queue
+            // drained below the guard (stale floor — drop it immediately).
             self.saturated = false;
             self.saturation_last_tick = None;
             self.saturation_feedback.clear();

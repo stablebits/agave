@@ -941,6 +941,15 @@ pub fn execute(
                 Err("--scheduler-token-bucket-burst must be > 0".to_string())?;
             }
 
+            let saturation_min_queue_pct =
+                value_t_or_exit!(matches, "scheduler_saturation_min_queue_pct", u8);
+            if saturation_min_queue_pct > 100 {
+                Err(format!(
+                    "--scheduler-saturation-min-queue-pct must be in [0, 100], got \
+                     {saturation_min_queue_pct}"
+                ))?;
+            }
+
             SchedulerConfig {
                 scheduler_pacing: value_t_or_exit!(
                     matches,
@@ -957,6 +966,7 @@ pub fn execute(
                 channel_depth_low_watermark: channel_depth_low,
                 token_bucket_refill_tps,
                 token_bucket_burst,
+                saturation_min_queue_pct,
             }
         },
         enable_block_production_forwarding: staked_nodes_overrides_path.is_some(),

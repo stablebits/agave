@@ -903,6 +903,21 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("scheduler_saturation_min_queue_pct")
+            .long("scheduler-saturation-min-queue-pct")
+            .takes_value(true)
+            .default_value(&default_args.scheduler_saturation_min_queue_pct)
+            .validator(is_parsable::<u8>)
+            .hidden(hidden_unless_forced())
+            .help(
+                "AND-guard on saturation entry: the chosen signal must fire AND the \
+                 scheduler queue must contain at least this percentage of its total \
+                 capacity. Prevents publishing a stale priority floor derived from a \
+                 near-empty queue. Mainly useful under --scheduler-saturation-signal=channel \
+                 or =token_bucket. 0 (default) disables the guard.",
+            ),
+    )
+    .arg(
         Arg::with_name("num_quic_endpoints")
             .long("num-quic-endpoints")
             .takes_value(true)
