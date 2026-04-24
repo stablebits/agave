@@ -95,6 +95,12 @@ pub struct SchedulerCountMetricsInner {
     /// 0 means no floor was published (i.e. scheduler was not saturated or
     /// pf-floor is disabled).
     pub current_priority_fee_floor: u64,
+    /// Depth of the sigverify→scheduler unbounded channel, in valid
+    /// packets, as of the last saturation-feedback tick. Reported as a
+    /// gauge; useful for spotting backpressure building up ahead of the
+    /// scheduler (e.g. manifesting as receive-age drops inside the
+    /// scheduler).
+    pub channel_in_flight_packets: usize,
 }
 
 impl IntervalSchedulerCountMetrics {
@@ -149,6 +155,7 @@ impl SchedulerCountMetricsInner {
             max_prioritization_fees: _max_prioritization_fees,
             rate_limiter_tokens_remaining,
             current_priority_fee_floor,
+            channel_in_flight_packets,
         } = self;
         let mut datapoint = create_datapoint!(
             @point name,
@@ -200,7 +207,12 @@ impl SchedulerCountMetricsInner {
                 rate_limiter_tokens_remaining,
                 i64
             ),
-            ("current_priority_fee_floor", current_priority_fee_floor, i64)
+            ("current_priority_fee_floor", current_priority_fee_floor, i64),
+            (
+                "channel_in_flight_packets",
+                channel_in_flight_packets,
+                i64
+            )
         );
         if let Some(slot) = slot {
             datapoint.add_field_i64("slot", slot as i64);
@@ -240,6 +252,7 @@ impl SchedulerCountMetricsInner {
         self.max_prioritization_fees = 0;
         self.rate_limiter_tokens_remaining = 0;
         self.current_priority_fee_floor = 0;
+        self.channel_in_flight_packets = 0;
     }
 
     pub fn update_priority_stats(&mut self, min_max_fees: Option<(u64, u64)>) {

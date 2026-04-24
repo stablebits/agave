@@ -4,7 +4,7 @@ use {
     solana_perf::packet::PacketBatch,
     std::sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -24,6 +24,16 @@ pub type BankingPacketReceiver = Receiver<BankingPacketBatch>;
 ///   scheduler diffs it per tick to compute the incoming arrival rate,
 ///   which drives the token-bucket saturation signal on the scheduler side.
 ///
+/// - **In-flight counter** (sigverify → scheduler). Tracks the total
+///   number of packets currently queued in the unbounded `sigverify →
+///   banking` channel, *including packets marked `discard`*. Sigverify
+///   increments immediately before send, rolls back on send failure, and
+///   the scheduler decrements as it drains each batch. Kept separate from
+///   `total_arrivals` so the token-bucket arrival rate remains a measure
+///   of *real* work while the gauge reflects transport-level depth (the
+///   two differ whenever sigverify retains partly-discarded multi-packet
+///   batches).
+///
 /// Both atomics are bundled on a single struct because every consumer pair
 /// uses them together in practice, and they share the same Arc plumbing from
 /// `tpu.rs` through `BankingStage` and into `SchedulerController` /
@@ -36,6 +46,11 @@ pub struct BankingStageFeedback {
     // Monotonic (never wraps in the lifetime of a validator process). Writer
     // is sigverify; reader is the scheduler.
     total_arrivals: AtomicU64,
+    // Current depth of the sigverify→scheduler unbounded channel in total
+    // packets (includes packets currently marked `discard`). Sigverify
+    // bumps this immediately before send and compensates on send failure;
+    // the scheduler decrements on drain and reads for reporting.
+    in_flight_packets: AtomicUsize,
 }
 
 impl BankingStageFeedback {
@@ -60,11 +75,11 @@ impl BankingStageFeedback {
 
     // --- arrivals counter (sigverify writes, scheduler reads) ---------------
 
-    /// Record that `n` packets have just entered the banking channel. Takes
-    /// `usize` to match sigverify's own packet-count types; internally
-    /// widened to `u64` to match the scheduler's arithmetic domain
-    /// (monotonic counter that must not wrap for the lifetime of a
-    /// validator process).
+    /// Record that `n` non-discard ("valid") packets have just entered the
+    /// banking channel. Takes `usize` to match sigverify's own packet-count
+    /// types; internally widened to `u64` to match the scheduler's
+    /// arithmetic domain (monotonic counter that must not wrap for the
+    /// lifetime of a validator process).
     pub fn add_arrivals(&self, n: usize) {
         self.total_arrivals
             .fetch_add(n as u64, Ordering::Relaxed);
@@ -72,5 +87,41 @@ impl BankingStageFeedback {
 
     pub fn total_arrivals(&self) -> u64 {
         self.total_arrivals.load(Ordering::Relaxed)
+    }
+
+    // --- in-flight channel-depth counter (sigverify adds, scheduler subs) ---
+
+    /// Record that `n` packets are being handed off to the banking channel
+    /// (total — includes packets currently marked `discard`). In sigverify
+    /// this bump happens immediately before `send()` and is rolled back on
+    /// send failure. Paired with `sub_in_flight` on the drain side to yield
+    /// a channel-depth gauge.
+    pub fn add_in_flight(&self, n: usize) {
+        self.in_flight_packets.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Called after a batch is known not to be in the channel anymore:
+    /// by the scheduler after drain, or by sigverify to compensate a
+    /// failed send. Uses `saturating_sub` defensively to keep the gauge
+    /// non-negative even if future callers mis-pair adds/subs.
+    pub fn sub_in_flight(&self, n: usize) {
+        // Fetch-and-update loop for saturating subtraction.
+        let mut current = self.in_flight_packets.load(Ordering::Relaxed);
+        loop {
+            let new = current.saturating_sub(n);
+            match self.in_flight_packets.compare_exchange_weak(
+                current,
+                new,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    pub fn in_flight_packets(&self) -> usize {
+        self.in_flight_packets.load(Ordering::Relaxed)
     }
 }

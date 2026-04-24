@@ -25,7 +25,7 @@ use {
     agave_banking_stage_ingress_types::BankingStageFeedback,
     solana_measure::measure_us,
     solana_net_utils::token_bucket::TokenBucket,
-    solana_runtime::{bank::Bank, bank_forks::SharableBanks},
+    solana_runtime::bank_forks::SharableBanks,
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
     std::{
         num::{NonZeroU64, Saturating},
@@ -363,6 +363,15 @@ where
     /// the queue stays below the guard, we clear the published floor so
     /// sigverify stops dropping.
     fn update_scheduler_saturation_feedback(&mut self, priority_min_max: Option<(u64, u64)>) {
+        // Observe the sigverify→scheduler channel depth every tick,
+        // independent of the pf-floor feature. Useful on its own for
+        // spotting upstream backpressure, and reported whether or not
+        // the token bucket is enabled.
+        let channel_in_flight_packets = self.feedback.in_flight_packets();
+        self.count_metrics.update(|count_metrics| {
+            count_metrics.channel_in_flight_packets = channel_in_flight_packets;
+        });
+
         let Some(bucket) = self.saturation_token_bucket.as_ref() else {
             return; // feature disabled
         };
@@ -411,7 +420,6 @@ where
                 self.feedback.clear_priority_floor();
             }
         } else if over_budget > 0 && buffer_guard_met {
-            // Entry 0 → 1
             self.saturated = true;
             if let Some((min, _)) = priority_min_max {
                 self.feedback.set_priority_floor(min);
@@ -421,7 +429,6 @@ where
             }
         }
     }
-
 
     /// Clears the transaction state container.
     /// This only clears pending transactions, and does **not** clear in-flight transactions.
@@ -527,9 +534,16 @@ where
             .receive_and_buffer
             .receive_and_buffer_packets(&mut self.container, decision)?;
 
+        // Drained from the sigverify→scheduler channel, counted including
+        // packets marked `discard` so the gauge reflects true transport
+        // depth (sigverify bumps by the same total via `add_in_flight`).
+        self.feedback
+            .sub_in_flight(receiving_stats.num_total_packets_drained);
+
         self.count_metrics.update(|count_metrics| {
             let ReceivingStats {
                 num_received,
+                num_total_packets_drained: _,
                 num_dropped_without_parsing: num_dropped_without_buffering,
                 num_dropped_on_parsing_and_sanitization,
                 num_dropped_on_lock_validation,
