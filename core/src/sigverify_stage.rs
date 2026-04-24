@@ -5,19 +5,28 @@
 //! transaction. All processing is done on the CPU by default.
 
 use {
-    crate::sigverify::TransactionSigVerifier,
+    crate::{
+        priority_formula::{FeeContext, calculate_priority_and_cost},
+        sigverify::TransactionSigVerifier,
+    },
+    agave_banking_stage_ingress_types::BankingStageFeedback,
+    agave_transaction_view::transaction_view::SanitizedTransactionView,
     core::time::Duration,
     crossbeam_channel::{Receiver, RecvTimeoutError},
     solana_measure::measure::Measure,
     solana_perf::{
         deduper::{self, Deduper},
-        packet::PacketBatch,
+        packet::{PacketBatch, PacketFlags},
+    },
+    solana_runtime_transaction::{
+        runtime_transaction::RuntimeTransaction, transaction_meta::TransactionMeta,
     },
     solana_streamer::streamer::{self, StreamerError},
     solana_time_utils as timing,
+    solana_transaction::sanitized::MessageHash,
     std::{
         sync::{
-            Arc,
+            Arc, LazyLock,
             atomic::{AtomicUsize, Ordering},
         },
         thread::{self, Builder, JoinHandle},
@@ -25,6 +34,13 @@ use {
     },
     thiserror::Error,
 };
+
+// Mainnet-defaults context for the pf-floor priority approximation.
+// `feature_set = all_enabled` keeps the parse step at most as permissive
+// as the live bank; `lamports_per_signature` and `burn_percent` track
+// stable mainnet constants. Mismatches against an actual non-mainnet
+// bank are bounded and load-shedding-only.
+static MAINNET_FEE_CONTEXT: LazyLock<FeeContext> = LazyLock::new(FeeContext::mainnet_defaults);
 
 #[derive(Error, Debug)]
 pub enum SigVerifyServiceError {
@@ -52,6 +68,7 @@ struct SigVerifierStats {
     total_dedup_time_us: usize,
     total_verify_time_us: Arc<AtomicUsize>,
     total_dropped_on_capacity: usize,
+    total_dropped_below_priority_floor: usize,
 }
 
 impl SigVerifierStats {
@@ -148,6 +165,11 @@ impl SigVerifierStats {
                 i64
             ),
             (
+                "total_dropped_below_priority_floor",
+                core::mem::take(&mut self.total_dropped_below_priority_floor),
+                i64
+            ),
+            (
                 "total_valid_packets",
                 self.total_valid_packets.swap(0, Ordering::Relaxed) as i64,
                 i64
@@ -166,15 +188,96 @@ impl SigVerifierStats {
     }
 }
 
+/// Approximate banking-stage priority for a packet from its raw bytes.
+///
+/// Calls into the same `calculate_priority_and_cost` the scheduler uses,
+/// supplied with a constants-only [`FeeContext`]
+/// ([`FeeContext::mainnet_defaults`]). The arithmetic is identical;
+/// inputs (`feature_set`, `lamports_per_signature`, `burn_percent`)
+/// diverge from a live bank in non-mainnet contexts. Documented and
+/// load-shedding-only — never affects correctness of accepted txs.
+///
+/// Returns `None` if the packet cannot be parsed; callers should leave
+/// such packets alone (they will be rejected downstream if genuinely
+/// invalid).
+pub(crate) fn approximate_priority(data: &[u8]) -> Option<u64> {
+    let view = SanitizedTransactionView::try_new_sanitized(data, true).ok()?;
+    let runtime_tx =
+        RuntimeTransaction::<SanitizedTransactionView<_>>::try_new(view, MessageHash::Compute, None)
+            .ok()?;
+    let config = runtime_tx
+        .transaction_configuration(&MAINNET_FEE_CONTEXT.feature_set)
+        .ok()?;
+    let (priority, _cost) =
+        calculate_priority_and_cost(&runtime_tx, &config, &MAINNET_FEE_CONTEXT);
+    Some(priority)
+
+    // --- Previous (simple) formula, kept commented for quick revert.
+    // Returned `compute_unit_price_in_microlamports`, i.e. priority_fee
+    // ignoring the base-fee reward and using compute_unit_limit (not
+    // CostModel::calculate_cost) for cost. Diverged from the scheduler's
+    // priority calculation in two ways at once; replaced after review.
+    //
+    // Some(config.compute_unit_price_in_microlamports())
+}
+
+/// Apply the scheduler's published priority floor to freshly-received
+/// batches. Below-floor packets are marked `discard`; a batch is removed
+/// from the outer `Vec` entirely when no packets survive (which covers the
+/// `PacketBatch::Single` below-floor case uniformly and also reclaims
+/// multi-packet batches whose packets all got dropped).
+///
+/// Returns the number of packets newly dropped.
+pub(crate) fn apply_priority_floor(batches: &mut Vec<PacketBatch>, floor: u64) -> usize {
+    let mut dropped: usize = 0;
+    batches.retain_mut(|batch| {
+        let mut any_kept = false;
+        for mut packet in batch.iter_mut() {
+            if packet.meta().discard() {
+                // Pre-existing discard: stays discarded, doesn't count as
+                // kept (so an all-prediscarded batch is dropped too).
+                continue;
+            }
+            if packet.meta().flags.contains(PacketFlags::SIMPLE_VOTE_TX) {
+                // Votes are immune to the priority floor (vote priority is
+                // governed by a separate policy in banking stage).
+                any_kept = true;
+                continue;
+            }
+            let Some(data) = packet.data(..) else {
+                // Zero-length or otherwise unreadable: leave to downstream
+                // stages to reject.
+                any_kept = true;
+                continue;
+            };
+            match approximate_priority(data) {
+                Some(priority) if priority < floor => {
+                    packet.meta_mut().set_discard(true);
+                    dropped = dropped.saturating_add(1);
+                }
+                _ => any_kept = true,
+            }
+        }
+        any_kept
+    });
+    dropped
+}
+
 impl SigVerifyStage {
     pub fn new(
         packet_receiver: Receiver<PacketBatch>,
         verifier: TransactionSigVerifier,
         thread_name: &'static str,
         metrics_name: &'static str,
+        banking_stage_feedback: Option<Arc<BankingStageFeedback>>,
     ) -> Self {
-        let thread_hdl =
-            Self::verifier_service(packet_receiver, verifier, thread_name, metrics_name);
+        let thread_hdl = Self::verifier_service(
+            packet_receiver,
+            verifier,
+            thread_name,
+            metrics_name,
+            banking_stage_feedback,
+        );
         Self { thread_hdl }
     }
 
@@ -184,10 +287,30 @@ impl SigVerifyStage {
         verifier: &mut TransactionSigVerifier,
         stats: &mut SigVerifierStats,
         in_flight_count: &Arc<AtomicUsize>,
+        banking_stage_feedback: Option<&Arc<BankingStageFeedback>>,
     ) -> Result<()> {
         const SOFT_RECEIVE_CAP: usize = 5_000;
-        let (mut batches, num_packets, recv_duration) =
+        let (mut batches, num_packets_received, recv_duration) =
             streamer::recv_packet_batches(recvr, SOFT_RECEIVE_CAP)?;
+
+        // Apply the scheduler's priority floor *at dequeue*, before dedup and
+        // sig verification. For Single batches (QUIC-TPU's shape) this
+        // removes below-floor packets from the outer vec entirely, relieving
+        // both CPU and the sigverify→banking channel downstream.
+        //
+        // `num_packets` tracks packets that continue through the pipeline;
+        // `num_packets_received` is preserved for the received-count stats so
+        // drop counters remain subsets of total_packets.
+        let mut num_packets = num_packets_received;
+        if let Some(floor) = banking_stage_feedback.and_then(|f| f.get_priority_floor()) {
+            let dropped = apply_priority_floor(&mut batches, floor);
+            if dropped > 0 {
+                stats.total_dropped_below_priority_floor = stats
+                    .total_dropped_below_priority_floor
+                    .saturating_add(dropped);
+                num_packets = num_packets.saturating_sub(dropped);
+            }
+        }
 
         // If we're already at capacity immediately drop the packets
         let mut should_drop = false;
@@ -203,9 +326,12 @@ impl SigVerifyStage {
             .increment(recv_duration.as_micros() as u64)
             .unwrap();
         stats.batches_hist.increment(batches_len as u64).unwrap();
-        stats.packets_hist.increment(num_packets as u64).unwrap();
+        stats
+            .packets_hist
+            .increment(num_packets_received as u64)
+            .unwrap();
         stats.total_batches += batches_len;
-        stats.total_packets += num_packets;
+        stats.total_packets += num_packets_received;
 
         if !should_drop {
             debug!(
@@ -233,10 +359,12 @@ impl SigVerifyStage {
                 batches_len,
                 num_packets
             );
-            stats
-                .dedup_packets_pp_us_hist
-                .increment(dedup_time.as_us() / (num_packets as u64))
-                .unwrap();
+            if num_packets > 0 {
+                stats
+                    .dedup_packets_pp_us_hist
+                    .increment(dedup_time.as_us() / (num_packets as u64))
+                    .unwrap();
+            }
             stats.total_dedup += discard_or_dedup_fail;
             stats.total_dedup_time_us += dedup_time.as_us() as usize;
         }
@@ -249,6 +377,7 @@ impl SigVerifyStage {
         mut verifier: TransactionSigVerifier,
         thread_name: &'static str,
         metrics_name: &'static str,
+        banking_stage_feedback: Option<Arc<BankingStageFeedback>>,
     ) -> JoinHandle<()> {
         let mut stats = SigVerifierStats::default();
         let mut last_print = Instant::now();
@@ -271,6 +400,7 @@ impl SigVerifyStage {
                         &mut verifier,
                         &mut stats,
                         &in_flight_count,
+                        banking_stage_feedback.as_ref(),
                     ) {
                         match e {
                             SigVerifyServiceError::Streamer(StreamerError::RecvTimeout(
@@ -336,8 +466,8 @@ mod tests {
         let (packet_s, packet_r) = unbounded();
         let (verified_s, verified_r) = BankingTracer::channel_for_test();
         let threadpool = Arc::new(sigverify::threadpool_for_tests());
-        let verifier = TransactionSigVerifier::new(threadpool, verified_s, None);
-        let stage = SigVerifyStage::new(packet_r, verifier, "solSigVerTest", "test");
+        let verifier = TransactionSigVerifier::new(threadpool, verified_s, None, None);
+        let stage = SigVerifyStage::new(packet_r, verifier, "solSigVerTest", "test", None);
 
         let now = Instant::now();
         let packets_per_batch = 128;

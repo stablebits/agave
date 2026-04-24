@@ -876,12 +876,35 @@ pub fn execute(
             BlockProductionMethod
         ),
         block_production_num_workers,
-        block_production_scheduler_config: SchedulerConfig {
-            scheduler_pacing: value_t_or_exit!(
-                matches,
-                "block_production_pacing_fill_time_millis",
-                SchedulerPacing
-            ),
+        block_production_scheduler_config: {
+            let refill_tps =
+                value_t_or_exit!(matches, "scheduler_token_bucket_refill_tps", u64);
+            let burst = value_t_or_exit!(matches, "scheduler_token_bucket_burst", u64);
+            if refill_tps == 0 {
+                Err("--scheduler-token-bucket-refill-tps must be > 0".to_string())?;
+            }
+            if burst == 0 {
+                Err("--scheduler-token-bucket-burst must be > 0".to_string())?;
+            }
+            let min_queue_pct =
+                value_t_or_exit!(matches, "scheduler_saturation_min_queue_pct", u8);
+            if min_queue_pct > 100 {
+                Err(format!(
+                    "--scheduler-saturation-min-queue-pct must be in [0, 100], got \
+                     {min_queue_pct}"
+                ))?;
+            }
+            SchedulerConfig {
+                scheduler_pacing: value_t_or_exit!(
+                    matches,
+                    "block_production_pacing_fill_time_millis",
+                    SchedulerPacing
+                ),
+                pf_floor_enabled: !matches.is_present("scheduler_pf_floor_disable"),
+                token_bucket_refill_tps: refill_tps,
+                token_bucket_burst: burst,
+                saturation_min_queue_pct: min_queue_pct,
+            }
         },
         enable_block_production_forwarding: staked_nodes_overrides_path.is_some(),
         enable_scheduler_bindings: matches.is_present("enable_scheduler_bindings"),

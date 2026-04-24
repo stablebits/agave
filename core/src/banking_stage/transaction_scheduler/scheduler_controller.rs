@@ -22,8 +22,10 @@ use {
     },
     solana_clock::DEFAULT_MS_PER_SLOT,
     solana_cost_model::cost_tracker::SharedBlockCost,
+    agave_banking_stage_ingress_types::BankingStageFeedback,
     solana_measure::measure_us,
-    solana_runtime::bank_forks::SharableBanks,
+    solana_net_utils::token_bucket::TokenBucket,
+    solana_runtime::{bank::Bank, bank_forks::SharableBanks},
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
     std::{
         num::{NonZeroU64, Saturating},
@@ -37,9 +39,37 @@ use {
 
 const CHECK_CHUNK: usize = 128;
 
+/// Default token-bucket refill rate (packets per second) for the pf-floor
+/// saturation signal. Approximates the rate at which the scheduler can drain
+/// its receive+parse+schedule loop.
+pub const DEFAULT_TOKEN_BUCKET_REFILL_TPS: u64 = 100_000;
+/// Default token-bucket burst capacity (packets). Controls how much of a
+/// short-term spike is absorbed before saturation triggers.
+pub const DEFAULT_TOKEN_BUCKET_BURST: u64 = 25_000;
+/// Default AND-guard on saturation entry: require the scheduler queue to hold
+/// at least this percentage of `TOTAL_BUFFERED_PACKETS` before the token
+/// bucket is allowed to drive saturation. This prevents publishing a stale
+/// floor when the queue is near-empty (the min priority of a tiny set of
+/// stragglers is noise, not signal).
+pub const DEFAULT_SATURATION_MIN_QUEUE_PCT: u8 = 90;
+
 #[derive(Clone)]
 pub struct SchedulerConfig {
     pub scheduler_pacing: SchedulerPacing,
+    /// When true, the scheduler publishes a priority floor when saturated,
+    /// and sigverify drops incoming packets whose approximated priority is
+    /// below that floor. When false, the mechanism is a no-op.
+    pub pf_floor_enabled: bool,
+    /// Token-bucket refill rate (packets per second). Incoming arrivals above
+    /// this rate deplete the bucket and drive saturation.
+    pub token_bucket_refill_tps: u64,
+    /// Token-bucket burst capacity (packets). Short-term arrival spikes up to
+    /// this many packets are absorbed before saturation triggers.
+    pub token_bucket_burst: u64,
+    /// AND-guard on saturation entry: the token bucket must be empty AND the
+    /// scheduler queue must contain at least this percentage of
+    /// `TOTAL_BUFFERED_PACKETS` for saturation to fire.
+    pub saturation_min_queue_pct: u8,
 }
 
 impl Default for SchedulerConfig {
@@ -48,6 +78,10 @@ impl Default for SchedulerConfig {
             scheduler_pacing: SchedulerPacing::FillTimeMillis(
                 DEFAULT_SCHEDULER_PACING_FILL_TIME_MILLIS,
             ),
+            pf_floor_enabled: true,
+            token_bucket_refill_tps: DEFAULT_TOKEN_BUCKET_REFILL_TPS,
+            token_bucket_burst: DEFAULT_TOKEN_BUCKET_BURST,
+            saturation_min_queue_pct: DEFAULT_SATURATION_MIN_QUEUE_PCT,
         }
     }
 }
@@ -88,6 +122,30 @@ where
     recheck_cursor: Option<TransactionPriorityId>,
     /// Recheck IDs scratch space.
     recheck_chunk: Vec<TransactionPriorityId>,
+    /// Shared feedback with sigverify: the scheduler publishes a priority
+    /// floor (read by sigverify to drop below-floor txs) and reads a
+    /// monotonic arrivals counter (written by sigverify) to drive the token
+    /// bucket.
+    feedback: Arc<BankingStageFeedback>,
+    /// Whether the scheduler is currently in the saturated state (simple
+    /// boolean latch for hysteresis bookkeeping).
+    saturated: bool,
+    /// Token bucket driving the pf-floor saturation signal. `None` when
+    /// `pf_floor_enabled` is false to keep the mechanism fully zero-cost.
+    saturation_token_bucket: Option<TokenBucket>,
+    /// Last observed value of `BankingStageFeedback::total_arrivals`,
+    /// used to compute per-tick arrivals for the token bucket.
+    prev_total_received: u64,
+    /// Precomputed from config: buffer occupancy (absolute packets, i.e.
+    /// `id_to_transaction_state.len()`) at which the AND-guard on saturation
+    /// entry is satisfied. Uses buffer size rather than priority-queue size
+    /// so that saturation still fires when the scheduler is actively
+    /// scheduling and the priority queue is momentarily near-empty while the
+    /// full buffer remains under pressure.
+    buffer_guard_threshold: usize,
+    /// Precomputed from config: token-bucket level at which saturation
+    /// de-asserts (hysteresis), currently `token_bucket_burst / 2`.
+    desaturate_tokens_threshold: u64,
 }
 
 impl<R, S> SchedulerController<R, S>
@@ -103,7 +161,25 @@ where
         sharable_banks: SharableBanks,
         scheduler: S,
         worker_metrics: Vec<Arc<ConsumeWorkerMetrics>>,
+        feedback: Arc<BankingStageFeedback>,
     ) -> Self {
+        let saturation_token_bucket = config.pf_floor_enabled.then(|| {
+            // Start full: the bucket represents slack for absorbing a burst,
+            // not work done. At startup the scheduler isn't behind on
+            // anything, so give it its full burst budget to absorb the first
+            // wave of arrivals (e.g. a backlog accumulated during a preceding
+            // non-leader period).
+            TokenBucket::new(
+                config.token_bucket_burst,
+                config.token_bucket_burst,
+                config.token_bucket_refill_tps as f64,
+            )
+        });
+        let prev_total_received = feedback.total_arrivals();
+        let buffer_guard_threshold = TOTAL_BUFFERED_PACKETS
+            .saturating_mul(config.saturation_min_queue_pct as usize)
+            / 100;
+        let desaturate_tokens_threshold = config.token_bucket_burst.saturating_div(2);
         Self {
             exit,
             config,
@@ -118,6 +194,12 @@ where
             scheduling_details: SchedulingDetails::default(),
             recheck_cursor: None,
             recheck_chunk: Vec::with_capacity(CHECK_CHUNK),
+            feedback,
+            saturated: false,
+            saturation_token_bucket,
+            prev_total_received,
+            buffer_guard_threshold,
+            desaturate_tokens_threshold,
         }
     }
 
@@ -205,6 +287,7 @@ where
             self.count_metrics.update(|count_metrics| {
                 count_metrics.update_priority_stats(priority_min_max);
             });
+            self.update_scheduler_saturation_feedback(priority_min_max);
             self.count_metrics
                 .maybe_report_and_reset_interval(should_report);
             self.timing_metrics
@@ -264,6 +347,81 @@ where
 
         Ok(scheduled)
     }
+
+    /// Update the scheduler saturation feedback channel based on incoming
+    /// packet arrivals and the current queue state.
+    ///
+    /// Saturation is driven by a token bucket fed at
+    /// `config.token_bucket_refill_tps` and consumed by actual arrivals. The
+    /// bucket going empty under pressure is the primary "over-capacity"
+    /// signal. It is AND-guarded with a minimum queue-occupancy check so
+    /// that we only publish a floor when there is a meaningful set of
+    /// in-queue transactions to derive it from (otherwise the min priority
+    /// of a near-empty queue is arbitrary and the floor would be noise).
+    ///
+    /// When the bucket is replenished past half of its burst capacity and
+    /// the queue stays below the guard, we clear the published floor so
+    /// sigverify stops dropping.
+    fn update_scheduler_saturation_feedback(&mut self, priority_min_max: Option<(u64, u64)>) {
+        let Some(bucket) = self.saturation_token_bucket.as_ref() else {
+            return; // feature disabled
+        };
+
+        // Consume this tick's arrivals from the bucket, taking whatever is
+        // available. The remainder (requested - consumed) is the amount by
+        // which arrivals exceeded the bucket this tick, i.e. "over budget."
+        let total_received = self.feedback.total_arrivals();
+        let arrivals = total_received.saturating_sub(self.prev_total_received);
+        self.prev_total_received = total_received;
+        let consumed = bucket.consume_tokens_saturating(arrivals);
+        let over_budget = arrivals.saturating_sub(consumed);
+        let current_tokens = bucket.current_tokens();
+
+        // Record observability metrics regardless of saturation state.
+        self.count_metrics.update(|count_metrics| {
+            count_metrics.rate_limiter_tokens_remaining = current_tokens;
+        });
+
+        // Buffer guard: require a meaningfully full buffer before publishing
+        // a floor. Uses the full buffer (priority-queue + held/in-flight) so
+        // that saturation stays active while the scheduler is actively
+        // scheduling and the priority queue is momentarily near-empty.
+        let buffer_guard_met = self.container.buffer_size() >= self.buffer_guard_threshold;
+
+        if self.saturated {
+            // While saturated, track any drift in the queue's min priority
+            // each tick — low-priority txs getting scheduled raise the min
+            // of the remaining backlog, and the published floor should
+            // follow. Relaxed atomic store, effectively free.
+            //
+            // If the priority queue is momentarily empty (heavy in-flight
+            // scheduling), we keep the previously-published floor implicitly
+            // (no overwrite) rather than clearing it — the buffer is still
+            // under pressure.
+            if let Some((min, _)) = priority_min_max {
+                self.feedback.set_priority_floor(min);
+                self.count_metrics.update(|count_metrics| {
+                    count_metrics.current_priority_fee_floor = min;
+                });
+            }
+            // Exit hysteresis: bucket refilled past threshold, or buffer
+            // drained below guard (pressure is gone).
+            if current_tokens >= self.desaturate_tokens_threshold || !buffer_guard_met {
+                self.saturated = false;
+                self.feedback.clear_priority_floor();
+            }
+        } else if over_budget > 0 && buffer_guard_met {
+            // Entry 0 → 1
+            self.saturated = true;
+            if let Some((min, _)) = priority_min_max {
+                self.feedback.set_priority_floor(min);
+                self.count_metrics.update(|count_metrics| {
+                    count_metrics.current_priority_fee_floor = min;
+                });
+            }
+        }
+    }
+
 
     /// Clears the transaction state container.
     /// This only clears pending transactions, and does **not** clear in-flight transactions.
@@ -544,6 +702,7 @@ mod tests {
             bank_forks.read().unwrap().sharable_banks(),
             scheduler,
             vec![], // no actual workers with metrics to report, this can be empty
+            Arc::new(BankingStageFeedback::default()),
         );
 
         (test_frame, scheduler_controller)

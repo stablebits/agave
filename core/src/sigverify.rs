@@ -5,7 +5,7 @@
 pub use solana_perf::sigverify::{count_packets_in_batches, ed25519_verify};
 use {
     crate::{banking_trace::BankingPacketSender, sigverify_stage::SigVerifyServiceError},
-    agave_banking_stage_ingress_types::BankingPacketBatch,
+    agave_banking_stage_ingress_types::{BankingPacketBatch, BankingStageFeedback},
     crossbeam_channel::{Sender, TrySendError},
     solana_measure::measure::Measure,
     solana_perf::{
@@ -23,6 +23,10 @@ pub struct TransactionSigVerifier {
     banking_stage_sender: BankingPacketSender,
     forward_stage_sender: Option<Sender<(BankingPacketBatch, bool)>>,
     reject_non_vote: bool,
+    /// Shared feedback with the banking-stage scheduler. Writer side: the
+    /// arrivals counter is bumped after each successful send. `None` for the
+    /// vote path (which has its own channel).
+    feedback: Option<Arc<BankingStageFeedback>>,
 }
 
 impl TransactionSigVerifier {
@@ -31,7 +35,7 @@ impl TransactionSigVerifier {
         packet_sender: BankingPacketSender,
         forward_stage_sender: Option<Sender<(BankingPacketBatch, bool)>>,
     ) -> Self {
-        let mut new_self = Self::new(thread_pool, packet_sender, forward_stage_sender);
+        let mut new_self = Self::new(thread_pool, packet_sender, forward_stage_sender, None);
         new_self.reject_non_vote = true;
         new_self
     }
@@ -40,12 +44,14 @@ impl TransactionSigVerifier {
         thread_pool: Arc<rayon::ThreadPool>,
         banking_stage_sender: BankingPacketSender,
         forward_stage_sender: Option<Sender<(BankingPacketBatch, bool)>>,
+        feedback: Option<Arc<BankingStageFeedback>>,
     ) -> Self {
         Self {
             thread_pool,
             banking_stage_sender,
             forward_stage_sender,
             reject_non_vote: false,
+            feedback,
         }
     }
 
@@ -61,6 +67,7 @@ impl TransactionSigVerifier {
         let banking_stage_sender = self.banking_stage_sender.clone();
         let forward_stage_sender = self.forward_stage_sender.clone();
         let reject_non_vote = self.reject_non_vote;
+        let feedback = self.feedback.clone();
 
         in_flight_count.fetch_add(valid_packets, Ordering::Release);
 
@@ -87,6 +94,12 @@ impl TransactionSigVerifier {
                 error!("sigverify send failed: {err:?}");
                 in_flight_count.fetch_sub(valid_packets, Ordering::Release);
                 return;
+            }
+            // Reaching this point means banking_stage_sender.send succeeded;
+            // account for packets entering the scheduler's input channel.
+            // Read by the scheduler to drive the pf-floor token bucket.
+            if let Some(feedback) = feedback.as_ref() {
+                feedback.add_arrivals(num_valid_packets);
             }
 
             total_valid_packets.fetch_add(num_valid_packets, Ordering::Relaxed);

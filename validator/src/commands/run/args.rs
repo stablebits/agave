@@ -1188,6 +1188,56 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("Enables external processes to connect and manage block production"),
     )
     .arg(
+        Arg::with_name("scheduler_pf_floor_disable")
+            .long("scheduler-pf-floor-disable")
+            .takes_value(false)
+            .hidden(hidden_unless_forced())
+            .help(
+                "Disable the scheduler pf-floor mechanism. When set, the scheduler does not \
+                 publish a priority floor under saturation and sigverify does not drop \
+                 low-priority transactions.",
+            ),
+    )
+    .arg(
+        Arg::with_name("scheduler_token_bucket_refill_tps")
+            .long("scheduler-token-bucket-refill-tps")
+            .takes_value(true)
+            .default_value(&default_args.scheduler_token_bucket_refill_tps)
+            .validator(is_parsable::<u64>)
+            .hidden(hidden_unless_forced())
+            .help(
+                "Target incoming-packet rate (packets per second) the scheduler can sustain. \
+                 Arrivals above this rate deplete the pf-floor token bucket and trigger \
+                 saturation.",
+            ),
+    )
+    .arg(
+        Arg::with_name("scheduler_token_bucket_burst")
+            .long("scheduler-token-bucket-burst")
+            .takes_value(true)
+            .default_value(&default_args.scheduler_token_bucket_burst)
+            .validator(is_parsable::<u64>)
+            .hidden(hidden_unless_forced())
+            .help(
+                "pf-floor token-bucket burst tolerance in packets. Short-term arrival spikes \
+                 up to this many packets are absorbed before saturation triggers.",
+            ),
+    )
+    .arg(
+        Arg::with_name("scheduler_saturation_min_queue_pct")
+            .long("scheduler-saturation-min-queue-pct")
+            .takes_value(true)
+            .default_value(&default_args.scheduler_saturation_min_queue_pct)
+            .validator(is_parsable::<u8>)
+            .hidden(hidden_unless_forced())
+            .help(
+                "AND-guard on saturation entry: the pf-floor token bucket must be empty AND \
+                 the scheduler queue must contain at least this percentage of its total \
+                 capacity for saturation to fire. Prevents publishing a stale priority floor \
+                 derived from a near-empty queue.",
+            ),
+    )
+    .arg(
         Arg::with_name("unified_scheduler_handler_threads")
             .long("unified-scheduler-handler-threads")
             .value_name("COUNT")

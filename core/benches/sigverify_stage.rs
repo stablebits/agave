@@ -79,8 +79,9 @@ fn bench_sigverify_stage(bencher: &mut Bencher, use_same_tx: bool) {
         Arc::new(sigverify::threadpool_for_benches()),
         verified_s,
         None,
+        None,
     );
-    let stage = SigVerifyStage::new(packet_r, verifier, "solSigVerBench", "bench");
+    let stage = SigVerifyStage::new(packet_r, verifier, "solSigVerBench", "bench", None);
     let packet_s = packet_s;
     let packet_s_for_bench = packet_s.clone();
     let verified_r_for_bench = verified_r.clone();

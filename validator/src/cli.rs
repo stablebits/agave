@@ -21,7 +21,13 @@ use {
         },
     },
     solana_clock::Slot,
-    solana_core::banking_trace::BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT,
+    solana_core::{
+        banking_stage::transaction_scheduler::scheduler_controller::{
+            DEFAULT_SATURATION_MIN_QUEUE_PCT, DEFAULT_TOKEN_BUCKET_BURST,
+            DEFAULT_TOKEN_BUCKET_REFILL_TPS,
+        },
+        banking_trace::BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT,
+    },
     solana_epoch_schedule::MINIMUM_SLOTS_PER_EPOCH,
     solana_faucet::faucet::{self, FAUCET_PORT},
     solana_hash::Hash,
@@ -234,6 +240,9 @@ pub struct DefaultArgs {
 
     pub banking_trace_dir_byte_limit: String,
     pub block_production_pacing_fill_time_millis: String,
+    pub scheduler_token_bucket_refill_tps: String,
+    pub scheduler_token_bucket_burst: String,
+    pub scheduler_saturation_min_queue_pct: String,
 
     pub thread_args: DefaultThreadArgs,
 }
@@ -286,6 +295,9 @@ impl DefaultArgs {
             banking_trace_dir_byte_limit: BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT.to_string(),
             block_production_pacing_fill_time_millis: BankingStage::default_fill_time_millis()
                 .to_string(),
+            scheduler_token_bucket_refill_tps: DEFAULT_TOKEN_BUCKET_REFILL_TPS.to_string(),
+            scheduler_token_bucket_burst: DEFAULT_TOKEN_BUCKET_BURST.to_string(),
+            scheduler_saturation_min_queue_pct: DEFAULT_SATURATION_MIN_QUEUE_PCT.to_string(),
             thread_args: DefaultThreadArgs::default(),
         }
     }

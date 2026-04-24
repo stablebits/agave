@@ -24,6 +24,7 @@ use {
         tpu_entry_notifier::TpuEntryNotifier,
         validator::{BlockProductionMethod, GeneratorConfig},
     },
+    agave_banking_stage_ingress_types::BankingStageFeedback,
     agave_votor::event::VotorEventSender,
     crossbeam_channel::{Receiver, bounded, unbounded},
     solana_clock::Slot,
@@ -164,6 +165,7 @@ impl Tpu {
         let (packet_sender, packet_receiver) = bounded(TPU_CHANNEL_SIZE);
         let (vote_packet_sender, vote_packet_receiver) = unbounded();
         let (forwarded_packet_sender, forwarded_packet_receiver) = unbounded();
+        let banking_stage_feedback = Arc::new(BankingStageFeedback::default());
         let fetch_stage = FetchStage::new_with_sender(
             tpu_vote_sockets,
             exit.clone(),
@@ -273,8 +275,15 @@ impl Tpu {
                 sigverify_threadpool.clone(),
                 non_vote_sender,
                 enable_block_production_forwarding.then(|| forward_stage_sender.clone()),
+                Some(banking_stage_feedback.clone()),
             );
-            SigVerifyStage::new(packet_receiver, verifier, "solSigVerTpu", "tpu-verifier")
+            SigVerifyStage::new(
+                packet_receiver,
+                verifier,
+                "solSigVerTpu",
+                "tpu-verifier",
+                Some(banking_stage_feedback.clone()),
+            )
         };
 
         let vote_sigverify_stage = {
@@ -288,6 +297,7 @@ impl Tpu {
                 verifier,
                 "solSigVerTpuVot",
                 "tpu-vote-verifier",
+                None,
             )
         };
 
@@ -322,6 +332,7 @@ impl Tpu {
             log_messages_bytes_limit,
             bank_forks.clone(),
             prioritization_fee_cache,
+            banking_stage_feedback.clone(),
         );
 
         #[cfg(unix)]
