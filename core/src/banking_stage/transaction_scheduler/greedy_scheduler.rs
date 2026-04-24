@@ -215,6 +215,10 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
     fn scheduling_common_mut(&mut self) -> &mut SchedulingCommon<Tx> {
         &mut self.common
     }
+
+    fn scheduling_common(&self) -> &SchedulingCommon<Tx> {
+        &self.common
+    }
 }
 
 fn try_schedule_transaction<Tx: TransactionWithMeta>(

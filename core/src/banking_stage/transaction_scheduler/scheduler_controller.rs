@@ -380,6 +380,9 @@ where
         let pipeline_dropped_by_sigverify = self.feedback.packets_dropped_by_sigverify();
         let pipeline_received_by_scheduler = self.feedback.packets_received_by_scheduler();
         let pipeline_dropped_by_scheduler = self.feedback.packets_dropped_by_scheduler();
+        let consume_work_queue_sum = self.scheduler.consume_work_queue_sum();
+        let consume_work_queue_max = self.scheduler.consume_work_queue_max();
+        let finished_work_queue_depth = self.scheduler.finished_work_queue_depth();
         self.count_metrics.update(|count_metrics| {
             count_metrics.channel_in_flight_packets = channel_in_flight_packets;
             count_metrics.channel_full_drops += Saturating(channel_full_drops_delta);
@@ -387,6 +390,9 @@ where
             count_metrics.pipeline_dropped_by_sigverify = pipeline_dropped_by_sigverify;
             count_metrics.pipeline_received_by_scheduler = pipeline_received_by_scheduler;
             count_metrics.pipeline_dropped_by_scheduler = pipeline_dropped_by_scheduler;
+            count_metrics.consume_work_queue_sum = consume_work_queue_sum;
+            count_metrics.consume_work_queue_max = consume_work_queue_max;
+            count_metrics.finished_work_queue_depth = finished_work_queue_depth;
         });
 
         let Some(bucket) = self.saturation_token_bucket.as_ref() else {

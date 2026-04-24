@@ -113,6 +113,15 @@ pub struct SchedulerCountMetricsInner {
     pub pipeline_dropped_by_sigverify: u64,
     pub pipeline_received_by_scheduler: u64,
     pub pipeline_dropped_by_scheduler: u64,
+    /// Snapshots of the unbounded scheduler→worker queues taken each
+    /// feedback tick. Sum is the total `ConsumeWork<Tx>` items queued
+    /// across all workers; max is the deepest single worker's backlog.
+    /// Emitted as gauges alongside the pipeline counters.
+    pub consume_work_queue_sum: usize,
+    pub consume_work_queue_max: usize,
+    /// Snapshot of the worker→scheduler `FinishedConsumeWork<Tx>` return
+    /// channel depth.
+    pub finished_work_queue_depth: usize,
 }
 
 impl IntervalSchedulerCountMetrics {
@@ -173,6 +182,9 @@ impl SchedulerCountMetricsInner {
             pipeline_dropped_by_sigverify,
             pipeline_received_by_scheduler,
             pipeline_dropped_by_scheduler,
+            consume_work_queue_sum,
+            consume_work_queue_max,
+            finished_work_queue_depth,
         } = self;
         let mut datapoint = create_datapoint!(
             @point name,
@@ -250,6 +262,13 @@ impl SchedulerCountMetricsInner {
                 "pipeline_dropped_by_scheduler",
                 pipeline_dropped_by_scheduler,
                 i64
+            ),
+            ("consume_work_queue_sum", consume_work_queue_sum, i64),
+            ("consume_work_queue_max", consume_work_queue_max, i64),
+            (
+                "finished_work_queue_depth",
+                finished_work_queue_depth,
+                i64
             )
         );
         if let Some(slot) = slot {
@@ -292,6 +311,10 @@ impl SchedulerCountMetricsInner {
         self.current_priority_fee_floor = 0;
         self.channel_in_flight_packets = 0;
         self.channel_full_drops = Saturating(0);
+        self.consume_work_queue_sum = 0;
+        self.consume_work_queue_max = 0;
+        self.finished_work_queue_depth = 0;
+        // pipeline_* are cumulative; intentionally not reset.
     }
 
     pub fn update_priority_stats(&mut self, min_max_fees: Option<(u64, u64)>) {

@@ -43,6 +43,34 @@ pub(crate) trait Scheduler<Tx: TransactionWithMeta> {
     /// All schedulers should have access to the common context for shared
     /// implementation.
     fn scheduling_common_mut(&mut self) -> &mut SchedulingCommon<Tx>;
+
+    /// Immutable accessor for `SchedulingCommon`, used by the controller
+    /// to read channel depths without requiring mutable borrow.
+    fn scheduling_common(&self) -> &SchedulingCommon<Tx>;
+
+    /// Summed length of every `scheduler → consume_worker` channel.
+    fn consume_work_queue_sum(&self) -> usize {
+        self.scheduling_common()
+            .consume_work_senders
+            .iter()
+            .map(|s| s.len())
+            .sum()
+    }
+
+    /// Max length across all `scheduler → consume_worker` channels.
+    fn consume_work_queue_max(&self) -> usize {
+        self.scheduling_common()
+            .consume_work_senders
+            .iter()
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Length of the `consume_worker → scheduler` return channel.
+    fn finished_work_queue_depth(&self) -> usize {
+        self.scheduling_common().finished_consume_work_receiver.len()
+    }
 }
 /// Metrics from scheduling transactions.
 #[derive(Default, Debug, PartialEq, Eq)]
