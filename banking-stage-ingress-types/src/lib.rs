@@ -56,6 +56,19 @@ pub struct BankingStageFeedback {
     // traced sender on `TrySendError::Full`; reader is the scheduler for
     // reporting.
     channel_full_drops: AtomicU64,
+
+    // --- pipeline traffic counters (cumulative, never reset) ----------
+    // Absolute counters at successive boundaries so the user can read the
+    // growth rate at each step and localize where a queue is building.
+    // `received_by_streamer` is measured at the *sigverify intake* — the
+    // first place inside the validator that packets are counted without
+    // touching cross-crate streamer code. It's a close proxy for
+    // streamer output (the fetch_stage→sigverify bounded channel is
+    // either transiently small or drops would show).
+    packets_received_by_streamer: AtomicU64,
+    packets_dropped_by_sigverify: AtomicU64,
+    packets_received_by_scheduler: AtomicU64,
+    packets_dropped_by_scheduler: AtomicU64,
 }
 
 impl BankingStageFeedback {
@@ -139,5 +152,43 @@ impl BankingStageFeedback {
 
     pub fn channel_full_drops(&self) -> u64 {
         self.channel_full_drops.load(Ordering::Relaxed)
+    }
+
+    // --- pipeline traffic counters -----------------------------------------
+
+    pub fn add_streamer_received(&self, n: usize) {
+        self.packets_received_by_streamer
+            .fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    pub fn add_sigverify_dropped(&self, n: usize) {
+        self.packets_dropped_by_sigverify
+            .fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    pub fn add_scheduler_received(&self, n: usize) {
+        self.packets_received_by_scheduler
+            .fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    pub fn add_scheduler_dropped(&self, n: usize) {
+        self.packets_dropped_by_scheduler
+            .fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    pub fn packets_received_by_streamer(&self) -> u64 {
+        self.packets_received_by_streamer.load(Ordering::Relaxed)
+    }
+
+    pub fn packets_dropped_by_sigverify(&self) -> u64 {
+        self.packets_dropped_by_sigverify.load(Ordering::Relaxed)
+    }
+
+    pub fn packets_received_by_scheduler(&self) -> u64 {
+        self.packets_received_by_scheduler.load(Ordering::Relaxed)
+    }
+
+    pub fn packets_dropped_by_scheduler(&self) -> u64 {
+        self.packets_dropped_by_scheduler.load(Ordering::Relaxed)
     }
 }

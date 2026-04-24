@@ -293,6 +293,12 @@ impl SigVerifyStage {
         let (mut batches, num_packets_received, recv_duration) =
             streamer::recv_packet_batches(recvr, SOFT_RECEIVE_CAP)?;
 
+        // Count every packet that reached sigverify intake (proxy for
+        // streamer output).
+        if let Some(feedback) = banking_stage_feedback {
+            feedback.add_streamer_received(num_packets_received);
+        }
+
         // Apply the scheduler's priority floor *at dequeue*, before dedup and
         // sig verification. For Single batches (QUIC-TPU's shape) this
         // removes below-floor packets from the outer vec entirely, relieving
@@ -309,6 +315,9 @@ impl SigVerifyStage {
                     .total_dropped_below_priority_floor
                     .saturating_add(dropped);
                 num_packets = num_packets.saturating_sub(dropped);
+                if let Some(feedback) = banking_stage_feedback {
+                    feedback.add_sigverify_dropped(dropped);
+                }
             }
         }
 
@@ -317,6 +326,9 @@ impl SigVerifyStage {
         if in_flight_count.load(Ordering::Relaxed) >= verifier.capacity() {
             stats.total_dropped_on_capacity += num_packets;
             should_drop = true;
+            if let Some(feedback) = banking_stage_feedback {
+                feedback.add_sigverify_dropped(num_packets);
+            }
         }
 
         let batches_len = batches.len();
@@ -363,6 +375,9 @@ impl SigVerifyStage {
             }
             stats.total_dedup += discard_or_dedup_fail;
             stats.total_dedup_time_us += dedup_time.as_us() as usize;
+            if let Some(feedback) = banking_stage_feedback {
+                feedback.add_sigverify_dropped(discard_or_dedup_fail);
+            }
         }
 
         Ok(())

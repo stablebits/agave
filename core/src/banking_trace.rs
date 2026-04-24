@@ -465,6 +465,10 @@ impl TracedSender {
                 Err(TrySendError::Full(dropped)) => {
                     let n: usize = dropped.iter().map(|b| b.len()).sum();
                     feedback.add_channel_full_drops(n);
+                    // Also attribute to the sigverify-side drop aggregate so
+                    // the pipeline-traffic counters balance (packets that
+                    // left sigverify but never reached the scheduler).
+                    feedback.add_sigverify_dropped(n);
                     Ok(())
                 }
                 Err(TrySendError::Disconnected(b)) => Err(SendError(b)),

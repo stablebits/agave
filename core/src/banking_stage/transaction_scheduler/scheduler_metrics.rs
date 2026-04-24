@@ -105,6 +105,14 @@ pub struct SchedulerCountMetricsInner {
     /// sigverify→scheduler channel was full at send time. Delta per
     /// reporting interval.
     pub channel_full_drops: Saturating<u64>,
+    /// Cumulative (never-reset) pipeline packet counters, mirrored from
+    /// `BankingStageFeedback` each report. Diffing these across samples
+    /// gives the per-boundary throughput regardless of how irregularly
+    /// the interval fires.
+    pub pipeline_received_by_streamer: u64,
+    pub pipeline_dropped_by_sigverify: u64,
+    pub pipeline_received_by_scheduler: u64,
+    pub pipeline_dropped_by_scheduler: u64,
 }
 
 impl IntervalSchedulerCountMetrics {
@@ -161,6 +169,10 @@ impl SchedulerCountMetricsInner {
             current_priority_fee_floor,
             channel_in_flight_packets,
             channel_full_drops: Saturating(channel_full_drops),
+            pipeline_received_by_streamer,
+            pipeline_dropped_by_sigverify,
+            pipeline_received_by_scheduler,
+            pipeline_dropped_by_scheduler,
         } = self;
         let mut datapoint = create_datapoint!(
             @point name,
@@ -218,7 +230,27 @@ impl SchedulerCountMetricsInner {
                 channel_in_flight_packets,
                 i64
             ),
-            ("channel_full_drops", channel_full_drops, i64)
+            ("channel_full_drops", channel_full_drops, i64),
+            (
+                "pipeline_received_by_streamer",
+                pipeline_received_by_streamer,
+                i64
+            ),
+            (
+                "pipeline_dropped_by_sigverify",
+                pipeline_dropped_by_sigverify,
+                i64
+            ),
+            (
+                "pipeline_received_by_scheduler",
+                pipeline_received_by_scheduler,
+                i64
+            ),
+            (
+                "pipeline_dropped_by_scheduler",
+                pipeline_dropped_by_scheduler,
+                i64
+            )
         );
         if let Some(slot) = slot {
             datapoint.add_field_i64("slot", slot as i64);

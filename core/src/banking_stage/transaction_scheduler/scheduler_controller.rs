@@ -376,9 +376,17 @@ where
         let channel_full_drops_delta =
             channel_full_drops_total.saturating_sub(self.prev_channel_full_drops);
         self.prev_channel_full_drops = channel_full_drops_total;
+        let pipeline_received_by_streamer = self.feedback.packets_received_by_streamer();
+        let pipeline_dropped_by_sigverify = self.feedback.packets_dropped_by_sigverify();
+        let pipeline_received_by_scheduler = self.feedback.packets_received_by_scheduler();
+        let pipeline_dropped_by_scheduler = self.feedback.packets_dropped_by_scheduler();
         self.count_metrics.update(|count_metrics| {
             count_metrics.channel_in_flight_packets = channel_in_flight_packets;
             count_metrics.channel_full_drops += Saturating(channel_full_drops_delta);
+            count_metrics.pipeline_received_by_streamer = pipeline_received_by_streamer;
+            count_metrics.pipeline_dropped_by_sigverify = pipeline_dropped_by_sigverify;
+            count_metrics.pipeline_received_by_scheduler = pipeline_received_by_scheduler;
+            count_metrics.pipeline_dropped_by_scheduler = pipeline_dropped_by_scheduler;
         });
 
         let Some(bucket) = self.saturation_token_bucket.as_ref() else {
@@ -516,6 +524,10 @@ where
         self.count_metrics.update(|count_metrics| {
             count_metrics.num_dropped_on_clean += num_dropped;
         });
+        let Saturating(num_dropped) = num_dropped;
+        if num_dropped > 0 {
+            self.feedback.add_scheduler_dropped(num_dropped);
+        }
     }
 
     /// Receives completed transactions from the workers and updates metrics.
@@ -548,6 +560,30 @@ where
         // depth (sigverify bumps by the same total via `add_in_flight`).
         self.feedback
             .sub_in_flight(receiving_stats.num_total_packets_drained);
+
+        // Cumulative pipeline counters. `received` uses the valid-packet
+        // count (matching sigverify's per-send `add_arrivals`); `dropped`
+        // is the sum of every scheduler-side drop reason emitted via
+        // `banking_stage_scheduler_counts`, so that
+        //   received_by_streamer
+        //     ≈ dropped_by_sigverify + dropped_by_scheduler
+        //       + received_by_scheduler - (pending in buffer/channel)
+        // in cumulative terms.
+        self.feedback
+            .add_scheduler_received(receiving_stats.num_received);
+        let scheduler_dropped_at_receive = receiving_stats
+            .num_dropped_without_parsing
+            .saturating_add(receiving_stats.num_dropped_on_parsing_and_sanitization)
+            .saturating_add(receiving_stats.num_dropped_on_lock_validation)
+            .saturating_add(receiving_stats.num_dropped_on_compute_budget)
+            .saturating_add(receiving_stats.num_dropped_on_age)
+            .saturating_add(receiving_stats.num_dropped_on_already_processed)
+            .saturating_add(receiving_stats.num_dropped_on_fee_payer)
+            .saturating_add(receiving_stats.num_dropped_on_capacity);
+        if scheduler_dropped_at_receive > 0 {
+            self.feedback
+                .add_scheduler_dropped(scheduler_dropped_at_receive);
+        }
 
         self.count_metrics.update(|count_metrics| {
             let ReceivingStats {
