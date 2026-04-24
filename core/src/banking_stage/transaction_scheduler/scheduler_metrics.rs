@@ -122,6 +122,21 @@ pub struct SchedulerCountMetricsInner {
     /// Snapshot of the worker→scheduler `FinishedConsumeWork<Tx>` return
     /// channel depth.
     pub finished_work_queue_depth: usize,
+    /// Of the `num_dropped_on_receive_age` drops in this interval, how
+    /// many had a recent_blockhash that was not present in the bank's
+    /// blockhash queue at all (age older than queue depth, or entirely
+    /// unknown). Complement against `num_dropped_on_receive_age` is the
+    /// count of drops whose age is in the `*_blockhash_age_slots` stats.
+    pub num_dropped_on_age_unknown_blockhash: Saturating<usize>,
+    /// Max blockhash-age (in slots) observed across age-drops this
+    /// interval, for drops whose blockhash *was* in the queue. Helps
+    /// spot "clients sending far-old blockhashes" vs. "client blockhash
+    /// just crossed the freshness window".
+    pub max_dropped_on_age_blockhash_age_slots: u64,
+    /// Sum of blockhash-age values across age-drops with a known age;
+    /// divide by `(num_dropped_on_receive_age -
+    /// num_dropped_on_age_unknown_blockhash)` to compute the average.
+    pub sum_dropped_on_age_blockhash_age_slots: Saturating<u64>,
 }
 
 impl IntervalSchedulerCountMetrics {
@@ -185,6 +200,11 @@ impl SchedulerCountMetricsInner {
             consume_work_queue_sum,
             consume_work_queue_max,
             finished_work_queue_depth,
+            num_dropped_on_age_unknown_blockhash:
+                Saturating(num_dropped_on_age_unknown_blockhash),
+            max_dropped_on_age_blockhash_age_slots,
+            sum_dropped_on_age_blockhash_age_slots:
+                Saturating(sum_dropped_on_age_blockhash_age_slots),
         } = self;
         let mut datapoint = create_datapoint!(
             @point name,
@@ -269,6 +289,21 @@ impl SchedulerCountMetricsInner {
                 "finished_work_queue_depth",
                 finished_work_queue_depth,
                 i64
+            ),
+            (
+                "num_dropped_on_age_unknown_blockhash",
+                num_dropped_on_age_unknown_blockhash,
+                i64
+            ),
+            (
+                "max_dropped_on_age_blockhash_age_slots",
+                max_dropped_on_age_blockhash_age_slots,
+                i64
+            ),
+            (
+                "sum_dropped_on_age_blockhash_age_slots",
+                sum_dropped_on_age_blockhash_age_slots,
+                i64
             )
         );
         if let Some(slot) = slot {
@@ -314,6 +349,9 @@ impl SchedulerCountMetricsInner {
         self.consume_work_queue_sum = 0;
         self.consume_work_queue_max = 0;
         self.finished_work_queue_depth = 0;
+        self.num_dropped_on_age_unknown_blockhash = Saturating(0);
+        self.max_dropped_on_age_blockhash_age_slots = 0;
+        self.sum_dropped_on_age_blockhash_age_slots = Saturating(0);
         // pipeline_* are cumulative; intentionally not reset.
     }
 

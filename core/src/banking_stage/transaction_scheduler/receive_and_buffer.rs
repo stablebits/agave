@@ -66,6 +66,22 @@ pub(crate) struct ReceivingStats {
 
     pub num_buffered: usize,
 
+    /// Count of age-drops whose recent_blockhash was not present in the
+    /// bank's blockhash queue at all (age older than the queue depth, or
+    /// entirely unknown). The complement of this against
+    /// `num_dropped_on_age` is the set of drops whose age is in
+    /// `[age_*_slots]` below.
+    pub num_dropped_on_age_unknown_blockhash: usize,
+    /// Max blockhash age (in slots) observed among `BlockhashNotFound`
+    /// drops this call. `0` if no such drops. Useful to spot clients
+    /// sending txs whose blockhash is far older than the freshness
+    /// window vs. only just-aged-out txs.
+    pub max_dropped_on_age_blockhash_age_slots: u64,
+    /// Sum of blockhash ages (in slots) across `BlockhashNotFound` drops
+    /// that had a known age. Reporter computes `sum / (num_dropped_on_age
+    /// - num_dropped_on_age_unknown_blockhash)` for the average.
+    pub sum_dropped_on_age_blockhash_age_slots: u64,
+
     pub receive_time_us: u64,
     pub buffer_time_us: u64,
 }
@@ -84,6 +100,14 @@ impl ReceivingStats {
         self.num_dropped_on_fee_payer += other.num_dropped_on_fee_payer;
         self.num_dropped_on_capacity += other.num_dropped_on_capacity;
         self.num_buffered += other.num_buffered;
+
+        self.num_dropped_on_age_unknown_blockhash += other.num_dropped_on_age_unknown_blockhash;
+        self.max_dropped_on_age_blockhash_age_slots = self
+            .max_dropped_on_age_blockhash_age_slots
+            .max(other.max_dropped_on_age_blockhash_age_slots);
+        self.sum_dropped_on_age_blockhash_age_slots = self
+            .sum_dropped_on_age_blockhash_age_slots
+            .saturating_add(other.sum_dropped_on_age_blockhash_age_slots);
 
         self.receive_time_us += other.receive_time_us;
         self.buffer_time_us += other.buffer_time_us;
@@ -140,6 +164,9 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
             num_dropped_on_fee_payer: 0,
             num_dropped_on_capacity: 0,
             num_buffered: 0,
+            num_dropped_on_age_unknown_blockhash: 0,
+            max_dropped_on_age_blockhash_age_slots: 0,
+            sum_dropped_on_age_blockhash_age_slots: 0,
             receive_time_us: 0,
             buffer_time_us: 0,
         };
@@ -210,6 +237,9 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
             num_received: stats.num_received,
             num_total_packets_drained: stats.num_total_packets_drained,
             num_dropped_without_parsing: stats.num_dropped_without_parsing,
+            num_dropped_on_age_unknown_blockhash: stats.num_dropped_on_age_unknown_blockhash,
+            max_dropped_on_age_blockhash_age_slots: stats.max_dropped_on_age_blockhash_age_slots,
+            sum_dropped_on_age_blockhash_age_slots: stats.sum_dropped_on_age_blockhash_age_slots,
             num_dropped_on_parsing_and_sanitization: stats.num_dropped_on_parsing_and_sanitization,
             num_dropped_on_lock_validation: stats.num_dropped_on_lock_validation,
             num_dropped_on_compute_budget: stats.num_dropped_on_compute_budget,
@@ -262,6 +292,9 @@ impl TransactionViewReceiveAndBuffer {
         let mut num_dropped_on_fee_payer = 0;
         let mut num_dropped_on_capacity = 0;
         let mut num_buffered = 0;
+        let mut num_dropped_on_age_unknown_blockhash = 0usize;
+        let mut max_dropped_on_age_blockhash_age_slots = 0u64;
+        let mut sum_dropped_on_age_blockhash_age_slots = 0u64;
 
         let mut check_and_push_to_queue =
             |container: &mut TransactionViewStateContainer,
@@ -292,6 +325,30 @@ impl TransactionViewReceiveAndBuffer {
                         match err {
                             TransactionError::BlockhashNotFound => {
                                 num_dropped_on_age += 1;
+                                // Look up how old the tx's blockhash is to
+                                // distinguish "clients are sending truly
+                                // ancient blockhashes (unknown / very old)"
+                                // from "client blockhash just passed the
+                                // ~150-slot window". `get_hash_age` returns
+                                // None if the hash is not in the bank's
+                                // blockhash queue at all.
+                                if let Some(tx) =
+                                    container.get_transaction(priority_id.id)
+                                {
+                                    match working_bank.get_hash_age(tx.recent_blockhash()) {
+                                        Some(age) => {
+                                            if age > max_dropped_on_age_blockhash_age_slots {
+                                                max_dropped_on_age_blockhash_age_slots = age;
+                                            }
+                                            sum_dropped_on_age_blockhash_age_slots =
+                                                sum_dropped_on_age_blockhash_age_slots
+                                                    .saturating_add(age);
+                                        }
+                                        None => {
+                                            num_dropped_on_age_unknown_blockhash += 1;
+                                        }
+                                    }
+                                }
                             }
                             TransactionError::AlreadyProcessed => {
                                 num_dropped_on_already_processed += 1;
@@ -407,6 +464,9 @@ impl TransactionViewReceiveAndBuffer {
             num_dropped_on_fee_payer,
             num_dropped_on_capacity,
             num_buffered,
+            num_dropped_on_age_unknown_blockhash,
+            max_dropped_on_age_blockhash_age_slots,
+            sum_dropped_on_age_blockhash_age_slots,
             receive_time_us: 0, // receive is outside this function
             buffer_time_us: start.elapsed().as_micros() as u64,
         }
@@ -664,6 +724,9 @@ mod tests {
         let ReceivingStats {
             num_received,
             num_total_packets_drained: _,
+            num_dropped_on_age_unknown_blockhash: _,
+            max_dropped_on_age_blockhash_age_slots: _,
+            sum_dropped_on_age_blockhash_age_slots: _,
             num_dropped_without_parsing,
             num_dropped_on_parsing_and_sanitization,
             num_dropped_on_lock_validation,
@@ -719,6 +782,9 @@ mod tests {
         let ReceivingStats {
             num_received,
             num_total_packets_drained: _,
+            num_dropped_on_age_unknown_blockhash: _,
+            max_dropped_on_age_blockhash_age_slots: _,
+            sum_dropped_on_age_blockhash_age_slots: _,
             num_dropped_without_parsing,
             num_dropped_on_parsing_and_sanitization,
             num_dropped_on_lock_validation,
@@ -763,6 +829,9 @@ mod tests {
         let ReceivingStats {
             num_received,
             num_total_packets_drained: _,
+            num_dropped_on_age_unknown_blockhash: _,
+            max_dropped_on_age_blockhash_age_slots: _,
+            sum_dropped_on_age_blockhash_age_slots: _,
             num_dropped_without_parsing,
             num_dropped_on_parsing_and_sanitization,
             num_dropped_on_lock_validation,
@@ -806,6 +875,9 @@ mod tests {
         let ReceivingStats {
             num_received,
             num_total_packets_drained: _,
+            num_dropped_on_age_unknown_blockhash: _,
+            max_dropped_on_age_blockhash_age_slots: _,
+            sum_dropped_on_age_blockhash_age_slots: _,
             num_dropped_without_parsing,
             num_dropped_on_parsing_and_sanitization,
             num_dropped_on_lock_validation,
@@ -854,6 +926,9 @@ mod tests {
         let ReceivingStats {
             num_received,
             num_total_packets_drained: _,
+            num_dropped_on_age_unknown_blockhash: _,
+            max_dropped_on_age_blockhash_age_slots: _,
+            sum_dropped_on_age_blockhash_age_slots: _,
             num_dropped_without_parsing,
             num_dropped_on_parsing_and_sanitization,
             num_dropped_on_lock_validation,
@@ -917,6 +992,9 @@ mod tests {
         let ReceivingStats {
             num_received,
             num_total_packets_drained: _,
+            num_dropped_on_age_unknown_blockhash: _,
+            max_dropped_on_age_blockhash_age_slots: _,
+            sum_dropped_on_age_blockhash_age_slots: _,
             num_dropped_without_parsing,
             num_dropped_on_parsing_and_sanitization,
             num_dropped_on_lock_validation,
@@ -965,6 +1043,9 @@ mod tests {
         let ReceivingStats {
             num_received,
             num_total_packets_drained: _,
+            num_dropped_on_age_unknown_blockhash: _,
+            max_dropped_on_age_blockhash_age_slots: _,
+            sum_dropped_on_age_blockhash_age_slots: _,
             num_dropped_without_parsing,
             num_dropped_on_parsing_and_sanitization,
             num_dropped_on_lock_validation,
@@ -1017,6 +1098,9 @@ mod tests {
         let ReceivingStats {
             num_received,
             num_total_packets_drained: _,
+            num_dropped_on_age_unknown_blockhash: _,
+            max_dropped_on_age_blockhash_age_slots: _,
+            sum_dropped_on_age_blockhash_age_slots: _,
             num_dropped_without_parsing,
             num_dropped_on_parsing_and_sanitization,
             num_dropped_on_lock_validation,
@@ -1097,6 +1181,9 @@ mod tests {
         let ReceivingStats {
             num_received,
             num_total_packets_drained: _,
+            num_dropped_on_age_unknown_blockhash: _,
+            max_dropped_on_age_blockhash_age_slots: _,
+            sum_dropped_on_age_blockhash_age_slots: _,
             num_dropped_without_parsing,
             num_dropped_on_parsing_and_sanitization,
             num_dropped_on_lock_validation,

@@ -604,6 +604,9 @@ where
                 num_dropped_on_fee_payer,
                 num_dropped_on_capacity,
                 num_buffered,
+                num_dropped_on_age_unknown_blockhash,
+                max_dropped_on_age_blockhash_age_slots,
+                sum_dropped_on_age_blockhash_age_slots,
                 receive_time_us: _,
                 buffer_time_us: _,
             } = &receiving_stats;
@@ -620,6 +623,16 @@ where
             count_metrics.num_dropped_on_receive_fee_payer += *num_dropped_on_fee_payer;
             count_metrics.num_dropped_on_capacity += *num_dropped_on_capacity;
             count_metrics.num_buffered += *num_buffered;
+            count_metrics.num_dropped_on_age_unknown_blockhash +=
+                *num_dropped_on_age_unknown_blockhash;
+            if *max_dropped_on_age_blockhash_age_slots
+                > count_metrics.max_dropped_on_age_blockhash_age_slots
+            {
+                count_metrics.max_dropped_on_age_blockhash_age_slots =
+                    *max_dropped_on_age_blockhash_age_slots;
+            }
+            count_metrics.sum_dropped_on_age_blockhash_age_slots +=
+                Saturating(*sum_dropped_on_age_blockhash_age_slots);
         });
 
         self.timing_metrics.update(|timing_metrics| {
