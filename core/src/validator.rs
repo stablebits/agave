@@ -1066,7 +1066,15 @@ impl Validator {
         } else {
             info!("Disabled banking trace");
         }
-        let banking_tracer_channels = banking_tracer.create_channels();
+        let banking_stage_feedback =
+            Arc::new(agave_banking_stage_ingress_types::BankingStageFeedback::default());
+        // Test-mode: bound the sigverify→scheduler (non-vote) channel at
+        // 500K and drop-on-full, with drop counts surfaced via feedback.
+        const BOUNDED_NON_VOTE_CAPACITY: usize = 500_000;
+        let banking_tracer_channels = banking_tracer.create_channels_with_bounded_non_vote(
+            BOUNDED_NON_VOTE_CAPACITY,
+            banking_stage_feedback.clone(),
+        );
 
         let scheduler_pool = DefaultSchedulerPool::new(
             config.unified_scheduler_handler_threads,
@@ -1662,6 +1670,7 @@ impl Validator {
             &staked_nodes,
             config.staked_nodes_overrides.clone(),
             banking_tracer_channels,
+            banking_stage_feedback,
             tracer_thread,
             tpu_quic_server_config,
             tpu_fwd_quic_server_config,

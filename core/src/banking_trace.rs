@@ -1,8 +1,10 @@
 use {
-    agave_banking_stage_ingress_types::{BankingPacketBatch, BankingPacketReceiver},
+    agave_banking_stage_ingress_types::{
+        BankingPacketBatch, BankingPacketReceiver, BankingStageFeedback,
+    },
     bincode::serialize_into,
     chrono::{DateTime, Local},
-    crossbeam_channel::{Receiver, SendError, Sender, TryRecvError, unbounded},
+    crossbeam_channel::{Receiver, SendError, Sender, TryRecvError, TrySendError, bounded, unbounded},
     rolling_file::{RollingCondition, RollingConditionBasic, RollingFileAppender},
     serde::{Deserialize, Serialize},
     solana_clock::Slot,
@@ -269,8 +271,56 @@ impl BankingTracer {
         }
     }
 
+    /// Test-mode variant: non-vote channel is `bounded(capacity)` with
+    /// drop-on-full via `feedback.add_channel_full_drops`. Vote channels
+    /// remain unbounded.
+    pub fn create_channels_with_bounded_non_vote(
+        &self,
+        capacity: usize,
+        feedback: Arc<BankingStageFeedback>,
+    ) -> Channels {
+        let (non_vote_sender, non_vote_receiver) =
+            self.create_channel_non_vote_bounded(capacity, feedback);
+
+        let (tpu_vote_sender, tpu_vote_receiver) =
+            Self::channel(ChannelLabel::TpuVote, self.active_tracer.as_ref().cloned());
+        let (gossip_vote_sender, gossip_vote_receiver) = Self::channel(
+            ChannelLabel::GossipVote,
+            self.active_tracer.as_ref().cloned(),
+        );
+
+        Channels {
+            non_vote_sender,
+            non_vote_receiver,
+            tpu_vote_sender,
+            tpu_vote_receiver,
+            gossip_vote_sender,
+            gossip_vote_receiver,
+        }
+    }
+
     pub fn create_channel_non_vote(&self) -> (BankingPacketSender, BankingPacketReceiver) {
         Self::channel(ChannelLabel::NonVote, self.active_tracer.as_ref().cloned())
+    }
+
+    /// Test-mode bounded variant of `create_channel_non_vote`. The sender
+    /// uses `try_send` and drops on full; the per-batch packet count of
+    /// dropped batches is accumulated in `feedback.channel_full_drops()`.
+    pub fn create_channel_non_vote_bounded(
+        &self,
+        capacity: usize,
+        feedback: Arc<BankingStageFeedback>,
+    ) -> (BankingPacketSender, BankingPacketReceiver) {
+        let (sender, receiver) = bounded(capacity);
+        (
+            TracedSender::new_with_drop_on_full(
+                ChannelLabel::NonVote,
+                sender,
+                self.active_tracer.as_ref().cloned(),
+                feedback,
+            ),
+            receiver,
+        )
     }
 
     pub fn channel_for_test() -> (TracedSender, Receiver<BankingPacketBatch>) {
@@ -359,6 +409,12 @@ pub struct TracedSender {
     label: ChannelLabel,
     sender: Sender<BankingPacketBatch>,
     active_tracer: Option<ActiveTracer>,
+    /// When `Some`, this sender uses `try_send` on the inner channel and
+    /// silently drops the batch on `TrySendError::Full`, bumping the
+    /// feedback's `channel_full_drops` counter by the total packet count of
+    /// the dropped batch. Used only for the test-mode bounded non-vote
+    /// channel; `None` preserves the legacy blocking-send behavior.
+    drop_on_full_feedback: Option<Arc<BankingStageFeedback>>,
 }
 
 impl TracedSender {
@@ -371,6 +427,21 @@ impl TracedSender {
             label,
             sender,
             active_tracer,
+            drop_on_full_feedback: None,
+        }
+    }
+
+    fn new_with_drop_on_full(
+        label: ChannelLabel,
+        sender: Sender<BankingPacketBatch>,
+        active_tracer: Option<ActiveTracer>,
+        feedback: Arc<BankingStageFeedback>,
+    ) -> Self {
+        Self {
+            label,
+            sender,
+            active_tracer,
+            drop_on_full_feedback: Some(feedback),
         }
     }
 
@@ -388,7 +459,19 @@ impl TracedSender {
                     })?;
             }
         }
-        self.sender.send(batch)
+        if let Some(feedback) = &self.drop_on_full_feedback {
+            match self.sender.try_send(batch) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(dropped)) => {
+                    let n: usize = dropped.iter().map(|b| b.len()).sum();
+                    feedback.add_channel_full_drops(n);
+                    Ok(())
+                }
+                Err(TrySendError::Disconnected(b)) => Err(SendError(b)),
+            }
+        } else {
+            self.sender.send(batch)
+        }
     }
 
     pub fn len(&self) -> usize {

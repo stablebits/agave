@@ -101,6 +101,10 @@ pub struct SchedulerCountMetricsInner {
     /// scheduler (e.g. manifesting as receive-age drops inside the
     /// scheduler).
     pub channel_in_flight_packets: usize,
+    /// Number of packets dropped because the (test-mode) bounded
+    /// sigverify→scheduler channel was full at send time. Delta per
+    /// reporting interval.
+    pub channel_full_drops: Saturating<u64>,
 }
 
 impl IntervalSchedulerCountMetrics {
@@ -156,6 +160,7 @@ impl SchedulerCountMetricsInner {
             rate_limiter_tokens_remaining,
             current_priority_fee_floor,
             channel_in_flight_packets,
+            channel_full_drops: Saturating(channel_full_drops),
         } = self;
         let mut datapoint = create_datapoint!(
             @point name,
@@ -212,7 +217,8 @@ impl SchedulerCountMetricsInner {
                 "channel_in_flight_packets",
                 channel_in_flight_packets,
                 i64
-            )
+            ),
+            ("channel_full_drops", channel_full_drops, i64)
         );
         if let Some(slot) = slot {
             datapoint.add_field_i64("slot", slot as i64);
@@ -253,6 +259,7 @@ impl SchedulerCountMetricsInner {
         self.rate_limiter_tokens_remaining = 0;
         self.current_priority_fee_floor = 0;
         self.channel_in_flight_packets = 0;
+        self.channel_full_drops = Saturating(0);
     }
 
     pub fn update_priority_stats(&mut self, min_max_fees: Option<(u64, u64)>) {

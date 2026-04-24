@@ -51,6 +51,11 @@ pub struct BankingStageFeedback {
     // bumps this immediately before send and compensates on send failure;
     // the scheduler decrements on drain and reads for reporting.
     in_flight_packets: AtomicUsize,
+    // Monotonic count of packets dropped because the bounded (test-mode)
+    // sigverify→scheduler channel was full at send time. Writer is the
+    // traced sender on `TrySendError::Full`; reader is the scheduler for
+    // reporting.
+    channel_full_drops: AtomicU64,
 }
 
 impl BankingStageFeedback {
@@ -123,5 +128,16 @@ impl BankingStageFeedback {
 
     pub fn in_flight_packets(&self) -> usize {
         self.in_flight_packets.load(Ordering::Relaxed)
+    }
+
+    // --- channel-full drop counter (test-mode bounded non-vote channel) -----
+
+    pub fn add_channel_full_drops(&self, n: usize) {
+        self.channel_full_drops
+            .fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    pub fn channel_full_drops(&self) -> u64 {
+        self.channel_full_drops.load(Ordering::Relaxed)
     }
 }

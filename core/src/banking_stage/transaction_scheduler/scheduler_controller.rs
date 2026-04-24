@@ -136,6 +136,9 @@ where
     /// Last observed value of `BankingStageFeedback::total_arrivals`,
     /// used to compute per-tick arrivals for the token bucket.
     prev_total_received: u64,
+    /// Last observed value of `BankingStageFeedback::channel_full_drops`,
+    /// used to compute per-interval deltas for the gauge.
+    prev_channel_full_drops: u64,
     /// Precomputed from config: buffer occupancy (absolute packets, i.e.
     /// `id_to_transaction_state.len()`) at which the AND-guard on saturation
     /// entry is satisfied. Uses buffer size rather than priority-queue size
@@ -198,6 +201,7 @@ where
             saturated: false,
             saturation_token_bucket,
             prev_total_received,
+            prev_channel_full_drops: 0,
             buffer_guard_threshold,
             desaturate_tokens_threshold,
         }
@@ -368,8 +372,13 @@ where
         // spotting upstream backpressure, and reported whether or not
         // the token bucket is enabled.
         let channel_in_flight_packets = self.feedback.in_flight_packets();
+        let channel_full_drops_total = self.feedback.channel_full_drops();
+        let channel_full_drops_delta =
+            channel_full_drops_total.saturating_sub(self.prev_channel_full_drops);
+        self.prev_channel_full_drops = channel_full_drops_total;
         self.count_metrics.update(|count_metrics| {
             count_metrics.channel_in_flight_packets = channel_in_flight_packets;
+            count_metrics.channel_full_drops += Saturating(channel_full_drops_delta);
         });
 
         let Some(bucket) = self.saturation_token_bucket.as_ref() else {
