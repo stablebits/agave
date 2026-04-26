@@ -18,7 +18,6 @@ use {
                 transaction_state_container::StateContainer,
             },
         },
-        priority_formula::calculate_simple_pf_priority,
         validator::SchedulerPacing,
     },
     agave_banking_stage_ingress_types::BankingStageFeedback,
@@ -288,7 +287,7 @@ where
             self.count_metrics.update(|count_metrics| {
                 count_metrics.update_priority_stats(priority_min_max);
             });
-            self.update_scheduler_saturation_feedback();
+            self.update_scheduler_saturation_feedback(priority_min_max);
             self.count_metrics
                 .maybe_report_and_reset_interval(should_report);
             self.timing_metrics
@@ -357,21 +356,24 @@ where
     /// bucket going empty under pressure is the primary "over-capacity"
     /// signal. It is AND-guarded with a minimum queue-occupancy check so
     /// that we only publish a floor when there is a meaningful set of
-    /// in-queue transactions to derive it from (otherwise the published
-    /// floor from a near-empty queue would be noise).
+    /// in-queue transactions to derive it from (otherwise the min priority
+    /// of a near-empty queue is arbitrary and the floor would be noise).
     ///
-    /// The published floor is the simple-formula priority of the
-    /// scheduler queue's min retained transaction (computed via
-    /// `calculate_simple_pf_priority`). Sigverify uses the same simple
-    /// formula on incoming packets, so the comparison is unit-consistent.
-    /// The simple formula is empirically more aggressive than the full
-    /// scheduler priority formula, which is the desired load-shedding
-    /// behavior under saturation.
+    /// The published floor is the **bank-context** priority of the
+    /// scheduler queue's min retained transaction. Sigverify compares
+    /// incoming packets against it using a deliberately mismatched simple
+    /// proxy (`priority_fee * 1_000_000 / compute_unit_limit`, see
+    /// `sigverify_stage::approximate_priority`). The systematic unit
+    /// mismatch — sigverify's proxy values are smaller than the bank-
+    /// context floor for typical txs — yields more aggressive load-
+    /// shedding than a unit-correct comparison would, which is what
+    /// keeps the scheduler from hitting `num_dropped_on_capacity` under
+    /// sustained load.
     ///
     /// When the bucket is replenished past half of its burst capacity and
     /// the queue stays below the guard, we clear the published floor so
     /// sigverify stops dropping.
-    fn update_scheduler_saturation_feedback(&mut self) {
+    fn update_scheduler_saturation_feedback(&mut self, priority_min_max: Option<(u64, u64)>) {
         // Observe the sigverify→scheduler channel depth every tick,
         // independent of the pf-floor feature. Useful on its own for
         // spotting upstream backpressure, and reported whether or not
@@ -406,22 +408,16 @@ where
         // scheduling and the priority queue is momentarily near-empty.
         let buffer_guard_met = self.container.buffer_size() >= self.buffer_guard_threshold;
 
-        let published_floor = self
-            .container
-            .get_min_priority_id()
-            .and_then(|priority_id| self.container.get_transaction(priority_id.id))
-            .and_then(calculate_simple_pf_priority);
-
         if self.saturated {
             // While saturated, refresh the floor from the queue's current
-            // min tx (priced via the simple formula sigverify also uses).
-            // If the priority queue is momentarily empty (heavy in-flight
-            // scheduling), keep the previous floor implicitly rather than
-            // clearing it — the buffer is still under pressure.
-            if let Some(floor) = published_floor {
-                self.feedback.set_priority_floor(floor);
+            // bank-context min priority each tick. If the priority queue
+            // is momentarily empty (heavy in-flight scheduling), keep the
+            // previous floor implicitly rather than clearing it — the
+            // buffer is still under pressure.
+            if let Some((min, _)) = priority_min_max {
+                self.feedback.set_priority_floor(min);
                 self.count_metrics.update(|count_metrics| {
-                    count_metrics.current_priority_fee_floor = floor;
+                    count_metrics.current_priority_fee_floor = min;
                 });
             }
             // Exit hysteresis: bucket refilled past threshold, or buffer
@@ -432,10 +428,10 @@ where
             }
         } else if over_budget > 0 && buffer_guard_met {
             self.saturated = true;
-            if let Some(floor) = published_floor {
-                self.feedback.set_priority_floor(floor);
+            if let Some((min, _)) = priority_min_max {
+                self.feedback.set_priority_floor(min);
                 self.count_metrics.update(|count_metrics| {
-                    count_metrics.current_priority_fee_floor = floor;
+                    count_metrics.current_priority_fee_floor = min;
                 });
             }
         }
