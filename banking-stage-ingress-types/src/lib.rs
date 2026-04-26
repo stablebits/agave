@@ -15,10 +15,11 @@ pub type BankingPacketReceiver = Receiver<BankingPacketBatch>;
 /// sigverify stage. Carries two complementary signals across the boundary:
 ///
 /// - **Saturation floor** (scheduler → sigverify). When the scheduler is
-///   saturated, it publishes the sigverify-space priority of the current
-///   scheduler-min retained transaction. Sigverify reads this and cheaply
-///   drops at-or-below-floor transactions before signature verification.
-///   `0` means "not saturated."
+///   saturated, it publishes the bank-context priority of its queue-min
+///   transaction. Sigverify reads this and cheaply drops below-floor
+///   transactions before signature verification using a deliberately
+///   simpler approximation that is empirically more aggressive than a
+///   unit-correct comparison would be. `0` means "not saturated."
 ///
 /// - **Arrivals counter** (sigverify → scheduler). Sigverify bumps a
 ///   monotonic counter on each successful send to the banking channel. The
@@ -41,8 +42,8 @@ pub type BankingPacketReceiver = Receiver<BankingPacketBatch>;
 /// `SigVerifyStage`.
 #[derive(Debug, Default)]
 pub struct BankingStageFeedback {
-    // `0` means "not saturated"; published sigverify-space floors are
-    // expected to be strictly positive in practice.
+    // `0` means "not saturated"; published priority floors are expected
+    // to be strictly positive in practice.
     priority_floor: AtomicU64,
     // Monotonic (never wraps in the lifetime of a validator process). Writer
     // is sigverify; reader is the scheduler.
