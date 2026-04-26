@@ -233,7 +233,7 @@ pub(crate) fn apply_priority_floor(batches: &mut Vec<PacketBatch>, floor: u64) -
                 continue;
             };
             match approximate_priority(data) {
-                Some(priority) if priority < floor => {
+                Some(priority) if priority <= floor => {
                     packet.meta_mut().set_discard(true);
                     dropped = dropped.saturating_add(1);
                 }
