@@ -5,10 +5,7 @@
 //! transaction. All processing is done on the CPU by default.
 
 use {
-    crate::{
-        priority_formula::{FeeContext, calculate_priority_and_cost},
-        sigverify::TransactionSigVerifier,
-    },
+    crate::{priority_formula::calculate_pf_drop_priority, sigverify::TransactionSigVerifier},
     agave_banking_stage_ingress_types::BankingStageFeedback,
     agave_transaction_view::transaction_view::SanitizedTransactionView,
     core::time::Duration,
@@ -18,15 +15,13 @@ use {
         deduper::{self, Deduper},
         packet::{PacketBatch, PacketFlags},
     },
-    solana_runtime_transaction::{
-        runtime_transaction::RuntimeTransaction, transaction_meta::TransactionMeta,
-    },
+    solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
     solana_streamer::streamer::{self, StreamerError},
     solana_time_utils as timing,
     solana_transaction::sanitized::MessageHash,
     std::{
         sync::{
-            Arc, LazyLock,
+            Arc,
             atomic::{AtomicUsize, Ordering},
         },
         thread::{self, Builder, JoinHandle},
@@ -34,13 +29,6 @@ use {
     },
     thiserror::Error,
 };
-
-// Mainnet-defaults context for the pf-floor priority approximation.
-// `feature_set = all_enabled` keeps the parse step at most as permissive
-// as the live bank; `lamports_per_signature` and `burn_percent` track
-// stable mainnet constants. Mismatches against an actual non-mainnet
-// bank are bounded and load-shedding-only.
-static MAINNET_FEE_CONTEXT: LazyLock<FeeContext> = LazyLock::new(FeeContext::mainnet_defaults);
 
 #[derive(Error, Debug)]
 pub enum SigVerifyServiceError {
@@ -202,15 +190,13 @@ impl SigVerifierStats {
 /// invalid).
 pub(crate) fn approximate_priority(data: &[u8]) -> Option<u64> {
     let view = SanitizedTransactionView::try_new_sanitized(data, true).ok()?;
-    let runtime_tx =
-        RuntimeTransaction::<SanitizedTransactionView<_>>::try_new(view, MessageHash::Compute, None)
-            .ok()?;
-    let config = runtime_tx
-        .transaction_configuration(&MAINNET_FEE_CONTEXT.feature_set)
-        .ok()?;
-    let (priority, _cost) =
-        calculate_priority_and_cost(&runtime_tx, &config, &MAINNET_FEE_CONTEXT);
-    Some(priority)
+    let runtime_tx = RuntimeTransaction::<SanitizedTransactionView<_>>::try_new(
+        view,
+        MessageHash::Compute,
+        None,
+    )
+    .ok()?;
+    calculate_pf_drop_priority(&runtime_tx)
 
     // --- Previous (simple) formula, kept commented for quick revert.
     // Returned `compute_unit_price_in_microlamports`, i.e. priority_fee
@@ -222,9 +208,9 @@ pub(crate) fn approximate_priority(data: &[u8]) -> Option<u64> {
 }
 
 /// Apply the scheduler's published priority floor to freshly-received
-/// batches. Below-floor packets are marked `discard`; a batch is removed
+/// batches. At-or-below-floor packets are marked `discard`; a batch is removed
 /// from the outer `Vec` entirely when no packets survive (which covers the
-/// `PacketBatch::Single` below-floor case uniformly and also reclaims
+/// `PacketBatch::Single` dropped case uniformly and also reclaims
 /// multi-packet batches whose packets all got dropped).
 ///
 /// Returns the number of packets newly dropped.
@@ -251,7 +237,7 @@ pub(crate) fn apply_priority_floor(batches: &mut Vec<PacketBatch>, floor: u64) -
                 continue;
             };
             match approximate_priority(data) {
-                Some(priority) if priority < floor => {
+                Some(priority) if priority <= floor => {
                     packet.meta_mut().set_discard(true);
                     dropped = dropped.saturating_add(1);
                 }
@@ -295,8 +281,8 @@ impl SigVerifyStage {
 
         // Apply the scheduler's priority floor *at dequeue*, before dedup and
         // sig verification. For Single batches (QUIC-TPU's shape) this
-        // removes below-floor packets from the outer vec entirely, relieving
-        // both CPU and the sigverify→banking channel downstream.
+        // removes at-or-below-floor packets from the outer vec entirely,
+        // relieving both CPU and the sigverify→banking channel downstream.
         //
         // `num_packets` tracks packets that continue through the pipeline;
         // `num_packets_received` is preserved for the received-count stats so

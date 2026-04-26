@@ -104,6 +104,8 @@ pub(crate) trait StateContainer<Tx: TransactionWithMeta> {
 
     fn flush_held_transactions(&mut self);
 
+    fn get_min_priority_id(&self) -> Option<TransactionPriorityId>;
+
     fn get_min_max_priority(&self) -> Option<(u64, u64)>;
 
     /// Return an iterator over priority IDs strictly below `cursor` in descending order,
@@ -205,6 +207,10 @@ impl<Tx: TransactionWithMeta> StateContainer<Tx> for TransactionStateContainer<T
         let max = self.priority_queue.last().unwrap().priority;
 
         Some((min, max))
+    }
+
+    fn get_min_priority_id(&self) -> Option<TransactionPriorityId> {
+        self.priority_queue.first().copied()
     }
 
     fn recheck_iter(
@@ -369,6 +375,11 @@ impl StateContainer<RuntimeTransactionView> for TransactionViewStateContainer {
     #[inline]
     fn flush_held_transactions(&mut self) {
         self.inner.flush_held_transactions();
+    }
+
+    #[inline]
+    fn get_min_priority_id(&self) -> Option<TransactionPriorityId> {
+        self.inner.get_min_priority_id()
     }
 
     #[inline]

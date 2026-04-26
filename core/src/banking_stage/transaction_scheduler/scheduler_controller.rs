@@ -18,11 +18,12 @@ use {
                 transaction_state_container::StateContainer,
             },
         },
+        priority_formula::calculate_pf_drop_priority,
         validator::SchedulerPacing,
     },
+    agave_banking_stage_ingress_types::BankingStageFeedback,
     solana_clock::DEFAULT_MS_PER_SLOT,
     solana_cost_model::cost_tracker::SharedBlockCost,
-    agave_banking_stage_ingress_types::BankingStageFeedback,
     solana_measure::measure_us,
     solana_net_utils::token_bucket::TokenBucket,
     solana_runtime::bank_forks::SharableBanks,
@@ -123,7 +124,8 @@ where
     /// Recheck IDs scratch space.
     recheck_chunk: Vec<TransactionPriorityId>,
     /// Shared feedback with sigverify: the scheduler publishes a priority
-    /// floor (read by sigverify to drop below-floor txs) and reads a
+    /// floor in sigverify's comparison space (read by sigverify to drop
+    /// at-or-below-floor txs) and reads a
     /// monotonic arrivals counter (written by sigverify) to drive the token
     /// bucket.
     feedback: Arc<BankingStageFeedback>,
@@ -176,9 +178,8 @@ where
             )
         });
         let prev_total_received = feedback.total_arrivals();
-        let buffer_guard_threshold = TOTAL_BUFFERED_PACKETS
-            .saturating_mul(config.saturation_min_queue_pct as usize)
-            / 100;
+        let buffer_guard_threshold =
+            TOTAL_BUFFERED_PACKETS.saturating_mul(config.saturation_min_queue_pct as usize) / 100;
         let desaturate_tokens_threshold = config.token_bucket_burst.saturating_div(2);
         Self {
             exit,
@@ -287,7 +288,7 @@ where
             self.count_metrics.update(|count_metrics| {
                 count_metrics.update_priority_stats(priority_min_max);
             });
-            self.update_scheduler_saturation_feedback(priority_min_max);
+            self.update_scheduler_saturation_feedback();
             self.count_metrics
                 .maybe_report_and_reset_interval(should_report);
             self.timing_metrics
@@ -356,13 +357,13 @@ where
     /// bucket going empty under pressure is the primary "over-capacity"
     /// signal. It is AND-guarded with a minimum queue-occupancy check so
     /// that we only publish a floor when there is a meaningful set of
-    /// in-queue transactions to derive it from (otherwise the min priority
-    /// of a near-empty queue is arbitrary and the floor would be noise).
+    /// in-queue transactions to derive it from (otherwise the published
+    /// floor from a near-empty queue would be noise).
     ///
     /// When the bucket is replenished past half of its burst capacity and
     /// the queue stays below the guard, we clear the published floor so
     /// sigverify stops dropping.
-    fn update_scheduler_saturation_feedback(&mut self, priority_min_max: Option<(u64, u64)>) {
+    fn update_scheduler_saturation_feedback(&mut self) {
         // Observe the sigverify→scheduler channel depth every tick,
         // independent of the pf-floor feature. Useful on its own for
         // spotting upstream backpressure, and reported whether or not
@@ -397,20 +398,23 @@ where
         // scheduling and the priority queue is momentarily near-empty.
         let buffer_guard_met = self.container.buffer_size() >= self.buffer_guard_threshold;
 
+        let published_floor = self
+            .container
+            .get_min_priority_id()
+            .and_then(|priority_id| self.container.get_transaction(priority_id.id))
+            .and_then(calculate_pf_drop_priority);
+
         if self.saturated {
-            // While saturated, track any drift in the queue's min priority
-            // each tick — low-priority txs getting scheduled raise the min
-            // of the remaining backlog, and the published floor should
-            // follow. Relaxed atomic store, effectively free.
-            //
-            // If the priority queue is momentarily empty (heavy in-flight
-            // scheduling), we keep the previously-published floor implicitly
-            // (no overwrite) rather than clearing it — the buffer is still
-            // under pressure.
-            if let Some((min, _)) = priority_min_max {
-                self.feedback.set_priority_floor(min);
+            // While saturated, keep publishing a floor that is derived from
+            // the current scheduler-min retained transaction, but expressed
+            // in sigverify's own comparison space. If the priority queue is
+            // momentarily empty (heavy in-flight scheduling), keep the
+            // previous floor implicitly rather than clearing it — the buffer
+            // is still under pressure.
+            if let Some(floor) = published_floor {
+                self.feedback.set_priority_floor(floor);
                 self.count_metrics.update(|count_metrics| {
-                    count_metrics.current_priority_fee_floor = min;
+                    count_metrics.current_priority_fee_floor = floor;
                 });
             }
             // Exit hysteresis: bucket refilled past threshold, or buffer
@@ -421,10 +425,10 @@ where
             }
         } else if over_budget > 0 && buffer_guard_met {
             self.saturated = true;
-            if let Some((min, _)) = priority_min_max {
-                self.feedback.set_priority_floor(min);
+            if let Some(floor) = published_floor {
+                self.feedback.set_priority_floor(floor);
                 self.count_metrics.update(|count_metrics| {
-                    count_metrics.current_priority_fee_floor = min;
+                    count_metrics.current_priority_fee_floor = floor;
                 });
             }
         }

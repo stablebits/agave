@@ -17,7 +17,7 @@ use {
     solana_runtime::bank::Bank,
     solana_runtime_transaction::transaction_meta::{TransactionConfiguration, TransactionMeta},
     solana_svm_transaction::svm_message::SVMStaticMessage,
-    std::sync::Arc,
+    std::sync::{Arc, LazyLock},
 };
 
 /// Bank-state inputs needed by [`calculate_priority_and_cost`]. Lets
@@ -53,6 +53,9 @@ impl FeeContext {
         }
     }
 }
+
+/// Constants snapshot used by sigverify's pf-floor proxy metric.
+pub static MAINNET_FEE_CONTEXT: LazyLock<FeeContext> = LazyLock::new(FeeContext::mainnet_defaults);
 
 /// Calculate priority and cost for a transaction.
 ///
@@ -101,6 +104,26 @@ pub fn calculate_priority_and_cost<Tx: TransactionMeta + SVMStaticMessage>(
     )
 }
 
+/// Calculate the pf-floor proxy priority used by sigverify.
+///
+/// This intentionally runs the shared formula against
+/// [`MAINNET_FEE_CONTEXT`] instead of a live bank snapshot so the scheduler
+/// can publish the floor in the same comparison space sigverify uses for
+/// pre-verification drops.
+pub fn calculate_pf_drop_priority<Tx: TransactionMeta + SVMStaticMessage>(
+    transaction: &Tx,
+) -> Option<u64> {
+    let transaction_configuration = transaction
+        .transaction_configuration(&MAINNET_FEE_CONTEXT.feature_set)
+        .ok()?;
+    let (priority, _cost) = calculate_priority_and_cost(
+        transaction,
+        &transaction_configuration,
+        &MAINNET_FEE_CONTEXT,
+    );
+    Some(priority)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,15 +146,12 @@ mod tests {
     /// per-bank, this and the bank-side accessor need to update together.
     #[test]
     fn from_bank_uses_default_burn_percent() {
-        use solana_runtime::{
-            bank::Bank, genesis_utils::create_genesis_config_with_leader,
-        };
         use solana_keypair::Keypair;
+        use solana_runtime::{bank::Bank, genesis_utils::create_genesis_config_with_leader};
         use solana_signer::Signer;
         let genesis_info =
             create_genesis_config_with_leader(1_000_000_000, &Keypair::new().pubkey(), 1);
-        let (bank, _bank_forks) =
-            Bank::new_with_bank_forks_for_tests(&genesis_info.genesis_config);
+        let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_info.genesis_config);
         assert_eq!(
             FeeContext::from_bank(&bank).burn_percent,
             solana_fee_calculator::DEFAULT_BURN_PERCENT as u64,
