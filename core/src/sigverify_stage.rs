@@ -5,7 +5,9 @@
 //! transaction. All processing is done on the CPU by default.
 
 use {
-    crate::{priority_formula::calculate_pf_drop_priority, sigverify::TransactionSigVerifier},
+    crate::{
+        priority_formula::calculate_simple_pf_priority, sigverify::TransactionSigVerifier,
+    },
     agave_banking_stage_ingress_types::BankingStageFeedback,
     agave_transaction_view::transaction_view::SanitizedTransactionView,
     core::time::Duration,
@@ -178,12 +180,14 @@ impl SigVerifierStats {
 
 /// Approximate banking-stage priority for a packet from its raw bytes.
 ///
-/// Calls into the same `calculate_priority_and_cost` the scheduler uses,
-/// supplied with a constants-only [`FeeContext`]
-/// ([`FeeContext::mainnet_defaults`]). The arithmetic is identical;
-/// inputs (`feature_set`, `lamports_per_signature`, `burn_percent`)
-/// diverge from a live bank in non-mainnet contexts. Documented and
-/// load-shedding-only — never affects correctness of accepted txs.
+/// Delegates to [`calculate_simple_pf_priority`], which returns
+/// `priority_fee_lamports * 1_000_000 / compute_unit_limit`. The
+/// scheduler publishes the floor using the same simple formula on its
+/// queue-min tx, so the comparison is unit-consistent. The simple
+/// shape is empirically more aggressive than the full priority formula
+/// — desired load-shedding behavior. The full-formula alternative
+/// ([`crate::priority_formula::calculate_pf_drop_priority`]) is kept
+/// for future use.
 ///
 /// Returns `None` if the packet cannot be parsed; callers should leave
 /// such packets alone (they will be rejected downstream if genuinely
@@ -196,15 +200,7 @@ pub(crate) fn approximate_priority(data: &[u8]) -> Option<u64> {
         None,
     )
     .ok()?;
-    calculate_pf_drop_priority(&runtime_tx)
-
-    // --- Previous (simple) formula, kept commented for quick revert.
-    // Returned `compute_unit_price_in_microlamports`, i.e. priority_fee
-    // ignoring the base-fee reward and using compute_unit_limit (not
-    // CostModel::calculate_cost) for cost. Diverged from the scheduler's
-    // priority calculation in two ways at once; replaced after review.
-    //
-    // Some(config.compute_unit_price_in_microlamports())
+    calculate_simple_pf_priority(&runtime_tx)
 }
 
 /// Apply the scheduler's published priority floor to freshly-received
@@ -237,7 +233,7 @@ pub(crate) fn apply_priority_floor(batches: &mut Vec<PacketBatch>, floor: u64) -
                 continue;
             };
             match approximate_priority(data) {
-                Some(priority) if priority <= floor => {
+                Some(priority) if priority < floor => {
                     packet.meta_mut().set_discard(true);
                     dropped = dropped.saturating_add(1);
                 }

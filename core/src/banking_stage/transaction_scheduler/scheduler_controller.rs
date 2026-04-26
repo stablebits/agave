@@ -18,7 +18,7 @@ use {
                 transaction_state_container::StateContainer,
             },
         },
-        priority_formula::calculate_pf_drop_priority,
+        priority_formula::calculate_simple_pf_priority,
         validator::SchedulerPacing,
     },
     agave_banking_stage_ingress_types::BankingStageFeedback,
@@ -364,6 +364,14 @@ where
     /// in-queue transactions to derive it from (otherwise the published
     /// floor from a near-empty queue would be noise).
     ///
+    /// The published floor is the simple-formula priority of the
+    /// scheduler queue's min retained transaction (computed via
+    /// `calculate_simple_pf_priority`). Sigverify uses the same simple
+    /// formula on incoming packets, so the comparison is unit-consistent.
+    /// The simple formula is empirically more aggressive than the full
+    /// scheduler priority formula, which is the desired load-shedding
+    /// behavior under saturation.
+    ///
     /// When the bucket is replenished past half of its burst capacity and
     /// the queue stays below the guard, we clear the published floor so
     /// sigverify stops dropping.
@@ -425,15 +433,14 @@ where
             .container
             .get_min_priority_id()
             .and_then(|priority_id| self.container.get_transaction(priority_id.id))
-            .and_then(calculate_pf_drop_priority);
+            .and_then(calculate_simple_pf_priority);
 
         if self.saturated {
-            // While saturated, keep publishing a floor that is derived from
-            // the current scheduler-min retained transaction, but expressed
-            // in sigverify's own comparison space. If the priority queue is
-            // momentarily empty (heavy in-flight scheduling), keep the
-            // previous floor implicitly rather than clearing it — the buffer
-            // is still under pressure.
+            // While saturated, refresh the floor from the queue's current
+            // min tx (priced via the simple formula sigverify also uses).
+            // If the priority queue is momentarily empty (heavy in-flight
+            // scheduling), keep the previous floor implicitly rather than
+            // clearing it — the buffer is still under pressure.
             if let Some(floor) = published_floor {
                 self.feedback.set_priority_floor(floor);
                 self.count_metrics.update(|count_metrics| {
