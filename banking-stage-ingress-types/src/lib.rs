@@ -15,9 +15,10 @@ pub type BankingPacketReceiver = Receiver<BankingPacketBatch>;
 /// sigverify stage. Carries two complementary signals across the boundary:
 ///
 /// - **Saturation floor** (scheduler → sigverify). When the scheduler is
-///   saturated, it publishes the minimum priority currently admitted to its
-///   queue. Sigverify reads this and cheaply drops below-floor transactions
-///   before signature verification. `0` means "not saturated."
+///   saturated, it publishes the sigverify-space priority of the current
+///   scheduler-min retained transaction. Sigverify reads this and cheaply
+///   drops at-or-below-floor transactions before signature verification.
+///   `0` means "not saturated."
 ///
 /// - **Arrivals counter** (sigverify → scheduler). Sigverify bumps a
 ///   monotonic counter on each successful send to the banking channel. The
@@ -40,7 +41,7 @@ pub type BankingPacketReceiver = Receiver<BankingPacketBatch>;
 /// `SigVerifyStage`.
 #[derive(Debug, Default)]
 pub struct BankingStageFeedback {
-    // `0` means "not saturated"; published scheduler priority floors are
+    // `0` means "not saturated"; published sigverify-space floors are
     // expected to be strictly positive in practice.
     priority_floor: AtomicU64,
     // Monotonic (never wraps in the lifetime of a validator process). Writer
@@ -75,7 +76,7 @@ impl BankingStageFeedback {
     // --- priority floor (scheduler writes, sigverify reads) -----------------
 
     pub fn set_priority_floor(&self, floor: u64) {
-        debug_assert!(floor > 0, "scheduler priority floor must be positive");
+        debug_assert!(floor > 0, "published priority floor must be positive");
         self.priority_floor.store(floor, Ordering::Relaxed);
     }
 
@@ -99,8 +100,7 @@ impl BankingStageFeedback {
     /// arithmetic domain (monotonic counter that must not wrap for the
     /// lifetime of a validator process).
     pub fn add_arrivals(&self, n: usize) {
-        self.total_arrivals
-            .fetch_add(n as u64, Ordering::Relaxed);
+        self.total_arrivals.fetch_add(n as u64, Ordering::Relaxed);
     }
 
     pub fn total_arrivals(&self) -> u64 {

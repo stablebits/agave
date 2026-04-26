@@ -91,9 +91,9 @@ pub struct SchedulerCountMetricsInner {
     /// remaining in the rate limiter). Emitted as a gauge for observability
     /// and tuning of the pf-floor mechanism.
     pub rate_limiter_tokens_remaining: u64,
-    /// Most recently published scheduler priority-fee floor in the interval.
-    /// 0 means no floor was published (i.e. scheduler was not saturated or
-    /// pf-floor is disabled).
+    /// Most recently published pf-floor in the interval, expressed in
+    /// sigverify's comparison space. 0 means no floor was published
+    /// (i.e. scheduler was not saturated or pf-floor is disabled).
     pub current_priority_fee_floor: u64,
     /// Depth of the sigverify→scheduler unbounded channel, in valid
     /// packets, as of the last saturation-feedback tick. Reported as a
