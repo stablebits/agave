@@ -15,16 +15,17 @@ pub type BankingPacketReceiver = Receiver<BankingPacketBatch>;
 /// sigverify stage. Carries two complementary signals across the boundary:
 ///
 /// - **Saturation floor** (scheduler → sigverify). When the scheduler is
-///   saturated, it publishes a coarse priority proxy
-///   (`priority_fee_lamports * 1_000_000 / compute_unit_limit`,
-///   computed via `priority_formula::calculate_simple_pf_priority`)
-///   of its queue-min transaction. Sigverify computes the same proxy
-///   for incoming packets and cheaply drops at-or-below-floor
-///   transactions before signature verification. The proxy is
-///   coarser than the scheduler's full priority formula on purpose —
-///   collisions on equal proxy values are common, and the at-or-
-///   below cutoff turns those into upstream drops instead of
-///   scheduler capacity drops. `0` means "not saturated."
+///   saturated, it publishes the bank-context priority of its queue-min
+///   transaction. Sigverify reads this and cheaply drops below-floor
+///   transactions before signature verification using a deliberately
+///   simpler proxy (`priority_fee * 1_000_000 / compute_unit_limit`,
+///   see `priority_formula::calculate_simple_pf_priority`). The two
+///   sides are intentionally NOT in the same units: sigverify's proxy
+///   tends to be smaller than the bank-context floor for typical txs,
+///   so the comparison drops more aggressively than a unit-correct
+///   one would. That's the desired load-shedding behavior — keeps the
+///   scheduler from hitting `num_dropped_on_capacity` under sustained
+///   load. `0` means "not saturated."
 ///
 /// - **Arrivals counter** (sigverify → scheduler). Sigverify bumps a
 ///   monotonic counter on each successful send to the banking channel. The

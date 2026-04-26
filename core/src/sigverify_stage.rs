@@ -204,9 +204,9 @@ pub(crate) fn approximate_priority(data: &[u8]) -> Option<u64> {
 }
 
 /// Apply the scheduler's published priority floor to freshly-received
-/// batches. At-or-below-floor packets are marked `discard`; a batch is removed
+/// batches. Below-floor packets are marked `discard`; a batch is removed
 /// from the outer `Vec` entirely when no packets survive (which covers the
-/// `PacketBatch::Single` dropped case uniformly and also reclaims
+/// `PacketBatch::Single` below-floor case uniformly and also reclaims
 /// multi-packet batches whose packets all got dropped).
 ///
 /// Returns the number of packets newly dropped.
@@ -233,7 +233,7 @@ pub(crate) fn apply_priority_floor(batches: &mut Vec<PacketBatch>, floor: u64) -
                 continue;
             };
             match approximate_priority(data) {
-                Some(priority) if priority <= floor => {
+                Some(priority) if priority < floor => {
                     packet.meta_mut().set_discard(true);
                     dropped = dropped.saturating_add(1);
                 }
@@ -283,8 +283,8 @@ impl SigVerifyStage {
 
         // Apply the scheduler's priority floor *at dequeue*, before dedup and
         // sig verification. For Single batches (QUIC-TPU's shape) this
-        // removes at-or-below-floor packets from the outer vec entirely,
-        // relieving both CPU and the sigverify→banking channel downstream.
+        // removes below-floor packets from the outer vec entirely, relieving
+        // both CPU and the sigverify→banking channel downstream.
         //
         // `num_packets` tracks packets that continue through the pipeline;
         // `num_packets_received` is preserved for the received-count stats so
