@@ -18,6 +18,7 @@ use {
                 transaction_state_container::StateContainer,
             },
         },
+        priority_formula::calculate_simple_pf_priority,
         validator::SchedulerPacing,
     },
     agave_banking_stage_ingress_types::BankingStageFeedback,
@@ -52,6 +53,24 @@ pub const DEFAULT_TOKEN_BUCKET_BURST: u64 = 25_000;
 /// floor when the queue is near-empty (the min priority of a tiny set of
 /// stragglers is noise, not signal).
 pub const DEFAULT_SATURATION_MIN_QUEUE_PCT: u8 = 90;
+
+/// Adaptive pf-floor multiplier bounds. The published floor is
+/// `simple_priority(queue_min) * pf_floor_k`. `K_MIN = 1.0` keeps the floor
+/// from ever falling below queue-min (publishing below queue-min is pointless
+/// — those txs already survive the scheduler's eviction). `K_MAX` caps
+/// overshoot when arrival load exceeds anything sigverify can shed by
+/// priority alone.
+const K_MIN: f32 = 1.0;
+const K_MAX: f32 = 5.0;
+/// Per-tick adjustments to `pf_floor_k`. Asymmetric on purpose: faster up
+/// (shed quickly when scheduler is still hitting capacity drops) than down
+/// (avoid oscillation around equilibrium).
+const K_STEP_UP: f32 = 0.05;
+const K_STEP_DOWN: f32 = 0.005;
+/// On re-saturation, jump-start `pf_floor_k` this far below the previously
+/// converged value rather than climbing from `K_MIN` again. Leaves room for
+/// the controller to re-discover equilibrium without overshooting.
+const K_REENTRY_BACKOFF: f32 = 0.5;
 
 #[derive(Clone)]
 pub struct SchedulerConfig {
@@ -147,6 +166,20 @@ where
     /// Precomputed from config: token-bucket level at which saturation
     /// de-asserts (hysteresis), currently `token_bucket_burst / 2`.
     desaturate_tokens_threshold: u64,
+    /// Adaptive multiplier applied to the simple-priority of the queue-min
+    /// tx when publishing the pf-floor. Climbs while the scheduler is still
+    /// hitting `num_dropped_on_capacity` (sigverify isn't shedding enough),
+    /// decays while saturated but no longer overflowing. Always within
+    /// `[K_MIN, K_MAX]`.
+    pf_floor_k: f32,
+    /// Last `pf_floor_k` value at desaturation. Used to jump-start the next
+    /// saturation episode (minus `K_REENTRY_BACKOFF`) so the controller
+    /// doesn't have to re-climb from `K_MIN` each time.
+    last_converged_k: f32,
+    /// Capacity drops accumulated since the last
+    /// `update_scheduler_saturation_feedback` tick. Drives `pf_floor_k`
+    /// adaptation; reset to 0 each tick.
+    tick_num_dropped_on_capacity: u64,
 }
 
 impl<R, S> SchedulerController<R, S>
@@ -200,6 +233,9 @@ where
             prev_total_received,
             buffer_guard_threshold,
             desaturate_tokens_threshold,
+            pf_floor_k: K_MIN,
+            last_converged_k: K_MIN,
+            tick_num_dropped_on_capacity: 0,
         }
     }
 
@@ -287,7 +323,7 @@ where
             self.count_metrics.update(|count_metrics| {
                 count_metrics.update_priority_stats(priority_min_max);
             });
-            self.update_scheduler_saturation_feedback(priority_min_max);
+            self.update_scheduler_saturation_feedback();
             self.count_metrics
                 .maybe_report_and_reset_interval(should_report);
             self.timing_metrics
@@ -359,21 +395,21 @@ where
     /// in-queue transactions to derive it from (otherwise the min priority
     /// of a near-empty queue is arbitrary and the floor would be noise).
     ///
-    /// The published floor is the **bank-context** priority of the
-    /// scheduler queue's min retained transaction. Sigverify compares
-    /// incoming packets against it using a deliberately mismatched simple
-    /// proxy (`priority_fee * 1_000_000 / compute_unit_limit`, see
-    /// `sigverify_stage::approximate_priority`). The systematic unit
-    /// mismatch — sigverify's proxy values are smaller than the bank-
-    /// context floor for typical txs — yields more aggressive load-
-    /// shedding than a unit-correct comparison would, which is what
-    /// keeps the scheduler from hitting `num_dropped_on_capacity` under
-    /// sustained load.
+    /// **Published floor:** `simple_priority(queue_min_tx) * pf_floor_k`,
+    /// where `simple_priority` is the same shape sigverify uses for its
+    /// per-packet check (see `priority_formula::calculate_simple_pf_priority`)
+    /// — i.e. the comparison is unit-consistent on both sides. `pf_floor_k`
+    /// is an adaptive multiplier that climbs while the scheduler is still
+    /// dropping on capacity (sigverify isn't shedding enough) and decays
+    /// while saturated but no longer overflowing. Anchoring on queue-min
+    /// keeps the floor bounded by what's actually in the queue; the
+    /// multiplier provides aggressiveness when needed.
     ///
-    /// When the bucket is replenished past half of its burst capacity and
-    /// the queue stays below the guard, we clear the published floor so
-    /// sigverify stops dropping.
-    fn update_scheduler_saturation_feedback(&mut self, priority_min_max: Option<(u64, u64)>) {
+    /// When the bucket is replenished past half of its burst capacity (or
+    /// the buffer drains below the guard), we clear the published floor and
+    /// cache the converged `k` so the next saturation episode can jump-start
+    /// near it rather than climbing from `K_MIN`.
+    fn update_scheduler_saturation_feedback(&mut self) {
         // Observe the sigverify→scheduler channel depth every tick,
         // independent of the pf-floor feature. Useful on its own for
         // spotting upstream backpressure, and reported whether or not
@@ -397,6 +433,10 @@ where
         let over_budget = arrivals.saturating_sub(consumed);
         let current_tokens = bucket.current_tokens();
 
+        // Drain per-tick capacity drops accumulated by `receive_and_buffer_packets`.
+        // Used as the error signal for the adaptive `pf_floor_k`.
+        let tick_drops = std::mem::take(&mut self.tick_num_dropped_on_capacity);
+
         // Record observability metrics regardless of saturation state.
         self.count_metrics.update(|count_metrics| {
             count_metrics.rate_limiter_tokens_remaining = current_tokens;
@@ -409,32 +449,59 @@ where
         let buffer_guard_met = self.container.buffer_size() >= self.buffer_guard_threshold;
 
         if self.saturated {
-            // While saturated, refresh the floor from the queue's current
-            // bank-context min priority each tick. If the priority queue
-            // is momentarily empty (heavy in-flight scheduling), keep the
-            // previous floor implicitly rather than clearing it — the
-            // buffer is still under pressure.
-            if let Some((min, _)) = priority_min_max {
-                self.feedback.set_priority_floor(min);
+            // Adapt k: capacity drops mean sigverify isn't shedding enough,
+            // bump up; otherwise decay slowly toward K_MIN.
+            if tick_drops > 0 {
+                self.pf_floor_k = (self.pf_floor_k + K_STEP_UP).min(K_MAX);
+            } else {
+                self.pf_floor_k = (self.pf_floor_k - K_STEP_DOWN).max(K_MIN);
+            }
+
+            // Refresh the floor from the queue's current min in
+            // simple-priority space, scaled by k. If the priority queue is
+            // momentarily empty (heavy in-flight scheduling) or queue-min
+            // has zero simple-priority, keep the previous floor implicitly
+            // rather than clearing — the buffer is still under pressure.
+            if let Some(floor) = self.compute_simple_floor() {
+                self.feedback.set_priority_floor(floor);
                 self.count_metrics.update(|count_metrics| {
-                    count_metrics.current_priority_fee_floor = min;
+                    count_metrics.current_priority_fee_floor = floor;
                 });
             }
             // Exit hysteresis: bucket refilled past threshold, or buffer
             // drained below guard (pressure is gone).
             if current_tokens >= self.desaturate_tokens_threshold || !buffer_guard_met {
                 self.saturated = false;
+                self.last_converged_k = self.pf_floor_k;
+                self.pf_floor_k = K_MIN;
                 self.feedback.clear_priority_floor();
             }
         } else if over_budget > 0 && buffer_guard_met {
             self.saturated = true;
-            if let Some((min, _)) = priority_min_max {
-                self.feedback.set_priority_floor(min);
+            // Jump-start near the previously converged k so the controller
+            // doesn't have to re-climb from K_MIN each saturation episode.
+            self.pf_floor_k = (self.last_converged_k - K_REENTRY_BACKOFF).max(K_MIN);
+            if let Some(floor) = self.compute_simple_floor() {
+                self.feedback.set_priority_floor(floor);
                 self.count_metrics.update(|count_metrics| {
-                    count_metrics.current_priority_fee_floor = min;
+                    count_metrics.current_priority_fee_floor = floor;
                 });
             }
         }
+    }
+
+    /// Compute the pf-floor to publish: simple-priority of the queue's
+    /// lowest-priority tx, scaled by `pf_floor_k`. Returns `None` when the
+    /// priority queue is empty, the queue-min tx isn't lookable, its
+    /// simple-priority can't be parsed, or the scaled value is zero (the
+    /// feedback channel rejects a zero floor — `0` is the "not saturated"
+    /// sentinel).
+    fn compute_simple_floor(&self) -> Option<u64> {
+        let priority_id = self.container.get_min_priority_id()?;
+        let tx = self.container.get_transaction(priority_id.id)?;
+        let simple_min = calculate_simple_pf_priority(tx)?;
+        let scaled = (simple_min as f64 * self.pf_floor_k as f64) as u64;
+        (scaled > 0).then_some(scaled)
     }
 
     /// Clears the transaction state container.
@@ -577,6 +644,14 @@ where
             count_metrics.num_dropped_on_capacity += *num_dropped_on_capacity;
             count_metrics.num_buffered += *num_buffered;
         });
+
+        // Accumulate capacity drops for the adaptive pf-floor controller.
+        // `count_metrics.num_dropped_on_capacity` resets at interval-report
+        // boundaries, which is the wrong cadence for k adaptation, so we
+        // keep our own per-tick counter.
+        self.tick_num_dropped_on_capacity = self
+            .tick_num_dropped_on_capacity
+            .saturating_add(receiving_stats.num_dropped_on_capacity as u64);
 
         self.timing_metrics.update(|timing_metrics| {
             timing_metrics.receive_time_us += receiving_stats.receive_time_us;
