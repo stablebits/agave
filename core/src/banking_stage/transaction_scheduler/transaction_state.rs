@@ -20,16 +20,28 @@ pub(crate) struct TransactionState<Tx> {
     priority: u64,
     /// Estimated cost of the transaction.
     cost: u64,
+    /// Sigverify-space "simple priority" of the transaction
+    /// (`priority_fee * 1_000_000 / compute_unit_limit`). Cached at
+    /// construction so the pf-floor controller can feed its histogram
+    /// without re-parsing the tx on every push.
+    simple_priority: u64,
 }
 
 impl<Tx> TransactionState<Tx> {
     /// Creates a new `TransactionState` in the `Unprocessed` state.
-    pub(crate) fn new(transaction: Tx, max_age: MaxAge, priority: u64, cost: u64) -> Self {
+    pub(crate) fn new(
+        transaction: Tx,
+        max_age: MaxAge,
+        priority: u64,
+        cost: u64,
+        simple_priority: u64,
+    ) -> Self {
         Self {
             transaction: Some(transaction),
             max_age,
             priority,
             cost,
+            simple_priority,
         }
     }
 
@@ -43,6 +55,12 @@ impl<Tx> TransactionState<Tx> {
     /// Return the cost of the transaction.
     pub(crate) fn cost(&self) -> u64 {
         self.cost
+    }
+
+    /// Sigverify-space simple priority cached at construction. Read by the
+    /// pf-floor controller while feeding its histogram.
+    pub(crate) fn simple_priority(&self) -> u64 {
+        self.simple_priority
     }
 
     /// Intended to be called when a transaction is scheduled. This method
@@ -79,13 +97,6 @@ impl<Tx> TransactionState<Tx> {
             .as_ref()
             .expect("transaction is not pending")
     }
-
-    /// Non-panicking variant of [`transaction`]: returns `None` when the
-    /// state is in `Pending` (i.e. taken for scheduling). Used by callers
-    /// that walk the buffer and want to silently skip in-flight entries.
-    pub(crate) fn try_transaction(&self) -> Option<&Tx> {
-        self.transaction.as_ref()
-    }
 }
 
 #[cfg(test)]
@@ -119,6 +130,7 @@ mod tests {
             MaxAge::MAX,
             compute_unit_price,
             TEST_TRANSACTION_COST,
+            compute_unit_price,
         )
     }
 

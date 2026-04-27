@@ -106,20 +106,6 @@ pub(crate) trait StateContainer<Tx: TransactionWithMeta> {
 
     fn get_min_max_priority(&self) -> Option<(u64, u64)>;
 
-    /// Lowest-priority entry in the queue. The full `TransactionPriorityId`
-    /// (rather than just the priority) is exposed so callers can look up the
-    /// underlying transaction via [`StateContainer::get_transaction`] — the
-    /// pf-floor controller needs the actual tx to compute the simple-priority
-    /// it publishes.
-    fn get_min_priority_id(&self) -> Option<TransactionPriorityId>;
-
-    /// Walk a stride-uniform sample of buffered (non-`Pending`) transactions,
-    /// invoking `f` once per sample. Approximate sample size; the exact
-    /// count depends on stride rounding and how many `Pending` entries fall
-    /// in the path. Used by the pf-floor controller to feed the
-    /// simple-priority histogram each tick.
-    fn sample_buffered_transactions<F: FnMut(&Tx)>(&self, sample_size: usize, f: F);
-
     /// Return an iterator over priority IDs strictly below `cursor` in descending order,
     /// or all IDs in descending order if `cursor` is `None`.
     fn recheck_iter(
@@ -221,25 +207,6 @@ impl<Tx: TransactionWithMeta> StateContainer<Tx> for TransactionStateContainer<T
         Some((min, max))
     }
 
-    fn get_min_priority_id(&self) -> Option<TransactionPriorityId> {
-        self.priority_queue.first().copied()
-    }
-
-    fn sample_buffered_transactions<F: FnMut(&Tx)>(&self, sample_size: usize, mut f: F) {
-        if sample_size == 0 || self.id_to_transaction_state.is_empty() {
-            return;
-        }
-        let stride = self.id_to_transaction_state.len().div_ceil(sample_size).max(1);
-        for (_, state) in self.id_to_transaction_state.iter().step_by(stride) {
-            // Skip Pending entries (in-flight, scheduled away). Their tx is
-            // taken; the simple-priority lives only on the live, non-pending
-            // population we're trying to characterize.
-            if let Some(tx) = state.try_transaction() {
-                f(tx);
-            }
-        }
-    }
-
     fn recheck_iter(
         &self,
         cursor: Option<&TransactionPriorityId>,
@@ -268,7 +235,13 @@ impl<Tx: TransactionWithMeta> TransactionStateContainer<Tx> {
         let priority_id = {
             let entry = self.get_vacant_map_entry();
             let transaction_id = entry.key();
-            entry.insert(TransactionState::new(transaction, max_age, priority, cost));
+            entry.insert(TransactionState::new(
+                transaction,
+                max_age,
+                priority,
+                cost,
+                priority,
+            ));
             TransactionPriorityId::new(priority, transaction_id)
         };
 
@@ -410,20 +383,6 @@ impl StateContainer<RuntimeTransactionView> for TransactionViewStateContainer {
     }
 
     #[inline]
-    fn get_min_priority_id(&self) -> Option<TransactionPriorityId> {
-        self.inner.get_min_priority_id()
-    }
-
-    #[inline]
-    fn sample_buffered_transactions<F: FnMut(&RuntimeTransactionView)>(
-        &self,
-        sample_size: usize,
-        f: F,
-    ) {
-        self.inner.sample_buffered_transactions(sample_size, f);
-    }
-
-    #[inline]
     fn recheck_iter(
         &self,
         cursor: Option<&TransactionPriorityId>,
@@ -545,7 +504,7 @@ mod tests {
             )
             .unwrap();
 
-            Ok(TransactionState::new(view, MaxAge::MAX, priority, cost))
+            Ok(TransactionState::new(view, MaxAge::MAX, priority, cost, priority))
         };
 
         // Push 2 transactions into the queue so buffer is full.

@@ -9,7 +9,7 @@
 //! [`SimplePriorityHistogram::add`]); over many ticks the bucket weights
 //! converge to the buffer's simple-priority distribution.
 
-use std::fmt::{self, Write};
+use std::fmt::Write;
 
 /// log2-spaced buckets covering the full u64 range. Bucket `i` covers
 /// `[2^i, 2^(i+1))` for `i in 0..63`, plus bucket 0 holds zero values
@@ -88,6 +88,7 @@ impl SimplePriorityHistogram {
 
     /// Render every non-empty bucket on its own line: `[lo, hi): weight`.
     /// For ad-hoc debugging when you want the full shape.
+    #[allow(dead_code)]
     pub(crate) fn format_full(&self) -> String {
         let mut out = String::new();
         for (i, &count) in self.buckets.iter().enumerate() {
