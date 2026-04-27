@@ -12,52 +12,35 @@ pub type BankingPacketBatch = Arc<Vec<PacketBatch>>;
 pub type BankingPacketReceiver = Receiver<BankingPacketBatch>;
 
 /// Shared coordination channel between the banking-stage scheduler and the
-/// sigverify stage. Carries two complementary signals across the boundary:
+/// sigverify stage. Carries three signals across the boundary:
 ///
-/// - **Saturation floor** (scheduler → sigverify). When the scheduler is
-///   saturated, it publishes the bank-context priority of its queue-min
-///   transaction. Sigverify reads this and cheaply drops below-floor
-///   transactions before signature verification using a deliberately
-///   simpler proxy (`priority_fee * 1_000_000 / compute_unit_limit`,
-///   see `priority_formula::calculate_simple_pf_priority`). The two
-///   sides are intentionally NOT in the same units: sigverify's proxy
-///   tends to be smaller than the bank-context floor for typical txs,
-///   so the comparison drops more aggressively than a unit-correct
-///   one would. That's the desired load-shedding behavior — keeps the
-///   scheduler from hitting `num_dropped_on_capacity` under sustained
-///   load. `0` means "not saturated."
+/// - **Saturation floor** (scheduler → sigverify). When saturated, the
+///   scheduler publishes `simple_priority(queue_min_tx) * k`, where
+///   `simple_priority` is the same `priority_fee * 1_000_000 /
+///   compute_unit_limit` shape sigverify computes per packet (see
+///   `priority_formula::calculate_simple_pf_priority`). Comparison is
+///   unit-consistent on both sides. `k` is an adaptive multiplier
+///   maintained by the scheduler — bumped while it's still hitting
+///   `num_dropped_on_capacity`, decayed when not. `0` means "not
+///   saturated."
 ///
-/// - **Arrivals counter** (sigverify → scheduler). Sigverify bumps a
-///   monotonic counter on each successful send to the banking channel. The
-///   scheduler diffs it per tick to compute the incoming arrival rate,
-///   which drives the token-bucket saturation signal on the scheduler side.
+/// - **Arrivals counter** (sigverify → scheduler). Monotonic count of
+///   non-discard packets sigverify has handed off to the banking
+///   channel. Scheduler diffs per-tick to drive the token-bucket
+///   saturation signal.
 ///
-/// - **In-flight counter** (sigverify → scheduler). Tracks the total
-///   number of packets currently queued in the unbounded `sigverify →
-///   banking` channel, *including packets marked `discard`*. Sigverify
-///   increments immediately before send, rolls back on send failure, and
-///   the scheduler decrements as it drains each batch. Kept separate from
-///   `total_arrivals` so the token-bucket arrival rate remains a measure
-///   of *real* work while the gauge reflects transport-level depth (the
-///   two differ whenever sigverify retains partly-discarded multi-packet
-///   batches).
-///
-/// Both atomics are bundled on a single struct because every consumer pair
-/// uses them together in practice, and they share the same Arc plumbing from
-/// `tpu.rs` through `BankingStage` and into `SchedulerController` /
-/// `SigVerifyStage`.
+/// - **In-flight counter** (sigverify → scheduler). Total packets
+///   currently in the unbounded `sigverify → banking` channel,
+///   including those marked `discard`. Sigverify bumps before send
+///   (rolling back on failure); scheduler subs on drain. Reported as a
+///   transport-depth gauge — kept separate from arrivals so the bucket
+///   measures real work and the gauge measures what's physically in
+///   the channel.
 #[derive(Debug, Default)]
 pub struct BankingStageFeedback {
-    // `0` means "not saturated"; published priority floors are expected
-    // to be strictly positive in practice.
+    // `0` is the "not saturated" sentinel; published floors are positive.
     priority_floor: AtomicU64,
-    // Monotonic (never wraps in the lifetime of a validator process). Writer
-    // is sigverify; reader is the scheduler.
     total_arrivals: AtomicU64,
-    // Current depth of the sigverify→scheduler unbounded channel in total
-    // packets (includes packets currently marked `discard`). Sigverify
-    // bumps this immediately before send and compensates on send failure;
-    // the scheduler decrements on drain and reads for reporting.
     in_flight_packets: AtomicUsize,
     // Monotonic count of packets dropped because the bounded (test-mode)
     // sigverify→scheduler channel was full at send time. Writer is the
@@ -91,9 +74,7 @@ impl BankingStageFeedback {
         self.priority_floor.store(0, Ordering::Relaxed);
     }
 
-    /// Return the currently published floor, or `None` if the scheduler is
-    /// not saturated. A stored value of `0` is used internally as the
-    /// "not-saturated" sentinel; callers see it as `None`.
+    /// Currently-published floor, or `None` if not saturated.
     pub fn get_priority_floor(&self) -> Option<u64> {
         let priority_floor = self.priority_floor.load(Ordering::Relaxed);
         (priority_floor != 0).then_some(priority_floor)
@@ -101,11 +82,6 @@ impl BankingStageFeedback {
 
     // --- arrivals counter (sigverify writes, scheduler reads) ---------------
 
-    /// Record that `n` non-discard ("valid") packets have just entered the
-    /// banking channel. Takes `usize` to match sigverify's own packet-count
-    /// types; internally widened to `u64` to match the scheduler's
-    /// arithmetic domain (monotonic counter that must not wrap for the
-    /// lifetime of a validator process).
     pub fn add_arrivals(&self, n: usize) {
         self.total_arrivals.fetch_add(n as u64, Ordering::Relaxed);
     }
@@ -116,21 +92,14 @@ impl BankingStageFeedback {
 
     // --- in-flight channel-depth counter (sigverify adds, scheduler subs) ---
 
-    /// Record that `n` packets are being handed off to the banking channel
-    /// (total — includes packets currently marked `discard`). In sigverify
-    /// this bump happens immediately before `send()` and is rolled back on
-    /// send failure. Paired with `sub_in_flight` on the drain side to yield
-    /// a channel-depth gauge.
     pub fn add_in_flight(&self, n: usize) {
         self.in_flight_packets.fetch_add(n, Ordering::Relaxed);
     }
 
-    /// Called after a batch is known not to be in the channel anymore:
-    /// by the scheduler after drain, or by sigverify to compensate a
-    /// failed send. Uses `saturating_sub` defensively to keep the gauge
-    /// non-negative even if future callers mis-pair adds/subs.
+    /// Saturating sub tolerates the benign race where the receiver
+    /// drains before the matching `add_in_flight` becomes visible, and
+    /// guards against future mis-paired callers.
     pub fn sub_in_flight(&self, n: usize) {
-        // Fetch-and-update loop for saturating subtraction.
         let mut current = self.in_flight_packets.load(Ordering::Relaxed);
         loop {
             let new = current.saturating_sub(n);
