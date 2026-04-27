@@ -79,6 +79,13 @@ impl<Tx> TransactionState<Tx> {
             .as_ref()
             .expect("transaction is not pending")
     }
+
+    /// Non-panicking variant of [`transaction`]: returns `None` when the
+    /// state is in `Pending` (i.e. taken for scheduling). Used by callers
+    /// that walk the buffer and want to silently skip in-flight entries.
+    pub(crate) fn try_transaction(&self) -> Option<&Tx> {
+        self.transaction.as_ref()
+    }
 }
 
 #[cfg(test)]
