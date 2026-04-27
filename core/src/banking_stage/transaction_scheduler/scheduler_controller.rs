@@ -19,7 +19,6 @@ use {
                 transaction_state_container::StateContainer,
             },
         },
-        priority_formula::calculate_simple_pf_priority,
         validator::SchedulerPacing,
     },
     agave_banking_stage_ingress_types::BankingStageFeedback,
@@ -73,14 +72,10 @@ const K_STEP_DOWN: f32 = 0.005;
 /// the controller to re-discover equilibrium without overshooting.
 const K_REENTRY_BACKOFF: f32 = 0.5;
 
-/// Number of buffered transactions to sample per feedback tick to feed the
-/// simple-priority histogram. n=128 gives ±~7pp 95% CI on the percentile
-/// estimate per tick; the rolling decay means the effective sample count
-/// is much larger.
-const HISTOGRAM_SAMPLE_SIZE: usize = 128;
-/// Multiplicative decay applied to the histogram each feedback tick. Lower
-/// = faster response to distribution drift, higher = smoother/lower noise
-/// percentile estimates.
+/// Multiplicative decay applied to the histogram each feedback tick. The
+/// histogram is fed on-entry by `receive_and_buffer`, so decay alone is
+/// what implements the rolling window (we don't track removals). Lower =
+/// faster response to distribution drift; higher = smoother percentile.
 const HISTOGRAM_DECAY: f32 = 0.95;
 /// Percentile of the buffer's simple-priority distribution used as the
 /// pre-`k` floor anchor. `0.25` means "drop the bottom quarter of the
@@ -474,18 +469,10 @@ where
         // Used as the error signal for the adaptive `pf_floor_k`.
         let tick_drops = std::mem::take(&mut self.tick_num_dropped_on_capacity);
 
-        // Maintain the rolling simple-priority histogram every tick (not
-        // gated on saturation). Keeping it warm during quiet periods means
-        // the percentile is already trustworthy the moment saturation
-        // hits, rather than after a warmup ramp.
+        // Decay the rolling simple-priority histogram each tick. The histogram
+        // is fed on-entry by `receive_and_buffer_packets` (not here); decay is
+        // what implements the rolling window.
         self.simple_priority_histogram.decay(HISTOGRAM_DECAY);
-        let histogram = &mut self.simple_priority_histogram;
-        self.container
-            .sample_buffered_transactions(HISTOGRAM_SAMPLE_SIZE, |tx| {
-                if let Some(simple_priority) = calculate_simple_pf_priority(tx) {
-                    histogram.add(simple_priority);
-                }
-            });
 
         // Record observability metrics regardless of saturation state.
         self.count_metrics.update(|count_metrics| {
@@ -670,9 +657,11 @@ where
         &mut self,
         decision: &BufferedPacketsDecision,
     ) -> Result<ReceivingStats, DisconnectedError> {
-        let receiving_stats = self
-            .receive_and_buffer
-            .receive_and_buffer_packets(&mut self.container, decision)?;
+        let receiving_stats = self.receive_and_buffer.receive_and_buffer_packets(
+            &mut self.container,
+            decision,
+            &mut self.simple_priority_histogram,
+        )?;
 
         // Drained from the sigverify→scheduler channel, counted including
         // packets marked `discard` so the gauge reflects true transport
