@@ -13,7 +13,9 @@ use {
         },
         priority_formula::{FeeContext, calculate_priority_and_cost},
     },
-    agave_banking_stage_ingress_types::{BankingPacketBatch, BankingPacketReceiver},
+    agave_banking_stage_ingress_types::{
+        BankingPacketBatch, BankingPacketReceiver, BankingStageFeedback,
+    },
     agave_transaction_view::{
         resolved_transaction_view::ResolvedTransactionView, transaction_data::TransactionData,
         transaction_version::TransactionVersion, transaction_view::SanitizedTransactionView,
@@ -37,7 +39,7 @@ use {
     solana_svm_transaction::svm_message::SVMMessage,
     solana_transaction::sanitized::MessageHash,
     solana_transaction_error::TransactionError,
-    std::time::Instant,
+    std::{sync::Arc, time::Instant},
 };
 
 #[derive(Debug)]
@@ -63,6 +65,11 @@ pub(crate) struct ReceivingStats {
     pub num_dropped_on_already_processed: usize,
     pub num_dropped_on_fee_payer: usize,
     pub num_dropped_on_capacity: usize,
+    /// Packets dropped at the scheduler-receive boundary because their
+    /// simple-priority was below the published pf-floor. Catches the
+    /// in-flight backlog that already passed sigverify before the floor
+    /// was published; see the second-stage drop in `try_handle_packet`.
+    pub num_dropped_below_priority_floor: usize,
 
     pub num_buffered: usize,
 
@@ -99,6 +106,7 @@ impl ReceivingStats {
         self.num_dropped_on_already_processed += other.num_dropped_on_already_processed;
         self.num_dropped_on_fee_payer += other.num_dropped_on_fee_payer;
         self.num_dropped_on_capacity += other.num_dropped_on_capacity;
+        self.num_dropped_below_priority_floor += other.num_dropped_below_priority_floor;
         self.num_buffered += other.num_buffered;
 
         self.num_dropped_on_age_unknown_blockhash += other.num_dropped_on_age_unknown_blockhash;
@@ -130,6 +138,10 @@ pub(crate) trait ReceiveAndBuffer {
 pub(crate) struct TransactionViewReceiveAndBuffer {
     pub receiver: BankingPacketReceiver,
     pub sharable_banks: SharableBanks,
+    /// Shared feedback channel; used here only as a *read* side, to
+    /// fetch the currently-published pf-floor so we can drop in-flight
+    /// arrivals that beat sigverify's filter.
+    pub feedback: Arc<BankingStageFeedback>,
 }
 
 impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
@@ -163,6 +175,7 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
             num_dropped_on_already_processed: 0,
             num_dropped_on_fee_payer: 0,
             num_dropped_on_capacity: 0,
+            num_dropped_below_priority_floor: 0,
             num_buffered: 0,
             num_dropped_on_age_unknown_blockhash: 0,
             max_dropped_on_age_blockhash_age_slots: 0,
@@ -247,6 +260,7 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
             num_dropped_on_already_processed: stats.num_dropped_on_already_processed,
             num_dropped_on_fee_payer: stats.num_dropped_on_fee_payer,
             num_dropped_on_capacity: stats.num_dropped_on_capacity,
+            num_dropped_below_priority_floor: stats.num_dropped_below_priority_floor,
             num_buffered: stats.num_buffered,
             receive_time_us: stats.receive_time_us,
             buffer_time_us: stats.buffer_time_us,
@@ -259,6 +273,12 @@ pub(crate) enum PacketHandlingError {
     LockValidation,
     ComputeBudget,
     ALTResolution,
+    /// Tx's sigverify-space simple priority is below the scheduler-published
+    /// pf-floor. Catches the in-flight backlog that already passed sigverify
+    /// before the floor was published; without this, the buffer fills with
+    /// low-priority arrivals during cold-start saturation and triggers a
+    /// `dropped_on_capacity` spike from the eviction wave.
+    BelowPriorityFloor,
 }
 
 impl TransactionViewReceiveAndBuffer {
@@ -291,10 +311,16 @@ impl TransactionViewReceiveAndBuffer {
         let mut num_dropped_on_already_processed = 0;
         let mut num_dropped_on_fee_payer = 0;
         let mut num_dropped_on_capacity = 0;
+        let mut num_dropped_below_priority_floor = 0;
         let mut num_buffered = 0;
         let mut num_dropped_on_age_unknown_blockhash = 0usize;
         let mut max_dropped_on_age_blockhash_age_slots = 0u64;
         let mut sum_dropped_on_age_blockhash_age_slots = 0u64;
+
+        // Snapshot the published pf-floor once per batch. Cheap atomic read,
+        // and the floor is intentionally coarse — re-reading per packet
+        // would only add noise.
+        let pf_floor = self.feedback.get_priority_floor().unwrap_or(0);
 
         let mut check_and_push_to_queue =
             |container: &mut TransactionViewStateContainer,
@@ -414,6 +440,7 @@ impl TransactionViewReceiveAndBuffer {
                             &fee_context,
                             transaction_account_lock_limit,
                             enable_instruction_accounts_limit,
+                            pf_floor,
                         ) {
                             Ok(state) => Ok(state),
                             Err(
@@ -429,6 +456,10 @@ impl TransactionViewReceiveAndBuffer {
                             }
                             Err(PacketHandlingError::ComputeBudget) => {
                                 num_dropped_on_compute_budget += 1;
+                                Err(())
+                            }
+                            Err(PacketHandlingError::BelowPriorityFloor) => {
+                                num_dropped_below_priority_floor += 1;
                                 Err(())
                             }
                         }
@@ -463,6 +494,7 @@ impl TransactionViewReceiveAndBuffer {
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_capacity,
+            num_dropped_below_priority_floor,
             num_buffered,
             num_dropped_on_age_unknown_blockhash,
             max_dropped_on_age_blockhash_age_slots,
@@ -479,6 +511,7 @@ impl TransactionViewReceiveAndBuffer {
         fee_context: &FeeContext,
         transaction_account_lock_limit: usize,
         enable_instruction_accounts_limit: bool,
+        pf_floor: u64,
     ) -> Result<TransactionViewState, PacketHandlingError> {
         let (view, deactivation_slot) = translate_to_runtime_view(
             bytes,
@@ -492,6 +525,17 @@ impl TransactionViewReceiveAndBuffer {
         else {
             return Err(PacketHandlingError::ComputeBudget);
         };
+
+        // Second-stage pf-floor drop. Sigverify already filtered against this
+        // same floor at intake; this catches the in-flight backlog that was
+        // past the sigverify check before the floor was published. The unit
+        // (`compute_unit_price_in_microlamports`) matches sigverify-space, so
+        // the comparison is consistent.
+        if pf_floor > 0
+            && transaction_configuration.compute_unit_price_in_microlamports() < pf_floor
+        {
+            return Err(PacketHandlingError::BelowPriorityFloor);
+        }
 
         let max_age = calculate_max_age(root_bank.epoch(), deactivation_slot, root_bank.slot());
         let (priority, cost) =
@@ -642,6 +686,7 @@ mod tests {
         let receive_and_buffer = TransactionViewReceiveAndBuffer {
             receiver,
             sharable_banks: bank_forks.read().unwrap().sharable_banks(),
+            feedback: Arc::new(BankingStageFeedback::default()),
         };
         let container = TransactionViewStateContainer::with_capacity(TEST_CONTAINER_CAPACITY);
         (receive_and_buffer, container)
@@ -735,6 +780,7 @@ mod tests {
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_capacity,
+            num_dropped_below_priority_floor: _,
             num_buffered,
             receive_time_us: _,
             buffer_time_us: _,
@@ -793,6 +839,7 @@ mod tests {
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_capacity,
+            num_dropped_below_priority_floor: _,
             num_buffered,
             receive_time_us: _,
             buffer_time_us: _,
@@ -840,6 +887,7 @@ mod tests {
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_capacity,
+            num_dropped_below_priority_floor: _,
             num_buffered,
             receive_time_us: _,
             buffer_time_us: _,
@@ -886,6 +934,7 @@ mod tests {
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_capacity,
+            num_dropped_below_priority_floor: _,
             num_buffered,
             receive_time_us: _,
             buffer_time_us: _,
@@ -937,6 +986,7 @@ mod tests {
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_capacity,
+            num_dropped_below_priority_floor: _,
             num_buffered,
             receive_time_us: _,
             buffer_time_us: _,
@@ -1003,6 +1053,7 @@ mod tests {
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_capacity,
+            num_dropped_below_priority_floor: _,
             num_buffered,
             receive_time_us: _,
             buffer_time_us: _,
@@ -1054,6 +1105,7 @@ mod tests {
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_capacity,
+            num_dropped_below_priority_floor: _,
             num_buffered,
             receive_time_us: _,
             buffer_time_us: _,
@@ -1109,6 +1161,7 @@ mod tests {
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_capacity,
+            num_dropped_below_priority_floor: _,
             num_buffered,
             receive_time_us: _,
             buffer_time_us: _,
@@ -1192,6 +1245,7 @@ mod tests {
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_capacity,
+            num_dropped_below_priority_floor: _,
             num_buffered,
             receive_time_us: _,
             buffer_time_us: _,
