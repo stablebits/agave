@@ -1,6 +1,5 @@
 use {
     super::{
-        simple_priority_histogram::SimplePriorityHistogram,
         transaction_priority_id::TransactionPriorityId,
         transaction_state::TransactionState,
         transaction_state_container::{
@@ -97,16 +96,10 @@ pub(crate) trait ReceiveAndBuffer {
 
     /// Return Err if the receiver is disconnected AND no packets were
     /// received. Otherwise return Ok(num_received).
-    ///
-    /// `pf_floor_histogram` is fed one entry per transaction that
-    /// successfully reaches the priority queue this call. Drives the
-    /// pf-floor controller's percentile-based anchor; pass a throwaway
-    /// histogram in tests/no-op contexts.
     fn receive_and_buffer_packets(
         &mut self,
         container: &mut Self::Container,
         decision: &BufferedPacketsDecision,
-        pf_floor_histogram: &mut SimplePriorityHistogram,
     ) -> Result<ReceivingStats, DisconnectedError>;
 }
 
@@ -123,7 +116,6 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
         &mut self,
         container: &mut Self::Container,
         decision: &BufferedPacketsDecision,
-        pf_floor_histogram: &mut SimplePriorityHistogram,
     ) -> Result<ReceivingStats, DisconnectedError> {
         let BankPair {
             root_bank,
@@ -175,7 +167,6 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
                         &root_bank,
                         &working_bank,
                         packet_batch_message,
-                        pf_floor_histogram,
                     ));
                 }
                 Err(RecvTimeoutError::Timeout) => timed_out = true,
@@ -200,7 +191,6 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
                             &root_bank,
                             &working_bank,
                             packet_batch_message,
-                            pf_floor_histogram,
                         );
                         stats.accumulate(batch_stats);
                     }
@@ -250,7 +240,6 @@ impl TransactionViewReceiveAndBuffer {
         root_bank: &Bank,
         working_bank: &Bank,
         packet_batch_message: BankingPacketBatch,
-        pf_floor_histogram: &mut SimplePriorityHistogram,
     ) -> ReceivingStats {
         let start = Instant::now();
         // If outside holding window, do not parse.
@@ -276,8 +265,7 @@ impl TransactionViewReceiveAndBuffer {
 
         let mut check_and_push_to_queue =
             |container: &mut TransactionViewStateContainer,
-             transaction_priority_ids: &mut ArrayVec<TransactionPriorityId, 64>,
-             pf_floor_histogram: &mut SimplePriorityHistogram| {
+             transaction_priority_ids: &mut ArrayVec<TransactionPriorityId, 64>| {
                 // Temporary scope so that transaction references are immediately
                 // dropped and transactions not passing
                 let mut check_results = {
@@ -313,12 +301,12 @@ impl TransactionViewReceiveAndBuffer {
                         container.remove_by_id(priority_id.id);
                         continue;
                     }
-                    let state = container
-                        .get_mut_transaction_state(priority_id.id)
+                    let transaction = container
+                        .get_transaction(priority_id.id)
                         .expect("transaction must exist");
                     if let Err(err) = Consumer::check_fee_payer_unlocked(
                         working_bank,
-                        state.transaction(),
+                        transaction,
                         &mut error_counters,
                     ) {
                         *result = Err(err);
@@ -326,15 +314,6 @@ impl TransactionViewReceiveAndBuffer {
                         container.remove_by_id(priority_id.id);
                         continue;
                     }
-
-                    // Tx survived all receive-side checks and is about to land
-                    // in the priority queue. Feed its sigverify-space simple
-                    // priority into the pf-floor histogram. The histogram
-                    // tracks the *input* distribution (everything that was
-                    // admitted to the queue this tick), which is what we want
-                    // to threshold against — independent of which arrivals
-                    // later get evicted on capacity.
-                    pf_floor_histogram.add(state.simple_priority());
 
                     num_buffered += 1;
                 }
@@ -407,22 +386,14 @@ impl TransactionViewReceiveAndBuffer {
 
                     // If at capacity, run checks and remove invalid transactions.
                     if transaction_priority_ids.len() == EXTRA_CAPACITY {
-                        check_and_push_to_queue(
-                            container,
-                            &mut transaction_priority_ids,
-                            pf_floor_histogram,
-                        );
+                        check_and_push_to_queue(container, &mut transaction_priority_ids);
                     }
                 }
             }
         }
 
         // Any remaining packets undergo status/age checks
-        check_and_push_to_queue(
-            container,
-            &mut transaction_priority_ids,
-            pf_floor_histogram,
-        );
+        check_and_push_to_queue(container, &mut transaction_priority_ids);
 
         ReceivingStats {
             num_received,
@@ -465,12 +436,8 @@ impl TransactionViewReceiveAndBuffer {
         let max_age = calculate_max_age(root_bank.epoch(), deactivation_slot, root_bank.slot());
         let (priority, cost) =
             calculate_priority_and_cost(&view, &transaction_configuration, fee_context);
-        // sigverify-space simple priority — same shape as
-        // `priority_formula::calculate_simple_pf_priority`. Cached on the
-        // state so the pf-floor histogram can be fed without re-deriving.
-        let simple_priority = transaction_configuration.compute_unit_price_in_microlamports();
 
-        Ok(TransactionState::new(view, max_age, priority, cost, simple_priority))
+        Ok(TransactionState::new(view, max_age, priority, cost))
     }
 }
 
@@ -674,11 +641,7 @@ mod tests {
 
         drop(sender); // disconnect channel
         let r = receive_and_buffer
-            .receive_and_buffer_packets(
-                &mut container,
-                &BufferedPacketsDecision::Hold,
-                &mut SimplePriorityHistogram::default(),
-            );
+            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold);
         assert!(r.is_err());
     }
 
@@ -716,7 +679,6 @@ mod tests {
             .receive_and_buffer_packets(
                 &mut container,
                 &BufferedPacketsDecision::Forward, // no packets should be held
-                &mut SimplePriorityHistogram::default(),
             )
             .unwrap();
 
@@ -769,11 +731,7 @@ mod tests {
             receive_time_us: _,
             buffer_time_us: _,
         } = receive_and_buffer
-            .receive_and_buffer_packets(
-                &mut container,
-                &BufferedPacketsDecision::Hold,
-                &mut SimplePriorityHistogram::default(),
-            )
+            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold)
             .unwrap();
 
         assert_eq!(num_received, 0);
@@ -817,11 +775,7 @@ mod tests {
             receive_time_us: _,
             buffer_time_us: _,
         } = receive_and_buffer
-            .receive_and_buffer_packets(
-                &mut container,
-                &BufferedPacketsDecision::Hold,
-                &mut SimplePriorityHistogram::default(),
-            )
+            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold)
             .unwrap();
 
         assert_eq!(num_received, 1);
@@ -864,11 +818,7 @@ mod tests {
             receive_time_us: _,
             buffer_time_us: _,
         } = receive_and_buffer
-            .receive_and_buffer_packets(
-                &mut container,
-                &BufferedPacketsDecision::Hold,
-                &mut SimplePriorityHistogram::default(),
-            )
+            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold)
             .unwrap();
 
         assert_eq!(num_received, 1);
@@ -916,11 +866,7 @@ mod tests {
             receive_time_us: _,
             buffer_time_us: _,
         } = receive_and_buffer
-            .receive_and_buffer_packets(
-                &mut container,
-                &BufferedPacketsDecision::Hold,
-                &mut SimplePriorityHistogram::default(),
-            )
+            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold)
             .unwrap();
 
         assert_eq!(num_received, 1);
@@ -983,11 +929,7 @@ mod tests {
             receive_time_us: _,
             buffer_time_us: _,
         } = receive_and_buffer
-            .receive_and_buffer_packets(
-                &mut container,
-                &BufferedPacketsDecision::Hold,
-                &mut SimplePriorityHistogram::default(),
-            )
+            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold)
             .unwrap();
 
         assert_eq!(num_received, 1);
@@ -1035,11 +977,7 @@ mod tests {
             receive_time_us: _,
             buffer_time_us: _,
         } = receive_and_buffer
-            .receive_and_buffer_packets(
-                &mut container,
-                &BufferedPacketsDecision::Hold,
-                &mut SimplePriorityHistogram::default(),
-            )
+            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold)
             .unwrap();
 
         assert_eq!(num_received, 1);
@@ -1091,11 +1029,7 @@ mod tests {
             receive_time_us: _,
             buffer_time_us: _,
         } = receive_and_buffer
-            .receive_and_buffer_packets(
-                &mut container,
-                &BufferedPacketsDecision::Hold,
-                &mut SimplePriorityHistogram::default(),
-            )
+            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold)
             .unwrap();
 
         assert_eq!(num_received, num_transactions);
@@ -1175,11 +1109,7 @@ mod tests {
             receive_time_us: _,
             buffer_time_us: _,
         } = receive_and_buffer
-            .receive_and_buffer_packets(
-                &mut container,
-                &BufferedPacketsDecision::Hold,
-                &mut SimplePriorityHistogram::default(),
-            )
+            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold)
             .unwrap();
 
         assert_eq!(num_received, 1);
