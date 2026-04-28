@@ -526,20 +526,19 @@ impl TransactionViewReceiveAndBuffer {
             return Err(PacketHandlingError::ComputeBudget);
         };
 
-        // Second-stage pf-floor drop. Sigverify already filtered against this
-        // same floor at intake; this catches the in-flight backlog that was
-        // past the sigverify check before the floor was published. The unit
-        // (`compute_unit_price_in_microlamports`) matches sigverify-space, so
-        // the comparison is consistent.
-        if pf_floor > 0
-            && transaction_configuration.compute_unit_price_in_microlamports() < pf_floor
-        {
-            return Err(PacketHandlingError::BelowPriorityFloor);
-        }
-
         let max_age = calculate_max_age(root_bank.epoch(), deactivation_slot, root_bank.slot());
         let (priority, cost) =
             calculate_priority_and_cost(&view, &transaction_configuration, fee_context);
+
+        // Second-stage pf-floor drop. Sigverify already filtered against this
+        // same floor at intake; this catches the in-flight backlog that was
+        // past the sigverify check before the floor was published. Compares
+        // bank-context priority (the same number the BTreeSet ranks by)
+        // against the published floor, which is queue-min's bank-context
+        // priority — apples to apples within the scheduler.
+        if pf_floor > 0 && priority < pf_floor {
+            return Err(PacketHandlingError::BelowPriorityFloor);
+        }
 
         Ok(TransactionState::new(view, max_age, priority, cost))
     }
