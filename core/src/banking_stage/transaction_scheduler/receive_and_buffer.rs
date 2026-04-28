@@ -11,7 +11,7 @@ use {
         banking_stage::{
             consumer::Consumer, decision_maker::BufferedPacketsDecision, scheduler_messages::MaxAge,
         },
-        priority_formula::{FeeContext, calculate_priority_and_cost},
+        priority_formula::{FeeContext, calculate_pf_drop_priority, calculate_priority_and_cost},
     },
     agave_banking_stage_ingress_types::{
         BankingPacketBatch, BankingPacketReceiver, BankingStageFeedback,
@@ -473,10 +473,12 @@ impl TransactionViewReceiveAndBuffer {
         // Second-stage pf-floor drop. Sigverify already filtered against this
         // same floor at intake; this catches the in-flight backlog that was
         // past the sigverify check before the floor was published. Compares
-        // bank-context priority (the same number the BTreeSet ranks by)
-        // against the published floor, which is queue-min's bank-context
-        // priority — apples to apples within the scheduler.
-        if pf_floor > 0 && priority < pf_floor {
+        // the tx's mainnet-context priority (matching what sigverify
+        // computed and the scheduler published) — keeps all three sites in
+        // identical units regardless of bank-vs-mainnet drift.
+        if pf_floor > 0
+            && calculate_pf_drop_priority(&view).is_some_and(|p| p < pf_floor)
+        {
             return Err(PacketHandlingError::BelowPriorityFloor);
         }
 

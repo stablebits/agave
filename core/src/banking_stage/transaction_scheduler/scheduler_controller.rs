@@ -18,6 +18,7 @@ use {
                 transaction_state_container::StateContainer,
             },
         },
+        priority_formula::calculate_pf_drop_priority,
         validator::SchedulerPacing,
     },
     agave_banking_stage_ingress_types::BankingStageFeedback,
@@ -359,16 +360,16 @@ where
     /// in-queue transactions to derive it from (otherwise the min priority
     /// of a near-empty queue is arbitrary and the floor would be noise).
     ///
-    /// **Published floor:** the bank-context full-formula priority of the
-    /// scheduler queue's lowest-priority transaction (the same number
-    /// the BTreeSet ranks by — `reward * 1_000_000 / (cost + 1)` from
-    /// `priority_formula::calculate_priority_and_cost`). Sigverify
-    /// approximates the same formula per-packet against
-    /// `MAINNET_FEE_CONTEXT` (see
-    /// `priority_formula::calculate_pf_drop_priority`). Bank-vs-mainnet
-    /// fee-context drift is small (mainnet defaults match real mainnet
-    /// `lamports_per_signature` and `burn_percent`); the comparison is
-    /// effectively unit-consistent.
+    /// **Published floor:** the queue-min tx's full-formula priority
+    /// evaluated against `MAINNET_FEE_CONTEXT` (see
+    /// `priority_formula::calculate_pf_drop_priority`). Sigverify and the
+    /// scheduler-receive second-stage check use the same function on
+    /// arriving txs, so all three sites are in identical units —
+    /// independent of any drift between the live bank and mainnet
+    /// defaults. The number we publish is *not* the bank-context priority
+    /// the BTreeSet ranks by; for typical mainnet feature-set / fee
+    /// inputs the two are within rounding, but using mainnet-context
+    /// everywhere makes the comparison exactly consistent.
     ///
     /// Semantics: "drop arrivals that are worse than what we'd evict
     /// anyway." The scheduler's BTreeSet evicts the lowest-priority entry
@@ -450,15 +451,22 @@ where
         }
     }
 
-    /// Compute the pf-floor to publish: bank-context full-formula priority
-    /// of the queue's lowest-priority tx. Reads the priority directly off
-    /// the `TransactionPriorityId` (cached on the BTreeSet entry — same
-    /// number the scheduler ranks by, no re-derivation). Returns `None`
-    /// when the queue is empty or the priority is zero (the feedback
-    /// channel rejects a zero floor — `0` is the "not saturated" sentinel).
+    /// Compute the pf-floor to publish: full-formula priority of the
+    /// queue's lowest-priority tx evaluated against `MAINNET_FEE_CONTEXT`.
+    /// Returns `None` when the queue is empty, the queue-min tx isn't
+    /// parseable, or the priority is zero (the feedback channel rejects
+    /// a zero floor — `0` is the "not saturated" sentinel).
+    ///
+    /// We re-derive instead of reading the cached bank-context priority off
+    /// `TransactionPriorityId` so the floor is exactly comparable to the
+    /// values sigverify and the scheduler-receive check compute on
+    /// arriving txs (both use the same `calculate_pf_drop_priority`
+    /// function with the same fee-context constants).
     fn compute_pf_floor(&self) -> Option<u64> {
         let priority_id = self.container.get_min_priority_id()?;
-        (priority_id.priority > 0).then_some(priority_id.priority)
+        let tx = self.container.get_transaction(priority_id.id)?;
+        let floor = calculate_pf_drop_priority(tx)?;
+        (floor > 0).then_some(floor)
     }
 
     /// Clears the transaction state container.
