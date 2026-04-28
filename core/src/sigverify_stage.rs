@@ -230,7 +230,13 @@ pub(crate) fn apply_priority_floor(batches: &mut Vec<PacketBatch>, floor: u64) -
                 continue;
             };
             match approximate_priority(data) {
-                Some(priority) if priority < floor => {
+                // `<=` instead of `<` so uniformly-priced traffic still
+                // gets shed: a tx tied with queue_min is no better than
+                // what the scheduler would evict on insert, so dropping
+                // it preserves the "no worse than queue_min" semantics
+                // and avoids degenerate no-op behavior when all incoming
+                // arrivals have the same priority as queue_min.
+                Some(priority) if priority <= floor => {
                     packet.meta_mut().set_discard(true);
                     dropped = dropped.saturating_add(1);
                 }

@@ -535,9 +535,13 @@ impl TransactionViewReceiveAndBuffer {
         // past the sigverify check before the floor was published. Compares
         // the tx's mainnet-context priority (matching what sigverify
         // computed and the scheduler published) — keeps all three sites in
-        // identical units regardless of bank-vs-mainnet drift.
+        // identical units regardless of bank-vs-mainnet drift. `<=` matches
+        // sigverify's predicate: a tx tied with queue-min is no better than
+        // what the scheduler would evict on insert, and the equality case
+        // matters for uniformly-priced traffic where `<` would degenerate
+        // to a no-op.
         if pf_floor > 0
-            && calculate_pf_drop_priority(&view).is_some_and(|p| p < pf_floor)
+            && calculate_pf_drop_priority(&view).is_some_and(|p| p <= pf_floor)
         {
             return Err(PacketHandlingError::BelowPriorityFloor);
         }
