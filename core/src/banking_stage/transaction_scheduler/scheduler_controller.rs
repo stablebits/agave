@@ -580,6 +580,7 @@ where
                 num_dropped_on_already_processed,
                 num_dropped_on_fee_payer,
                 num_dropped_on_capacity,
+                num_dropped_below_priority_floor,
                 num_buffered,
                 receive_time_us: _,
                 buffer_time_us: _,
@@ -596,6 +597,7 @@ where
                 *num_dropped_on_already_processed;
             count_metrics.num_dropped_on_receive_fee_payer += *num_dropped_on_fee_payer;
             count_metrics.num_dropped_on_capacity += *num_dropped_on_capacity;
+            count_metrics.num_dropped_below_priority_floor += *num_dropped_below_priority_floor;
             count_metrics.num_buffered += *num_buffered;
         });
 
@@ -690,6 +692,7 @@ mod tests {
         TransactionViewReceiveAndBuffer {
             receiver,
             sharable_banks: bank_forks.read().unwrap().sharable_banks(),
+            feedback: Arc::new(BankingStageFeedback::default()),
         }
     }
 
