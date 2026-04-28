@@ -90,6 +90,10 @@ pub struct ExecuteAndCommitTransactionsOutput {
     pub commit_transactions_result: Result<Vec<CommitTransactionDetails>, PohRecorderError>,
     pub(crate) execute_and_commit_timings: LeaderExecuteAndCommitTimings,
     pub(crate) error_counters: TransactionErrorMetrics,
+    /// Sum of prioritization-fee lamports paid by transactions committed in
+    /// this batch. Used by the pf-floor evaluation to track block fee revenue
+    /// (denominator: `block_cost` from the cost tracker → fee/CU economics).
+    pub(crate) block_priority_fees_lamports: u64,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -414,10 +418,11 @@ impl Consumer {
                 commit_transactions_result: Err(recorder_err),
                 execute_and_commit_timings,
                 error_counters,
+                block_priority_fees_lamports: 0,
             };
         }
 
-        let (commit_time_us, commit_transaction_statuses) =
+        let (commit_time_us, commit_transaction_statuses, block_priority_fees_lamports) =
             if processed_counts.processed_transactions_count != 0 {
                 self.committer.commit_transactions(
                     batch,
@@ -438,6 +443,7 @@ impl Consumer {
                             Err(err) => CommitTransactionDetails::NotCommitted(err),
                         })
                         .collect(),
+                    0,
                 )
             };
 
@@ -468,6 +474,7 @@ impl Consumer {
             commit_transactions_result: Ok(commit_transaction_statuses),
             execute_and_commit_timings,
             error_counters,
+            block_priority_fees_lamports,
         }
     }
 
