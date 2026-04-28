@@ -18,7 +18,6 @@ use {
                 transaction_state_container::StateContainer,
             },
         },
-        priority_formula::calculate_simple_pf_priority,
         validator::SchedulerPacing,
     },
     agave_banking_stage_ingress_types::BankingStageFeedback,
@@ -360,11 +359,16 @@ where
     /// in-queue transactions to derive it from (otherwise the min priority
     /// of a near-empty queue is arbitrary and the floor would be noise).
     ///
-    /// **Published floor:** the sigverify-space simple priority of the
-    /// scheduler queue's lowest-priority transaction (`priority_fee *
-    /// 1_000_000 / compute_unit_limit`, see
-    /// `priority_formula::calculate_simple_pf_priority`). Sigverify uses
-    /// the same shape per-packet so the comparison is unit-consistent.
+    /// **Published floor:** the bank-context full-formula priority of the
+    /// scheduler queue's lowest-priority transaction (the same number
+    /// the BTreeSet ranks by — `reward * 1_000_000 / (cost + 1)` from
+    /// `priority_formula::calculate_priority_and_cost`). Sigverify
+    /// approximates the same formula per-packet against
+    /// `MAINNET_FEE_CONTEXT` (see
+    /// `priority_formula::calculate_pf_drop_priority`). Bank-vs-mainnet
+    /// fee-context drift is small (mainnet defaults match real mainnet
+    /// `lamports_per_signature` and `burn_percent`); the comparison is
+    /// effectively unit-consistent.
     ///
     /// Semantics: "drop arrivals that are worse than what we'd evict
     /// anyway." The scheduler's BTreeSet evicts the lowest-priority entry
@@ -423,7 +427,7 @@ where
             // empty (heavy in-flight scheduling) or the queue-min tx parses
             // to a zero simple-priority, keep the previous floor implicitly
             // rather than clearing — the buffer is still under pressure.
-            if let Some(floor) = self.compute_simple_floor() {
+            if let Some(floor) = self.compute_pf_floor() {
                 self.feedback.set_priority_floor(floor);
                 self.count_metrics.update(|count_metrics| {
                     count_metrics.current_priority_fee_floor = floor;
@@ -437,7 +441,7 @@ where
             }
         } else if over_budget > 0 && buffer_guard_met {
             self.saturated = true;
-            if let Some(floor) = self.compute_simple_floor() {
+            if let Some(floor) = self.compute_pf_floor() {
                 self.feedback.set_priority_floor(floor);
                 self.count_metrics.update(|count_metrics| {
                     count_metrics.current_priority_fee_floor = floor;
@@ -446,16 +450,15 @@ where
         }
     }
 
-    /// Compute the pf-floor to publish: simple-priority of the queue's
-    /// lowest-priority tx. Returns `None` when the queue is empty, the
-    /// queue-min tx isn't parseable, or its simple-priority is zero (the
-    /// feedback channel rejects a zero floor — `0` is the "not saturated"
-    /// sentinel).
-    fn compute_simple_floor(&self) -> Option<u64> {
+    /// Compute the pf-floor to publish: bank-context full-formula priority
+    /// of the queue's lowest-priority tx. Reads the priority directly off
+    /// the `TransactionPriorityId` (cached on the BTreeSet entry — same
+    /// number the scheduler ranks by, no re-derivation). Returns `None`
+    /// when the queue is empty or the priority is zero (the feedback
+    /// channel rejects a zero floor — `0` is the "not saturated" sentinel).
+    fn compute_pf_floor(&self) -> Option<u64> {
         let priority_id = self.container.get_min_priority_id()?;
-        let tx = self.container.get_transaction(priority_id.id)?;
-        let simple_min = calculate_simple_pf_priority(tx)?;
-        (simple_min > 0).then_some(simple_min)
+        (priority_id.priority > 0).then_some(priority_id.priority)
     }
 
     /// Clears the transaction state container.

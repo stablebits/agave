@@ -6,7 +6,7 @@
 
 use {
     crate::{
-        priority_formula::calculate_simple_pf_priority, sigverify::TransactionSigVerifier,
+        priority_formula::calculate_pf_drop_priority, sigverify::TransactionSigVerifier,
     },
     agave_banking_stage_ingress_types::BankingStageFeedback,
     agave_transaction_view::transaction_view::SanitizedTransactionView,
@@ -180,14 +180,11 @@ impl SigVerifierStats {
 
 /// Approximate banking-stage priority for a packet from its raw bytes.
 ///
-/// Delegates to [`calculate_simple_pf_priority`], which returns
-/// `priority_fee_lamports * 1_000_000 / compute_unit_limit`. The
-/// scheduler publishes the floor using the same simple formula on its
-/// queue-min tx, so the comparison is unit-consistent. The simple
-/// shape is empirically more aggressive than the full priority formula
-/// — desired load-shedding behavior. The full-formula alternative
-/// ([`crate::priority_formula::calculate_pf_drop_priority`]) is kept
-/// for future use.
+/// Delegates to [`calculate_pf_drop_priority`], which evaluates the same
+/// `reward * 1_000_000 / (cost + 1)` formula the scheduler uses for queue
+/// ordering, against `MAINNET_FEE_CONTEXT` (sigverify has no live bank).
+/// Bank-vs-mainnet drift is small in practice; the comparison against the
+/// scheduler-published floor is effectively unit-consistent.
 ///
 /// Returns `None` if the packet cannot be parsed; callers should leave
 /// such packets alone (they will be rejected downstream if genuinely
@@ -200,7 +197,7 @@ pub(crate) fn approximate_priority(data: &[u8]) -> Option<u64> {
         None,
     )
     .ok()?;
-    calculate_simple_pf_priority(&runtime_tx)
+    calculate_pf_drop_priority(&runtime_tx)
 }
 
 /// Drop below-floor packets from `batches`. Below-floor packets are marked
