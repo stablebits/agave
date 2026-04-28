@@ -203,14 +203,27 @@ pub(crate) fn approximate_priority(data: &[u8]) -> Option<u64> {
     calculate_simple_pf_priority(&runtime_tx)
 }
 
-/// Apply the scheduler's published priority floor to freshly-received
-/// batches. Below-floor packets are marked `discard`; a batch is removed
-/// from the outer `Vec` entirely when no packets survive (which covers the
+/// Walk freshly-received batches once: feed the pre-filter simple-priority
+/// histogram on `feedback`, and (when `floor > 0`) drop below-floor packets.
+///
+/// The histogram feed runs unconditionally on every parseable packet so the
+/// scheduler-side percentile reflects the *true* input distribution rather
+/// than the survivor set after filtering. Without this, repeated saturation
+/// cycles ratchet the percentile upward as low-priority arrivals get
+/// silently filtered out — see the design discussion in
+/// `BankingStageFeedback`.
+///
+/// Below-floor packets are marked `discard`; a batch is removed from the
+/// outer `Vec` entirely when no packets survive (which covers the
 /// `PacketBatch::Single` below-floor case uniformly and also reclaims
 /// multi-packet batches whose packets all got dropped).
 ///
-/// Returns the number of packets newly dropped.
-pub(crate) fn apply_priority_floor(batches: &mut Vec<PacketBatch>, floor: u64) -> usize {
+/// Returns the number of packets newly dropped (always `0` when `floor == 0`).
+pub(crate) fn apply_priority_floor(
+    batches: &mut Vec<PacketBatch>,
+    floor: u64,
+    feedback: &BankingStageFeedback,
+) -> usize {
     let mut dropped: usize = 0;
     batches.retain_mut(|batch| {
         let mut any_kept = false;
@@ -233,11 +246,16 @@ pub(crate) fn apply_priority_floor(batches: &mut Vec<PacketBatch>, floor: u64) -
                 continue;
             };
             match approximate_priority(data) {
-                Some(priority) if priority < floor => {
-                    packet.meta_mut().set_discard(true);
-                    dropped = dropped.saturating_add(1);
+                Some(priority) => {
+                    feedback.add_simple_priority(priority);
+                    if floor > 0 && priority < floor {
+                        packet.meta_mut().set_discard(true);
+                        dropped = dropped.saturating_add(1);
+                    } else {
+                        any_kept = true;
+                    }
                 }
-                _ => any_kept = true,
+                None => any_kept = true,
             }
         }
         any_kept
@@ -281,17 +299,21 @@ impl SigVerifyStage {
             feedback.add_streamer_received(num_packets_received);
         }
 
-        // Apply the scheduler's priority floor *at dequeue*, before dedup and
-        // sig verification. For Single batches (QUIC-TPU's shape) this
-        // removes below-floor packets from the outer vec entirely, relieving
-        // both CPU and the sigverify→banking channel downstream.
+        // Walk batches once *at dequeue*, before dedup and sigverify, to:
+        //   (a) feed the pre-filter simple-priority histogram on the feedback
+        //       channel, and
+        //   (b) drop below-floor packets when the scheduler has published one.
+        // For Single batches (QUIC-TPU's shape) any drop removes the entry
+        // from the outer vec entirely, relieving both CPU and the
+        // sigverify→banking channel downstream.
         //
         // `num_packets` tracks packets that continue through the pipeline;
         // `num_packets_received` is preserved for the received-count stats so
         // drop counters remain subsets of total_packets.
         let mut num_packets = num_packets_received;
-        if let Some(floor) = banking_stage_feedback.and_then(|f| f.get_priority_floor()) {
-            let dropped = apply_priority_floor(&mut batches, floor);
+        if let Some(feedback) = banking_stage_feedback {
+            let floor = feedback.get_priority_floor().unwrap_or(0);
+            let dropped = apply_priority_floor(&mut batches, floor, feedback);
             if dropped > 0 {
                 stats.total_dropped_below_priority_floor = stats
                     .total_dropped_below_priority_floor

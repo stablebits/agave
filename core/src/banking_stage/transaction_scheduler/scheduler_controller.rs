@@ -85,7 +85,7 @@ const HISTOGRAM_FLOOR_PERCENTILE: f32 = 0.25;
 /// Minimum accumulated histogram weight before we trust a percentile read.
 /// Prevents publishing a noise-driven floor in the first few ticks of
 /// saturation while the histogram is still warming up.
-const HISTOGRAM_WARMUP_WEIGHT: f32 = 256.0;
+const HISTOGRAM_WARMUP_WEIGHT: u64 = 256;
 /// Log the full histogram distribution every N feedback ticks while the
 /// scheduler is saturated. Set to 0 to disable. Output goes to `info!`.
 const HISTOGRAM_LOG_EVERY_N_TICKS: u64 = 200;
@@ -201,15 +201,8 @@ where
     /// `update_scheduler_saturation_feedback` tick. Drives `pf_floor_k`
     /// adaptation; reset to 0 each tick.
     tick_num_dropped_on_capacity: u64,
-    /// Rolling log-bucket distribution of simple-priorities of buffered
-    /// transactions. Sampled-and-decayed each feedback tick; the published
-    /// floor is `histogram.percentile(HISTOGRAM_FLOOR_PERCENTILE) *
-    /// pf_floor_k`. Anchoring on a percentile (rather than queue-min)
-    /// puts the floor in the meaningful body of the distribution, where
-    /// scaling actually shifts the drop fraction.
-    simple_priority_histogram: SimplePriorityHistogram,
     /// Counter for `HISTOGRAM_LOG_EVERY_N_TICKS`-paced debug logging of
-    /// the full distribution. Bumped each saturated tick.
+    /// the simple-priority distribution. Bumped each saturated tick.
     histogram_log_tick: u64,
 }
 
@@ -268,7 +261,6 @@ where
             pf_floor_k: K_MIN,
             last_converged_k: K_MIN,
             tick_num_dropped_on_capacity: 0,
-            simple_priority_histogram: SimplePriorityHistogram::default(),
             histogram_log_tick: 0,
         }
     }
@@ -430,16 +422,19 @@ where
     /// of a near-empty queue is arbitrary and the floor would be noise).
     ///
     /// **Published floor:** `histogram.percentile(p) * pf_floor_k`, where
-    /// the histogram is a rolling log-bucket distribution of buffered
-    /// simple-priorities (sampled-and-decayed each tick, see
-    /// `simple_priority_histogram`), `p = HISTOGRAM_FLOOR_PERCENTILE` (the
-    /// fraction of the population we'd shed at `k=1`), and `pf_floor_k` is
-    /// an adaptive multiplier maintained by this function. The histogram
-    /// puts the floor anchor in the meaningful body of the distribution
-    /// (queue-min has near-zero simple-priority and was empirically too
-    /// weak to anchor on); the multiplier climbs while the scheduler is
-    /// still dropping on capacity and decays while saturated but no longer
-    /// overflowing.
+    /// the histogram is a rolling log-bucket distribution of *pre-filter*
+    /// arriving simple-priorities (fed by sigverify on every packet
+    /// before any drop decision; see
+    /// `BankingStageFeedback::add_simple_priority`), `p =
+    /// HISTOGRAM_FLOOR_PERCENTILE` (the fraction of arrivals we'd shed at
+    /// `k=1`), and `pf_floor_k` is an adaptive multiplier maintained by
+    /// this function. The histogram lives on the sigverify side so it
+    /// reflects the true input distribution rather than the survivor set
+    /// after filtering — without that, the percentile ratchets upward
+    /// each saturation cycle as low-priority arrivals get silently
+    /// excluded from the sample. The multiplier climbs while the
+    /// scheduler is still dropping on capacity and decays while saturated
+    /// but no longer overflowing.
     ///
     /// When the bucket is replenished past half of its burst capacity (or
     /// the buffer drains below the guard), we clear the published floor and
@@ -493,9 +488,14 @@ where
         let tick_drops = std::mem::take(&mut self.tick_num_dropped_on_capacity);
 
         // Decay the rolling simple-priority histogram each tick. The histogram
-        // is fed on-entry by `receive_and_buffer_packets` (not here); decay is
-        // what implements the rolling window.
-        self.simple_priority_histogram.decay(HISTOGRAM_DECAY);
+        // is fed on every arrival by sigverify (in `apply_priority_floor`,
+        // *before* the floor check) — see `BankingStageFeedback::add_simple_priority`.
+        // Decay is what implements the rolling window. Then snapshot for this
+        // tick's percentile reads.
+        self.feedback.decay_simple_priority_buckets(HISTOGRAM_DECAY);
+        let histogram_snapshot = SimplePriorityHistogram::from_snapshot(
+            self.feedback.snapshot_simple_priority_buckets(),
+        );
 
         // Record observability metrics regardless of saturation state.
         self.count_metrics.update(|count_metrics| {
@@ -527,7 +527,7 @@ where
             {
                 info!(
                     "pf-floor histogram: {} k={:.3}",
-                    self.simple_priority_histogram.format_summary(),
+                    histogram_snapshot.format_summary(),
                     self.pf_floor_k,
                 );
             }
@@ -535,7 +535,7 @@ where
             // Refresh the floor from the histogram percentile, scaled by k.
             // If the histogram is still warming up, keep the previous floor
             // implicitly rather than clearing — the buffer is under pressure.
-            if let Some(floor) = self.compute_simple_floor() {
+            if let Some(floor) = self.compute_simple_floor(&histogram_snapshot) {
                 self.feedback.set_priority_floor(floor);
                 self.count_metrics.update(|count_metrics| {
                     count_metrics.current_priority_fee_floor = floor;
@@ -555,7 +555,7 @@ where
             // Jump-start near the previously converged k so the controller
             // doesn't have to re-climb from K_MIN each saturation episode.
             self.pf_floor_k = (self.last_converged_k - K_REENTRY_BACKOFF).max(K_MIN);
-            if let Some(floor) = self.compute_simple_floor() {
+            if let Some(floor) = self.compute_simple_floor(&histogram_snapshot) {
                 self.feedback.set_priority_floor(floor);
                 self.count_metrics.update(|count_metrics| {
                     count_metrics.current_priority_fee_floor = floor;
@@ -569,13 +569,11 @@ where
     /// Returns `None` while the histogram is still warming up, the
     /// percentile is zero, or the scaled value is zero (the feedback
     /// channel rejects a zero floor — `0` is the "not saturated" sentinel).
-    fn compute_simple_floor(&self) -> Option<u64> {
-        if self.simple_priority_histogram.total_weight() < HISTOGRAM_WARMUP_WEIGHT {
+    fn compute_simple_floor(&self, histogram: &SimplePriorityHistogram) -> Option<u64> {
+        if histogram.total_weight() < HISTOGRAM_WARMUP_WEIGHT {
             return None;
         }
-        let anchor = self
-            .simple_priority_histogram
-            .percentile(HISTOGRAM_FLOOR_PERCENTILE)?;
+        let anchor = histogram.percentile(HISTOGRAM_FLOOR_PERCENTILE)?;
         let scaled = (anchor as f64 * self.pf_floor_k as f64) as u64;
         (scaled > 0).then_some(scaled)
     }
@@ -684,11 +682,9 @@ where
         &mut self,
         decision: &BufferedPacketsDecision,
     ) -> Result<ReceivingStats, DisconnectedError> {
-        let receiving_stats = self.receive_and_buffer.receive_and_buffer_packets(
-            &mut self.container,
-            decision,
-            &mut self.simple_priority_histogram,
-        )?;
+        let receiving_stats = self
+            .receive_and_buffer
+            .receive_and_buffer_packets(&mut self.container, decision)?;
 
         // Drained from the sigverify→scheduler channel, counted including
         // packets marked `discard` so the gauge reflects true transport
