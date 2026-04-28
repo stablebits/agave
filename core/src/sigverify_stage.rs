@@ -203,27 +203,14 @@ pub(crate) fn approximate_priority(data: &[u8]) -> Option<u64> {
     calculate_simple_pf_priority(&runtime_tx)
 }
 
-/// Walk freshly-received batches once: feed the pre-filter simple-priority
-/// histogram on `feedback`, and (when `floor > 0`) drop below-floor packets.
+/// Drop below-floor packets from `batches`. Below-floor packets are marked
+/// `discard`; a batch is removed from the outer `Vec` entirely when no
+/// packets survive (which covers the `PacketBatch::Single` below-floor case
+/// uniformly and also reclaims multi-packet batches whose packets all got
+/// dropped).
 ///
-/// The histogram feed runs unconditionally on every parseable packet so the
-/// scheduler-side percentile reflects the *true* input distribution rather
-/// than the survivor set after filtering. Without this, repeated saturation
-/// cycles ratchet the percentile upward as low-priority arrivals get
-/// silently filtered out — see the design discussion in
-/// `BankingStageFeedback`.
-///
-/// Below-floor packets are marked `discard`; a batch is removed from the
-/// outer `Vec` entirely when no packets survive (which covers the
-/// `PacketBatch::Single` below-floor case uniformly and also reclaims
-/// multi-packet batches whose packets all got dropped).
-///
-/// Returns the number of packets newly dropped (always `0` when `floor == 0`).
-pub(crate) fn apply_priority_floor(
-    batches: &mut Vec<PacketBatch>,
-    floor: u64,
-    feedback: &BankingStageFeedback,
-) -> usize {
+/// Returns the number of packets newly dropped.
+pub(crate) fn apply_priority_floor(batches: &mut Vec<PacketBatch>, floor: u64) -> usize {
     let mut dropped: usize = 0;
     batches.retain_mut(|batch| {
         let mut any_kept = false;
@@ -246,16 +233,11 @@ pub(crate) fn apply_priority_floor(
                 continue;
             };
             match approximate_priority(data) {
-                Some(priority) => {
-                    feedback.add_simple_priority(priority);
-                    if floor > 0 && priority < floor {
-                        packet.meta_mut().set_discard(true);
-                        dropped = dropped.saturating_add(1);
-                    } else {
-                        any_kept = true;
-                    }
+                Some(priority) if priority < floor => {
+                    packet.meta_mut().set_discard(true);
+                    dropped = dropped.saturating_add(1);
                 }
-                None => any_kept = true,
+                _ => any_kept = true,
             }
         }
         any_kept
@@ -293,28 +275,17 @@ impl SigVerifyStage {
         let (mut batches, num_packets_received, recv_duration) =
             streamer::recv_packet_batches(recvr, SOFT_RECEIVE_CAP)?;
 
-        // Walk batches once *at dequeue*, before dedup and sigverify, to:
-        //   (a) feed the pre-filter simple-priority histogram on the feedback
-        //       channel, and
-        //   (b) drop below-floor packets when the scheduler has published one.
-        // For Single batches (QUIC-TPU's shape) any drop removes the entry
-        // from the outer vec entirely, relieving both CPU and the
-        // sigverify→banking channel downstream.
+        // The scheduler-published pf-floor drop is applied below, *after*
+        // dedup and *before* signature verification. Doing it post-dedup
+        // means duplicate high-priority arrivals (very common — same tx
+        // hitting multiple TPU forwarders) don't crowd out unique
+        // lower-priority work; doing it pre-sigverify still saves
+        // signature-verification CPU on what we'd otherwise drop.
         //
         // `num_packets` tracks packets that continue through the pipeline;
         // `num_packets_received` is preserved for the received-count stats so
         // drop counters remain subsets of total_packets.
-        let mut num_packets = num_packets_received;
-        if let Some(feedback) = banking_stage_feedback {
-            let floor = feedback.get_priority_floor().unwrap_or(0);
-            let dropped = apply_priority_floor(&mut batches, floor, feedback);
-            if dropped > 0 {
-                stats.total_dropped_below_priority_floor = stats
-                    .total_dropped_below_priority_floor
-                    .saturating_add(dropped);
-                num_packets = num_packets.saturating_sub(dropped);
-            }
-        }
+        let num_packets = num_packets_received;
 
         // If we're already at capacity immediately drop the packets
         let mut should_drop = false;
@@ -347,7 +318,23 @@ impl SigVerifyStage {
             let discard_or_dedup_fail =
                 deduper::dedup_packets_and_count_discards(deduper, &mut batches) as usize;
             dedup_time.stop();
-            let num_packets_to_verify = num_packets.saturating_sub(discard_or_dedup_fail);
+            let mut num_packets_to_verify = num_packets.saturating_sub(discard_or_dedup_fail);
+
+            // Apply the scheduler-published priority floor *after* dedup
+            // and *before* signature verification. Post-dedup so duplicate
+            // high-priority arrivals don't bias the cut; pre-sigverify so
+            // we still save signature-verification CPU on what we drop.
+            if let Some(floor) =
+                banking_stage_feedback.and_then(|f| f.get_priority_floor())
+            {
+                let dropped = apply_priority_floor(&mut batches, floor);
+                if dropped > 0 {
+                    stats.total_dropped_below_priority_floor = stats
+                        .total_dropped_below_priority_floor
+                        .saturating_add(dropped);
+                    num_packets_to_verify = num_packets_to_verify.saturating_sub(dropped);
+                }
+            }
 
             verifier.verify_and_send_packets(
                 batches,

@@ -7,7 +7,6 @@ use {
         scheduler::Scheduler,
         scheduler_error::SchedulerError,
         scheduler_metrics::{SchedulerCountMetrics, SchedulerTimingMetrics, SchedulingDetails},
-        simple_priority_histogram::SimplePriorityHistogram,
     },
     crate::{
         banking_stage::{
@@ -19,6 +18,7 @@ use {
                 transaction_state_container::StateContainer,
             },
         },
+        priority_formula::calculate_simple_pf_priority,
         validator::SchedulerPacing,
     },
     agave_banking_stage_ingress_types::BankingStageFeedback,
@@ -53,42 +53,6 @@ pub const DEFAULT_TOKEN_BUCKET_BURST: u64 = 25_000;
 /// floor when the queue is near-empty (the min priority of a tiny set of
 /// stragglers is noise, not signal).
 pub const DEFAULT_SATURATION_MIN_QUEUE_PCT: u8 = 90;
-
-/// Adaptive pf-floor multiplier bounds. The published floor is
-/// `simple_priority(queue_min) * pf_floor_k`. `K_MIN = 1.0` keeps the floor
-/// from ever falling below queue-min (publishing below queue-min is pointless
-/// — those txs already survive the scheduler's eviction). `K_MAX` caps
-/// overshoot when arrival load exceeds anything sigverify can shed by
-/// priority alone.
-const K_MIN: f32 = 1.0;
-const K_MAX: f32 = 5.0;
-/// Per-tick adjustments to `pf_floor_k`. Asymmetric on purpose: faster up
-/// (shed quickly when scheduler is still hitting capacity drops) than down
-/// (avoid oscillation around equilibrium).
-const K_STEP_UP: f32 = 0.05;
-const K_STEP_DOWN: f32 = 0.005;
-/// On re-saturation, jump-start `pf_floor_k` this far below the previously
-/// converged value rather than climbing from `K_MIN` again. Leaves room for
-/// the controller to re-discover equilibrium without overshooting.
-const K_REENTRY_BACKOFF: f32 = 0.5;
-
-/// Multiplicative decay applied to the histogram each feedback tick. The
-/// histogram is fed on-entry by `receive_and_buffer`, so decay alone is
-/// what implements the rolling window (we don't track removals). Lower =
-/// faster response to distribution drift; higher = smoother percentile.
-const HISTOGRAM_DECAY: f32 = 0.95;
-/// Percentile of the buffer's simple-priority distribution used as the
-/// pre-`k` floor anchor. `0.25` means "drop the bottom quarter of the
-/// buffer's distribution"; `pf_floor_k` then scales that up to the actual
-/// drop fraction needed to keep the scheduler from overflowing.
-const HISTOGRAM_FLOOR_PERCENTILE: f32 = 0.25;
-/// Minimum accumulated histogram weight before we trust a percentile read.
-/// Prevents publishing a noise-driven floor in the first few ticks of
-/// saturation while the histogram is still warming up.
-const HISTOGRAM_WARMUP_WEIGHT: u64 = 256;
-/// Log the full histogram distribution every N feedback ticks while the
-/// scheduler is saturated. Set to 0 to disable. Output goes to `info!`.
-const HISTOGRAM_LOG_EVERY_N_TICKS: u64 = 200;
 
 #[derive(Clone)]
 pub struct SchedulerConfig {
@@ -184,23 +148,6 @@ where
     /// Precomputed from config: token-bucket level at which saturation
     /// de-asserts (hysteresis), currently `token_bucket_burst / 2`.
     desaturate_tokens_threshold: u64,
-    /// Adaptive multiplier applied to the simple-priority of the queue-min
-    /// tx when publishing the pf-floor. Climbs while the scheduler is still
-    /// hitting `num_dropped_on_capacity` (sigverify isn't shedding enough),
-    /// decays while saturated but no longer overflowing. Always within
-    /// `[K_MIN, K_MAX]`.
-    pf_floor_k: f32,
-    /// Last `pf_floor_k` value at desaturation. Used to jump-start the next
-    /// saturation episode (minus `K_REENTRY_BACKOFF`) so the controller
-    /// doesn't have to re-climb from `K_MIN` each time.
-    last_converged_k: f32,
-    /// Capacity drops accumulated since the last
-    /// `update_scheduler_saturation_feedback` tick. Drives `pf_floor_k`
-    /// adaptation; reset to 0 each tick.
-    tick_num_dropped_on_capacity: u64,
-    /// Counter for `HISTOGRAM_LOG_EVERY_N_TICKS`-paced debug logging of
-    /// the simple-priority distribution. Bumped each saturated tick.
-    histogram_log_tick: u64,
 }
 
 impl<R, S> SchedulerController<R, S>
@@ -254,10 +201,6 @@ where
             prev_total_received,
             buffer_guard_threshold,
             desaturate_tokens_threshold,
-            pf_floor_k: K_MIN,
-            last_converged_k: K_MIN,
-            tick_num_dropped_on_capacity: 0,
-            histogram_log_tick: 0,
         }
     }
 
@@ -417,25 +360,28 @@ where
     /// in-queue transactions to derive it from (otherwise the min priority
     /// of a near-empty queue is arbitrary and the floor would be noise).
     ///
-    /// **Published floor:** `histogram.percentile(p) * pf_floor_k`, where
-    /// the histogram is a rolling log-bucket distribution of *pre-filter*
-    /// arriving simple-priorities (fed by sigverify on every packet
-    /// before any drop decision; see
-    /// `BankingStageFeedback::add_simple_priority`), `p =
-    /// HISTOGRAM_FLOOR_PERCENTILE` (the fraction of arrivals we'd shed at
-    /// `k=1`), and `pf_floor_k` is an adaptive multiplier maintained by
-    /// this function. The histogram lives on the sigverify side so it
-    /// reflects the true input distribution rather than the survivor set
-    /// after filtering — without that, the percentile ratchets upward
-    /// each saturation cycle as low-priority arrivals get silently
-    /// excluded from the sample. The multiplier climbs while the
-    /// scheduler is still dropping on capacity and decays while saturated
-    /// but no longer overflowing.
+    /// **Published floor:** the sigverify-space simple priority of the
+    /// scheduler queue's lowest-priority transaction (`priority_fee *
+    /// 1_000_000 / compute_unit_limit`, see
+    /// `priority_formula::calculate_simple_pf_priority`). Sigverify uses
+    /// the same shape per-packet so the comparison is unit-consistent.
+    ///
+    /// Semantics: "drop arrivals that are worse than what we'd evict
+    /// anyway." The scheduler's BTreeSet evicts the lowest-priority entry
+    /// on overflow, so any incoming tx below the queue-min is one we
+    /// would have evicted on insertion — sigverify cuts those off
+    /// upstream to save signature-verification CPU. The floor is
+    /// self-stabilizing: when the queue evicts low-priority entries,
+    /// queue-min rises and the published floor with it; when the queue
+    /// drains, the floor falls and sigverify lets more through.
+    ///
+    /// We do *not* try to drive `num_dropped_on_capacity` to zero —
+    /// capacity drops are how the scheduler enforces priority-aware
+    /// admission (lowest queue entry yields to a higher-priority arrival),
+    /// so a non-zero counter under load is the expected behavior.
     ///
     /// When the bucket is replenished past half of its burst capacity (or
-    /// the buffer drains below the guard), we clear the published floor and
-    /// cache the converged `k` so the next saturation episode can jump-start
-    /// near it rather than climbing from `K_MIN`.
+    /// the buffer drains below the guard), we clear the published floor.
     fn update_scheduler_saturation_feedback(&mut self) {
         // Observe the sigverify→scheduler channel depth every tick,
         // independent of the pf-floor feature. Useful on its own for
@@ -460,20 +406,6 @@ where
         let over_budget = arrivals.saturating_sub(consumed);
         let current_tokens = bucket.current_tokens();
 
-        // Drain per-tick capacity drops accumulated by `receive_and_buffer_packets`.
-        // Used as the error signal for the adaptive `pf_floor_k`.
-        let tick_drops = std::mem::take(&mut self.tick_num_dropped_on_capacity);
-
-        // Decay the rolling simple-priority histogram each tick. The histogram
-        // is fed on every arrival by sigverify (in `apply_priority_floor`,
-        // *before* the floor check) — see `BankingStageFeedback::add_simple_priority`.
-        // Decay is what implements the rolling window. Then snapshot for this
-        // tick's percentile reads.
-        self.feedback.decay_simple_priority_buckets(HISTOGRAM_DECAY);
-        let histogram_snapshot = SimplePriorityHistogram::from_snapshot(
-            self.feedback.snapshot_simple_priority_buckets(),
-        );
-
         // Record observability metrics regardless of saturation state.
         self.count_metrics.update(|count_metrics| {
             count_metrics.rate_limiter_tokens_remaining = current_tokens;
@@ -486,33 +418,12 @@ where
         let buffer_guard_met = self.container.buffer_size() >= self.buffer_guard_threshold;
 
         if self.saturated {
-            // Adapt k: capacity drops mean sigverify isn't shedding enough,
-            // bump up; otherwise decay slowly toward K_MIN.
-            if tick_drops > 0 {
-                self.pf_floor_k = (self.pf_floor_k + K_STEP_UP).min(K_MAX);
-            } else {
-                self.pf_floor_k = (self.pf_floor_k - K_STEP_DOWN).max(K_MIN);
-            }
-
-            // Periodic debug log of the full simple-priority distribution.
-            // Only emitted while saturated to avoid noise during normal
-            // operation; a one-line p10/p25/p50/p75/p90 summary plus the
-            // current k and published floor.
-            self.histogram_log_tick = self.histogram_log_tick.wrapping_add(1);
-            if HISTOGRAM_LOG_EVERY_N_TICKS > 0
-                && self.histogram_log_tick % HISTOGRAM_LOG_EVERY_N_TICKS == 0
-            {
-                info!(
-                    "pf-floor histogram: {} k={:.3}",
-                    histogram_snapshot.format_summary(),
-                    self.pf_floor_k,
-                );
-            }
-
-            // Refresh the floor from the histogram percentile, scaled by k.
-            // If the histogram is still warming up, keep the previous floor
-            // implicitly rather than clearing — the buffer is under pressure.
-            if let Some(floor) = self.compute_simple_floor(&histogram_snapshot) {
+            // Refresh the floor from the queue's current min (in sigverify
+            // simple-priority units). If the priority queue is momentarily
+            // empty (heavy in-flight scheduling) or the queue-min tx parses
+            // to a zero simple-priority, keep the previous floor implicitly
+            // rather than clearing — the buffer is still under pressure.
+            if let Some(floor) = self.compute_simple_floor() {
                 self.feedback.set_priority_floor(floor);
                 self.count_metrics.update(|count_metrics| {
                     count_metrics.current_priority_fee_floor = floor;
@@ -522,17 +433,11 @@ where
             // drained below guard (pressure is gone).
             if current_tokens >= self.desaturate_tokens_threshold || !buffer_guard_met {
                 self.saturated = false;
-                self.last_converged_k = self.pf_floor_k;
-                self.pf_floor_k = K_MIN;
                 self.feedback.clear_priority_floor();
             }
         } else if over_budget > 0 && buffer_guard_met {
             self.saturated = true;
-            self.histogram_log_tick = 0;
-            // Jump-start near the previously converged k so the controller
-            // doesn't have to re-climb from K_MIN each saturation episode.
-            self.pf_floor_k = (self.last_converged_k - K_REENTRY_BACKOFF).max(K_MIN);
-            if let Some(floor) = self.compute_simple_floor(&histogram_snapshot) {
+            if let Some(floor) = self.compute_simple_floor() {
                 self.feedback.set_priority_floor(floor);
                 self.count_metrics.update(|count_metrics| {
                     count_metrics.current_priority_fee_floor = floor;
@@ -541,18 +446,16 @@ where
         }
     }
 
-    /// Compute the pf-floor to publish:
-    /// `histogram.percentile(HISTOGRAM_FLOOR_PERCENTILE) * pf_floor_k`.
-    /// Returns `None` while the histogram is still warming up, the
-    /// percentile is zero, or the scaled value is zero (the feedback
-    /// channel rejects a zero floor — `0` is the "not saturated" sentinel).
-    fn compute_simple_floor(&self, histogram: &SimplePriorityHistogram) -> Option<u64> {
-        if histogram.total_weight() < HISTOGRAM_WARMUP_WEIGHT {
-            return None;
-        }
-        let anchor = histogram.percentile(HISTOGRAM_FLOOR_PERCENTILE)?;
-        let scaled = (anchor as f64 * self.pf_floor_k as f64) as u64;
-        (scaled > 0).then_some(scaled)
+    /// Compute the pf-floor to publish: simple-priority of the queue's
+    /// lowest-priority tx. Returns `None` when the queue is empty, the
+    /// queue-min tx isn't parseable, or its simple-priority is zero (the
+    /// feedback channel rejects a zero floor — `0` is the "not saturated"
+    /// sentinel).
+    fn compute_simple_floor(&self) -> Option<u64> {
+        let priority_id = self.container.get_min_priority_id()?;
+        let tx = self.container.get_transaction(priority_id.id)?;
+        let simple_min = calculate_simple_pf_priority(tx)?;
+        (simple_min > 0).then_some(simple_min)
     }
 
     /// Clears the transaction state container.
@@ -695,14 +598,6 @@ where
             count_metrics.num_dropped_on_capacity += *num_dropped_on_capacity;
             count_metrics.num_buffered += *num_buffered;
         });
-
-        // Accumulate capacity drops for the adaptive pf-floor controller.
-        // `count_metrics.num_dropped_on_capacity` resets at interval-report
-        // boundaries, which is the wrong cadence for k adaptation, so we
-        // keep our own per-tick counter.
-        self.tick_num_dropped_on_capacity = self
-            .tick_num_dropped_on_capacity
-            .saturating_add(receiving_stats.num_dropped_on_capacity as u64);
 
         self.timing_metrics.update(|timing_metrics| {
             timing_metrics.receive_time_us += receiving_stats.receive_time_us;
