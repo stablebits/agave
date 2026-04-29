@@ -14,7 +14,7 @@ use {
         scheduler_priority::{FeeContext, calculate_pf_drop_priority, calculate_priority_and_cost},
     },
     agave_banking_stage_ingress_types::{
-        BankingPacketBatch, BankingPacketReceiver, BankingStageFeedback,
+        BankingPacketBatch, BankingPacketReceiver, SchedulerPriorityFloor,
     },
     agave_transaction_view::{
         resolved_transaction_view::ResolvedTransactionView, transaction_data::TransactionData,
@@ -114,10 +114,9 @@ pub(crate) trait ReceiveAndBuffer {
 pub(crate) struct TransactionViewReceiveAndBuffer {
     pub receiver: BankingPacketReceiver,
     pub sharable_banks: SharableBanks,
-    /// Shared feedback channel; used here only as a *read* side, to
-    /// fetch the currently-published pf-floor so we can drop in-flight
-    /// arrivals that beat sigverify's filter.
-    pub feedback: Arc<BankingStageFeedback>,
+    /// Shared scheduler-published priority floor. Used here only as a read
+    /// side so we can drop in-flight arrivals that beat sigverify's filter.
+    pub priority_floor: Arc<SchedulerPriorityFloor>,
 }
 
 impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
@@ -287,7 +286,7 @@ impl TransactionViewReceiveAndBuffer {
         // Snapshot the published pf-floor once per batch. Cheap atomic read,
         // and the floor is intentionally coarse — re-reading per packet
         // would only add noise.
-        let pf_floor = self.feedback.get_priority_floor().unwrap_or(0);
+        let pf_floor = self.priority_floor.get().unwrap_or(0);
 
         let mut check_and_push_to_queue =
             |container: &mut TransactionViewStateContainer,
@@ -629,7 +628,7 @@ mod tests {
         let receive_and_buffer = TransactionViewReceiveAndBuffer {
             receiver,
             sharable_banks: bank_forks.read().unwrap().sharable_banks(),
-            feedback: Arc::new(BankingStageFeedback::default()),
+            priority_floor: Arc::new(SchedulerPriorityFloor::default()),
         };
         let container = TransactionViewStateContainer::with_capacity(TEST_CONTAINER_CAPACITY);
         (receive_and_buffer, container)

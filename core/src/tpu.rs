@@ -23,7 +23,7 @@ use {
         tpu_entry_notifier::TpuEntryNotifier,
         validator::{BlockProductionMethod, GeneratorConfig},
     },
-    agave_banking_stage_ingress_types::BankingStageFeedback,
+    agave_banking_stage_ingress_types::SchedulerPriorityFloor,
     agave_votor::event::VotorEventSender,
     crossbeam_channel::{Receiver, bounded, unbounded},
     solana_clock::Slot,
@@ -262,7 +262,7 @@ impl Tpu {
         // Shared sigverify→scheduler coordination channel. The scheduler
         // publishes a priority floor under saturation; sigverify reads it
         // and drops below-floor packets ahead of signature verification.
-        let banking_stage_feedback = Arc::new(BankingStageFeedback::default());
+        let scheduler_priority_floor = Arc::new(SchedulerPriorityFloor::default());
 
         let (sigverify_stage, gossip_sigverify_handle) = SigVerifyStage::new(
             packet_receiver,
@@ -272,7 +272,7 @@ impl Tpu {
             forward_stage_sender.clone(),
             tpu_sigverify_threads,
             enable_block_production_forwarding,
-            Some(banking_stage_feedback.clone()),
+            Some(scheduler_priority_floor.clone()),
         );
 
         let cluster_info_vote_listener = ClusterInfoVoteListener::new(
@@ -306,7 +306,7 @@ impl Tpu {
             log_messages_bytes_limit,
             bank_forks.clone(),
             prioritization_fee_cache,
-            banking_stage_feedback,
+            scheduler_priority_floor,
         );
 
         #[cfg(unix)]

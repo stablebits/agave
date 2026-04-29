@@ -13,7 +13,7 @@ use {
             TransactionSigVerifier,
         },
     },
-    agave_banking_stage_ingress_types::{BankingPacketBatch, BankingStageFeedback},
+    agave_banking_stage_ingress_types::{BankingPacketBatch, SchedulerPriorityFloor},
     core::time::Duration,
     crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded},
     solana_measure::measure::Measure,
@@ -247,7 +247,7 @@ impl SigVerifyStage {
         forward_stage_sender: Sender<(BankingPacketBatch, bool)>,
         num_workers: NonZeroUsize,
         forward_non_votes: bool,
-        banking_stage_feedback: Option<Arc<BankingStageFeedback>>,
+        scheduler_priority_floor: Option<Arc<SchedulerPriorityFloor>>,
     ) -> (Self, GossipSigVerifyHandle) {
         let (gossip_verified_vote_sender, verified_vote_receiver) = unbounded();
         let non_vote_stats = SigVerifierStats::default();
@@ -274,7 +274,7 @@ impl SigVerifyStage {
             "solSigVerTpu",
             "tpu-verifier",
             non_vote_stats,
-            banking_stage_feedback,
+            scheduler_priority_floor,
         );
         let tpu_vote_thread_hdl = Self::verifier_service(
             vote_packet_receiver,
@@ -312,7 +312,7 @@ impl SigVerifyStage {
         recvr: &Receiver<PacketBatch>,
         verifier: &mut TransactionSigVerifier,
         stats: &mut SigVerifierStats,
-        banking_stage_feedback: Option<&Arc<BankingStageFeedback>>,
+        scheduler_priority_floor: Option<&Arc<SchedulerPriorityFloor>>,
     ) -> Result<()> {
         const SOFT_RECEIVE_CAP: usize = 5_000;
         let (mut batches, num_packets, recv_duration) =
@@ -335,7 +335,7 @@ impl SigVerifyStage {
 
         // Apply the scheduler-published pf-floor to drop low-priority transactions
         // earlier when the scheduler is saturated.
-        if let Some(floor) = banking_stage_feedback.and_then(|f| f.get_priority_floor()) {
+        if let Some(floor) = scheduler_priority_floor.and_then(|f| f.get()) {
             let dropped = apply_priority_floor(&mut batches, floor);
             if dropped > 0 {
                 stats.total_dropped_below_priority_floor = stats
@@ -361,7 +361,7 @@ impl SigVerifyStage {
         thread_name: &'static str,
         metrics_name: &'static str,
         mut stats: SigVerifierStats,
-        banking_stage_feedback: Option<Arc<BankingStageFeedback>>,
+        scheduler_priority_floor: Option<Arc<SchedulerPriorityFloor>>,
     ) -> JoinHandle<()> {
         let mut last_print = Instant::now();
         const MAX_DEDUPER_AGE: Duration = Duration::from_secs(2);
@@ -381,7 +381,7 @@ impl SigVerifyStage {
                         &packet_receiver,
                         &mut verifier,
                         &mut stats,
-                        banking_stage_feedback.as_ref(),
+                        scheduler_priority_floor.as_ref(),
                     ) {
                         match e {
                             SigVerifyServiceError::Streamer(StreamerError::RecvTimeout(

@@ -19,7 +19,7 @@ use {
         },
         validator::BlockProductionMethod,
     },
-    agave_banking_stage_ingress_types::{BankingPacketReceiver, BankingStageFeedback},
+    agave_banking_stage_ingress_types::{BankingPacketReceiver, SchedulerPriorityFloor},
     crossbeam_channel::{Receiver, Sender, unbounded},
     futures::{StreamExt, stream::FuturesUnordered},
     histogram::Histogram,
@@ -338,7 +338,7 @@ pub struct BankingStage {
     bank_forks: Arc<RwLock<BankForks>>,
     committer: Committer,
     log_messages_bytes_limit: Option<usize>,
-    feedback: Arc<BankingStageFeedback>,
+    priority_floor: Arc<SchedulerPriorityFloor>,
     threads: FuturesUnordered<NamedTask<std::thread::Result<()>>>,
 }
 
@@ -359,7 +359,7 @@ impl BankingStage {
         log_messages_bytes_limit: Option<usize>,
         bank_forks: Arc<RwLock<BankForks>>,
         prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
-        feedback: Arc<BankingStageFeedback>,
+        priority_floor: Arc<SchedulerPriorityFloor>,
     ) -> BankingStageHandle {
         let committer = Committer::new(
             transaction_status_sender,
@@ -381,7 +381,7 @@ impl BankingStage {
             bank_forks,
             committer,
             log_messages_bytes_limit,
-            feedback,
+            priority_floor,
             threads: FuturesUnordered::default(),
         };
 
@@ -440,10 +440,10 @@ impl BankingStage {
     }
 
     async fn cycle_threads(&mut self, args: BankingControlMsg) -> Result<(), ()> {
-        // Feedback is produced only by the internal scheduler. Clear it before
-        // cycling workers so sigverify does not keep applying a stale floor
-        // while the scheduler is stopped or switching modes.
-        self.feedback.clear_priority_floor();
+        // The priority floor is produced only by the internal scheduler. Clear
+        // it before cycling workers so sigverify does not keep applying a stale
+        // floor while the scheduler is stopped or switching modes.
+        self.priority_floor.clear();
 
         // Shutdown all current threads.
         self.worker_exit_signal.store(true, Ordering::Relaxed);
@@ -475,7 +475,7 @@ impl BankingStage {
     fn spawn_scheduler(&mut self, args: BankingControlMsg) -> Result<(), ()> {
         // The requested scheduler may be external, disabled, or have different
         // pf-floor settings than the previous one. Always start unsaturated.
-        self.feedback.clear_priority_floor();
+        self.priority_floor.clear();
 
         let threads = (match args {
             BankingControlMsg::Internal {
@@ -522,7 +522,7 @@ impl BankingStage {
         let receive_and_buffer = TransactionViewReceiveAndBuffer {
             receiver: self.non_vote_receiver.clone(),
             sharable_banks: sharable_banks.clone(),
-            feedback: self.feedback.clone(),
+            priority_floor: self.priority_floor.clone(),
         };
 
         // Spawn vote worker.
@@ -570,7 +570,7 @@ impl BankingStage {
         // assignment without introducing `dyn`.
         macro_rules! spawn_scheduler {
             ($scheduler:ident) => {
-                let feedback = self.feedback.clone();
+                let priority_floor = self.priority_floor.clone();
                 let exit = exit.clone();
                 let shutdown_signal = self.banking_shutdown_signal.clone();
                 threads.push(
@@ -585,7 +585,7 @@ impl BankingStage {
                                 sharable_banks,
                                 $scheduler,
                                 worker_metrics,
-                                feedback,
+                                priority_floor,
                             );
 
                             match scheduler_controller.run() {
@@ -944,7 +944,7 @@ mod tests {
             None,
             bank_forks,
             None,
-            Arc::new(BankingStageFeedback::default()),
+            Arc::new(SchedulerPriorityFloor::default()),
         );
         drop(non_vote_sender);
         drop(tpu_vote_sender);
@@ -1006,7 +1006,7 @@ mod tests {
             None,
             bank_forks, // keep a local-copy of bank-forks so worker threads do not lose weak access to bank-forks
             None,
-            Arc::new(BankingStageFeedback::default()),
+            Arc::new(SchedulerPriorityFloor::default()),
         );
 
         // good tx, and no verify
@@ -1162,7 +1162,7 @@ mod tests {
                 None,
                 bank_forks,
                 None,
-                Arc::new(BankingStageFeedback::default()),
+                Arc::new(SchedulerPriorityFloor::default()),
             );
 
             // wait for banking_stage to eat the packets
@@ -1317,7 +1317,7 @@ mod tests {
             None,
             bank_forks,
             None,
-            Arc::new(BankingStageFeedback::default()),
+            Arc::new(SchedulerPriorityFloor::default()),
         );
 
         let keypairs = (0..100).map(|_| Keypair::new()).collect_vec();
