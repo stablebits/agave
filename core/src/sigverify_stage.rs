@@ -7,21 +7,24 @@
 use {
     crate::{
         banking_trace::BankingPacketSender,
+        priority_formula::calculate_pf_drop_priority,
         sigverify::{
             GossipSigVerifier, GossipVerifiedVoteBatch, SigVerifyWorkerPool, SigVerifyWorkerStats,
             TransactionSigVerifier,
         },
     },
-    agave_banking_stage_ingress_types::BankingPacketBatch,
+    agave_banking_stage_ingress_types::{BankingPacketBatch, BankingStageFeedback},
+    agave_transaction_view::transaction_view::SanitizedTransactionView,
     core::time::Duration,
     crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded},
     solana_measure::measure::Measure,
     solana_perf::{
         deduper::{self, Deduper},
-        packet::PacketBatch,
+        packet::{PacketBatch, PacketFlags},
     },
+    solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
     solana_streamer::streamer::{self, StreamerError},
-    solana_transaction::Transaction,
+    solana_transaction::{Transaction, sanitized::MessageHash},
     std::{
         num::NonZeroUsize,
         sync::{
@@ -69,9 +72,12 @@ struct SigVerifierStats {
     total_dedup_time_us: usize,
     total_verify_time_us: Arc<AtomicUsize>,
     total_dropped_on_capacity: usize,
+    total_dropped_below_priority_floor: usize,
 }
 
 impl SigVerifierStats {
+    const REPORT_INTERVAL: Duration = Duration::from_secs(2);
+
     fn maybe_report_and_reset(&mut self, name: &'static str) {
         // No need to report a datapoint if no batches/packets received
         if self.total_batches == 0 {
@@ -163,6 +169,11 @@ impl SigVerifierStats {
                 i64
             ),
             (
+                "total_dropped_below_priority_floor",
+                core::mem::take(&mut self.total_dropped_below_priority_floor),
+                i64
+            ),
+            (
                 "total_valid_packets",
                 self.total_valid_packets.swap(0, Ordering::Relaxed) as i64,
                 i64
@@ -181,6 +192,76 @@ impl SigVerifierStats {
     }
 }
 
+/// Approximate banking-stage priority for a packet from its raw bytes.
+///
+/// Delegates to [`calculate_pf_drop_priority`], which evaluates the same
+/// `reward * 1_000_000 / (cost + 1)` formula the scheduler uses for queue
+/// ordering, against `MAINNET_FEE_CONTEXT` (sigverify has no live bank).
+/// Bank-vs-mainnet drift is small in practice; the comparison against the
+/// scheduler-published floor is effectively unit-consistent.
+///
+/// Returns `None` if the packet cannot be parsed; callers should leave
+/// such packets alone (they will be rejected downstream if genuinely
+/// invalid).
+pub(crate) fn approximate_priority(data: &[u8]) -> Option<u64> {
+    let view = SanitizedTransactionView::try_new_sanitized(data, true).ok()?;
+    let runtime_tx = RuntimeTransaction::<SanitizedTransactionView<_>>::try_new(
+        view,
+        MessageHash::Compute,
+        None,
+    )
+    .ok()?;
+    calculate_pf_drop_priority(&runtime_tx)
+}
+
+/// Drop below-floor packets from `batches`. Below-floor packets are marked
+/// `discard`; a batch is removed from the outer `Vec` entirely when no
+/// packets survive (which covers the `PacketBatch::Single` below-floor case
+/// uniformly and also reclaims multi-packet batches whose packets all got
+/// dropped).
+///
+/// Returns the number of packets newly dropped.
+pub(crate) fn apply_priority_floor(batches: &mut Vec<PacketBatch>, floor: u64) -> usize {
+    let mut dropped: usize = 0;
+    batches.retain_mut(|batch| {
+        let mut any_kept = false;
+        for mut packet in batch.iter_mut() {
+            if packet.meta().discard() {
+                // Pre-existing discard: stays discarded, doesn't count as
+                // kept (so an all-prediscarded batch is dropped too).
+                continue;
+            }
+            if packet.meta().flags.contains(PacketFlags::SIMPLE_VOTE_TX) {
+                // Votes are immune to the priority floor (vote priority is
+                // governed by a separate policy in banking stage).
+                any_kept = true;
+                continue;
+            }
+            let Some(data) = packet.data(..) else {
+                // Zero-length or otherwise unreadable: leave to downstream
+                // stages to reject.
+                any_kept = true;
+                continue;
+            };
+            match approximate_priority(data) {
+                // `<=` instead of `<` so uniformly-priced traffic still
+                // gets shed: a tx tied with queue_min is no better than
+                // what the scheduler would evict on insert, so dropping
+                // it preserves the "no worse than queue_min" semantics
+                // and avoids degenerate no-op behavior when all incoming
+                // arrivals have the same priority as queue_min.
+                Some(priority) if priority <= floor => {
+                    packet.meta_mut().set_discard(true);
+                    dropped = dropped.saturating_add(1);
+                }
+                _ => any_kept = true,
+            }
+        }
+        any_kept
+    });
+    dropped
+}
+
 impl SigVerifyStage {
     pub fn new(
         packet_receiver: Receiver<PacketBatch>,
@@ -190,6 +271,7 @@ impl SigVerifyStage {
         forward_stage_sender: Sender<(BankingPacketBatch, bool)>,
         num_workers: NonZeroUsize,
         forward_non_votes: bool,
+        non_vote_feedback: Option<Arc<BankingStageFeedback>>,
     ) -> (Self, GossipSigVerifyHandle) {
         let (gossip_verified_vote_sender, verified_vote_receiver) = unbounded();
         let non_vote_stats = SigVerifierStats::default();
@@ -216,6 +298,7 @@ impl SigVerifyStage {
             "solSigVerTpu",
             "tpu-verifier",
             non_vote_stats,
+            non_vote_feedback,
         );
         let tpu_vote_thread_hdl = Self::verifier_service(
             vote_packet_receiver,
@@ -223,6 +306,7 @@ impl SigVerifyStage {
             "solSigVerTpuVot",
             "tpu-vote-verifier",
             tpu_vote_stats,
+            None,
         );
         let gossip_sigverify_handle = GossipSigVerifyHandle {
             verifier: worker_pool.gossip_verifier(),
@@ -252,6 +336,7 @@ impl SigVerifyStage {
         recvr: &Receiver<PacketBatch>,
         verifier: &mut TransactionSigVerifier,
         stats: &mut SigVerifierStats,
+        banking_stage_feedback: Option<&Arc<BankingStageFeedback>>,
     ) -> Result<()> {
         const SOFT_RECEIVE_CAP: usize = 5_000;
         let (mut batches, num_packets, recv_duration) =
@@ -271,6 +356,21 @@ impl SigVerifyStage {
         let discard_or_dedup_fail =
             deduper::dedup_packets_and_count_discards(deduper, &mut batches) as usize;
         dedup_time.stop();
+
+        // Apply the scheduler-published pf-floor *after* dedup and *before*
+        // dispatch to the verify worker pool. Post-dedup so duplicate
+        // high-priority arrivals don't crowd out unique lower-priority
+        // work; pre-verify so we still save signature-verification CPU on
+        // what we drop. The worker pool skips `discard`-marked packets.
+        if let Some(floor) = banking_stage_feedback.and_then(|f| f.get_priority_floor()) {
+            let dropped = apply_priority_floor(&mut batches, floor);
+            if dropped > 0 {
+                stats.total_dropped_below_priority_floor = stats
+                    .total_dropped_below_priority_floor
+                    .saturating_add(dropped);
+            }
+        }
+
         stats.total_dropped_on_capacity += verifier.verify_and_send_packets(batches)?;
         stats
             .dedup_packets_pp_us_hist
@@ -288,6 +388,7 @@ impl SigVerifyStage {
         thread_name: &'static str,
         metrics_name: &'static str,
         mut stats: SigVerifierStats,
+        banking_stage_feedback: Option<Arc<BankingStageFeedback>>,
     ) -> JoinHandle<()> {
         let mut last_print = Instant::now();
         const MAX_DEDUPER_AGE: Duration = Duration::from_secs(2);
@@ -302,9 +403,13 @@ impl SigVerifyStage {
                     if deduper.maybe_reset(&mut rng, DEDUPER_FALSE_POSITIVE_RATE, MAX_DEDUPER_AGE) {
                         stats.num_deduper_saturations += 1;
                     }
-                    if let Err(e) =
-                        Self::verifier(&deduper, &packet_receiver, &mut verifier, &mut stats)
-                    {
+                    if let Err(e) = Self::verifier(
+                        &deduper,
+                        &packet_receiver,
+                        &mut verifier,
+                        &mut stats,
+                        banking_stage_feedback.as_ref(),
+                    ) {
                         match e {
                             SigVerifyServiceError::Streamer(StreamerError::RecvTimeout(
                                 RecvTimeoutError::Disconnected,
@@ -315,7 +420,7 @@ impl SigVerifyStage {
                             _ => error!("{e:?}"),
                         }
                     }
-                    if last_print.elapsed().as_secs() > 2 {
+                    if last_print.elapsed() > SigVerifierStats::REPORT_INTERVAL {
                         stats.maybe_report_and_reset(metrics_name);
                         last_print = Instant::now();
                     }
@@ -406,6 +511,7 @@ mod tests {
             forward_stage_s,
             NonZeroUsize::new(4).unwrap(),
             false,
+            None,
         );
 
         let now = Instant::now();

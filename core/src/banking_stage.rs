@@ -19,7 +19,7 @@ use {
         },
         validator::BlockProductionMethod,
     },
-    agave_banking_stage_ingress_types::BankingPacketReceiver,
+    agave_banking_stage_ingress_types::{BankingPacketReceiver, BankingStageFeedback},
     crossbeam_channel::{Receiver, Sender, unbounded},
     futures::{StreamExt, stream::FuturesUnordered},
     histogram::Histogram,
@@ -337,6 +337,7 @@ pub struct BankingStage {
     bank_forks: Arc<RwLock<BankForks>>,
     committer: Committer,
     log_messages_bytes_limit: Option<usize>,
+    feedback: Arc<BankingStageFeedback>,
     threads: FuturesUnordered<NamedTask<std::thread::Result<()>>>,
 }
 
@@ -357,6 +358,7 @@ impl BankingStage {
         log_messages_bytes_limit: Option<usize>,
         bank_forks: Arc<RwLock<BankForks>>,
         prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
+        feedback: Arc<BankingStageFeedback>,
     ) -> BankingStageHandle {
         let committer = Committer::new(
             transaction_status_sender,
@@ -378,6 +380,7 @@ impl BankingStage {
             bank_forks,
             committer,
             log_messages_bytes_limit,
+            feedback,
             threads: FuturesUnordered::default(),
         };
 
@@ -509,6 +512,7 @@ impl BankingStage {
         let receive_and_buffer = TransactionViewReceiveAndBuffer {
             receiver: self.non_vote_receiver.clone(),
             sharable_banks: sharable_banks.clone(),
+            feedback: self.feedback.clone(),
         };
 
         // Spawn vote worker.
@@ -556,6 +560,7 @@ impl BankingStage {
         // assignment without introducing `dyn`.
         macro_rules! spawn_scheduler {
             ($scheduler:ident) => {
+                let feedback = self.feedback.clone();
                 let exit = exit.clone();
                 let shutdown_signal = self.banking_shutdown_signal.clone();
                 threads.push(
@@ -570,6 +575,7 @@ impl BankingStage {
                                 sharable_banks,
                                 $scheduler,
                                 worker_metrics,
+                                feedback,
                             );
 
                             match scheduler_controller.run() {
@@ -921,12 +927,14 @@ mod tests {
             DEFAULT_NUM_WORKERS,
             SchedulerConfig {
                 scheduler_pacing: SchedulerPacing::Disabled,
+                ..SchedulerConfig::default()
             },
             None,
             replay_vote_sender,
             None,
             bank_forks,
             None,
+            Arc::new(BankingStageFeedback::default()),
         );
         drop(non_vote_sender);
         drop(tpu_vote_sender);
@@ -981,12 +989,14 @@ mod tests {
             DEFAULT_NUM_WORKERS,
             SchedulerConfig {
                 scheduler_pacing: SchedulerPacing::Disabled,
+                ..SchedulerConfig::default()
             },
             None,
             replay_vote_sender,
             None,
             bank_forks, // keep a local-copy of bank-forks so worker threads do not lose weak access to bank-forks
             None,
+            Arc::new(BankingStageFeedback::default()),
         );
 
         // good tx, and no verify
@@ -1135,12 +1145,14 @@ mod tests {
                 DEFAULT_NUM_WORKERS,
                 SchedulerConfig {
                     scheduler_pacing: SchedulerPacing::Disabled,
+                    ..SchedulerConfig::default()
                 },
                 None,
                 replay_vote_sender,
                 None,
                 bank_forks,
                 None,
+                Arc::new(BankingStageFeedback::default()),
             );
 
             // wait for banking_stage to eat the packets
@@ -1288,12 +1300,14 @@ mod tests {
             DEFAULT_NUM_WORKERS,
             SchedulerConfig {
                 scheduler_pacing: SchedulerPacing::Disabled,
+                ..SchedulerConfig::default()
             },
             None,
             replay_vote_sender,
             None,
             bank_forks,
             None,
+            Arc::new(BankingStageFeedback::default()),
         );
 
         let keypairs = (0..100).map(|_| Keypair::new()).collect_vec();
