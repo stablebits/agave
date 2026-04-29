@@ -1,5 +1,6 @@
 use {
     super::{
+        committer::CommitTransactionDetails,
         consumer::{Consumer, ExecuteAndCommitTransactionsOutput, ProcessTransactionBatchOutput},
         leader_slot_timing_metrics::LeaderExecuteAndCommitTimings,
         scheduler_messages::{ConsumeWork, FinishedConsumeWork},
@@ -2336,9 +2337,10 @@ impl ConsumeWorkerMetrics {
         ExecuteAndCommitTransactionsOutput {
             transaction_counts,
             retryable_transaction_indexes,
+            commit_transactions_result,
             execute_and_commit_timings,
             error_counters,
-            ..
+            block_priority_fees_lamports,
         }: &ExecuteAndCommitTransactionsOutput,
     ) {
         self.count_metrics
@@ -2359,6 +2361,23 @@ impl ConsumeWorkerMetrics {
         self.count_metrics
             .retryable_transaction_count
             .fetch_add(retryable_transaction_indexes.len(), Ordering::Relaxed);
+        self.count_metrics
+            .block_priority_fees_lamports
+            .fetch_add(*block_priority_fees_lamports, Ordering::Relaxed);
+        if let Ok(commit_transaction_statuses) = commit_transactions_result {
+            let executed_units: u64 = commit_transaction_statuses
+                .iter()
+                .filter_map(|d| match d {
+                    CommitTransactionDetails::Committed { compute_units, .. } => {
+                        Some(*compute_units)
+                    }
+                    CommitTransactionDetails::NotCommitted(_) => None,
+                })
+                .sum();
+            self.count_metrics
+                .block_executed_units
+                .fetch_add(executed_units, Ordering::Relaxed);
+        }
         self.update_on_execute_and_commit_timings(execute_and_commit_timings);
         self.update_on_error_counters(error_counters);
     }
@@ -2517,6 +2536,13 @@ struct ConsumeWorkerCountMetrics {
     retryable_transaction_count: AtomicUsize,
     retryable_expired_bank_count: AtomicUsize,
     cost_model_throttled_transactions_count: AtomicU64,
+    /// Sum of prioritization-fee lamports paid by committed transactions
+    /// since the last report. Pair with `block_executed_units` (or the
+    /// scheduler's `block_cost`) to get fee/CU economics.
+    block_priority_fees_lamports: AtomicU64,
+    /// Sum of executed compute units across committed transactions since
+    /// the last report.
+    block_executed_units: AtomicU64,
 }
 
 impl ConsumeWorkerCountMetrics {
@@ -2561,6 +2587,16 @@ impl ConsumeWorkerCountMetrics {
                 "cost_model_throttled_transactions_count",
                 self.cost_model_throttled_transactions_count
                     .swap(0, Ordering::Relaxed),
+                i64
+            ),
+            (
+                "block_priority_fees_lamports",
+                self.block_priority_fees_lamports.swap(0, Ordering::Relaxed),
+                i64
+            ),
+            (
+                "block_executed_units",
+                self.block_executed_units.swap(0, Ordering::Relaxed),
                 i64
             ),
         );
