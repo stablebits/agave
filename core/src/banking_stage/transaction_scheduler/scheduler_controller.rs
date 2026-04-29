@@ -14,12 +14,12 @@ use {
             consume_worker::ConsumeWorkerMetrics,
             consumer::Consumer,
             decision_maker::{BufferedPacketsDecision, DecisionMaker},
+            scheduler_priority::calculate_pf_drop_priority,
             transaction_scheduler::{
                 receive_and_buffer::ReceivingStats, transaction_priority_id::TransactionPriorityId,
                 transaction_state_container::StateContainer,
             },
         },
-        priority_formula::calculate_pf_drop_priority,
         validator::SchedulerPacing,
     },
     agave_banking_stage_ingress_types::BankingStageFeedback,
@@ -397,7 +397,7 @@ where
     ///
     /// **Published floor:** the queue-min tx's full-formula priority
     /// evaluated against `MAINNET_FEE_CONTEXT` (see
-    /// `priority_formula::calculate_pf_drop_priority`). Sigverify and the
+    /// `scheduler_priority::calculate_pf_drop_priority`). Sigverify and the
     /// scheduler-receive second-stage check use the same function on
     /// arriving txs, so all three sites are in identical units —
     /// independent of any drift between the live bank and mainnet

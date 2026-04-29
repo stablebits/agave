@@ -6,8 +6,8 @@
 
 use {
     crate::{
+        banking_stage::scheduler_priority::approximate_priority,
         banking_trace::BankingPacketSender,
-        priority_formula::approximate_priority,
         sigverify::{
             GossipSigVerifier, GossipVerifiedVoteBatch, SigVerifyWorkerPool, SigVerifyWorkerStats,
             TransactionSigVerifier,
@@ -247,7 +247,7 @@ impl SigVerifyStage {
         forward_stage_sender: Sender<(BankingPacketBatch, bool)>,
         num_workers: NonZeroUsize,
         forward_non_votes: bool,
-        non_vote_feedback: Option<Arc<BankingStageFeedback>>,
+        banking_stage_feedback: Option<Arc<BankingStageFeedback>>,
     ) -> (Self, GossipSigVerifyHandle) {
         let (gossip_verified_vote_sender, verified_vote_receiver) = unbounded();
         let non_vote_stats = SigVerifierStats::default();
@@ -274,7 +274,7 @@ impl SigVerifyStage {
             "solSigVerTpu",
             "tpu-verifier",
             non_vote_stats,
-            non_vote_feedback,
+            banking_stage_feedback,
         );
         let tpu_vote_thread_hdl = Self::verifier_service(
             vote_packet_receiver,
@@ -333,11 +333,8 @@ impl SigVerifyStage {
             deduper::dedup_packets_and_count_discards(deduper, &mut batches) as usize;
         dedup_time.stop();
 
-        // Apply the scheduler-published pf-floor *after* dedup and *before*
-        // dispatch to the verify worker pool. Post-dedup so duplicate
-        // high-priority arrivals don't crowd out unique lower-priority
-        // work; pre-verify so we still save signature-verification CPU on
-        // what we drop. The worker pool skips `discard`-marked packets.
+        // Apply the scheduler-published pf-floor to drop low-priority transactions
+        // earlier when the scheduler is saturated.
         if let Some(floor) = banking_stage_feedback.and_then(|f| f.get_priority_floor()) {
             let dropped = apply_priority_floor(&mut batches, floor);
             if dropped > 0 {

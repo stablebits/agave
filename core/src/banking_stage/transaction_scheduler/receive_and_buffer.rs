@@ -7,11 +7,11 @@ use {
             TransactionViewStateContainer,
         },
     },
-    crate::{
-        banking_stage::{
-            consumer::Consumer, decision_maker::BufferedPacketsDecision, scheduler_messages::MaxAge,
-        },
-        priority_formula::{FeeContext, calculate_pf_drop_priority, calculate_priority_and_cost},
+    crate::banking_stage::{
+        consumer::Consumer,
+        decision_maker::BufferedPacketsDecision,
+        scheduler_messages::MaxAge,
+        scheduler_priority::{FeeContext, calculate_pf_drop_priority, calculate_priority_and_cost},
     },
     agave_banking_stage_ingress_types::{
         BankingPacketBatch, BankingPacketReceiver, BankingStageFeedback,

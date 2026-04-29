@@ -69,6 +69,7 @@ mod leader_slot_timing_metrics;
 mod qos_service;
 mod read_write_account_set;
 mod scheduler_messages;
+pub mod scheduler_priority;
 mod vote_packet_receiver;
 mod vote_storage;
 mod vote_worker;
