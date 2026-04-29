@@ -71,6 +71,11 @@ struct SigVerifierStats {
     total_verify_time_us: Arc<AtomicUsize>,
     total_dropped_on_capacity: usize,
     total_dropped_below_priority_floor: usize,
+    /// Worker-stage (post-channel-hop) pf-floor drops. Shared with
+    /// `SigVerifyWorkerPool` so non-vote workers can fetch_add when they
+    /// catch in-flight backlog whose floor was raised after the
+    /// first-stage check.
+    total_dropped_below_priority_floor_late: Arc<AtomicUsize>,
 }
 
 impl SigVerifierStats {
@@ -172,6 +177,12 @@ impl SigVerifierStats {
                 i64
             ),
             (
+                "total_dropped_below_priority_floor_late",
+                self.total_dropped_below_priority_floor_late
+                    .swap(0, Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
                 "total_valid_packets",
                 self.total_valid_packets.swap(0, Ordering::Relaxed) as i64,
                 i64
@@ -262,11 +273,18 @@ impl SigVerifyStage {
             SigVerifyWorkerStats {
                 total_valid_packets: non_vote_stats.total_valid_packets.clone(),
                 total_verify_time_us: non_vote_stats.total_verify_time_us.clone(),
+                total_dropped_below_priority_floor_late: non_vote_stats
+                    .total_dropped_below_priority_floor_late
+                    .clone(),
             },
             SigVerifyWorkerStats {
                 total_valid_packets: tpu_vote_stats.total_valid_packets.clone(),
                 total_verify_time_us: tpu_vote_stats.total_verify_time_us.clone(),
+                total_dropped_below_priority_floor_late: tpu_vote_stats
+                    .total_dropped_below_priority_floor_late
+                    .clone(),
             },
+            scheduler_priority_floor.clone(),
         );
         let non_vote_thread_hdl = Self::verifier_service(
             packet_receiver,

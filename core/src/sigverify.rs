@@ -3,8 +3,11 @@
 //! cores.
 
 use {
-    crate::{banking_trace::BankingPacketSender, sigverify_stage::SigVerifyServiceError},
-    agave_banking_stage_ingress_types::BankingPacketBatch,
+    crate::{
+        banking_trace::BankingPacketSender,
+        sigverify_stage::{SigVerifyServiceError, apply_priority_floor},
+    },
+    agave_banking_stage_ingress_types::{BankingPacketBatch, SchedulerPriorityFloor},
     crossbeam_channel::{Receiver, Sender, TrySendError, bounded},
     solana_measure::measure_us,
     solana_perf::{
@@ -45,6 +48,7 @@ pub(crate) struct GossipVerifiedVoteBatch {
 pub(crate) struct SigVerifyWorkerStats {
     pub(crate) total_valid_packets: Arc<AtomicUsize>,
     pub(crate) total_verify_time_us: Arc<AtomicUsize>,
+    pub(crate) total_dropped_below_priority_floor_late: Arc<AtomicUsize>,
 }
 
 impl TransactionSigVerifier {
@@ -127,6 +131,11 @@ struct WorkerPoolChannels {
     forward_stage_sender: Sender<(BankingPacketBatch, bool)>,
     non_vote_stats: SigVerifyWorkerStats,
     tpu_vote_stats: SigVerifyWorkerStats,
+    /// Scheduler-published pf-floor read by non-vote workers as a
+    /// second-stage drop. Catches packets that passed the verifier_service
+    /// first-stage check but were in the worker channel or about to be
+    /// signature-verified when the floor was raised. `None` disables.
+    scheduler_priority_floor: Option<Arc<SchedulerPriorityFloor>>,
 }
 
 pub(crate) struct SigVerifyWorkerPool {
@@ -156,6 +165,7 @@ impl SigVerifyWorkerPool {
         forward_non_votes: bool,
         non_vote_stats: SigVerifyWorkerStats,
         tpu_vote_stats: SigVerifyWorkerStats,
+        scheduler_priority_floor: Option<Arc<SchedulerPriorityFloor>>,
     ) -> Self {
         let (non_vote_sender, non_vote_receiver) = bounded(SIGVERIFY_WORK_CHANNEL_SIZE);
         let (tpu_vote_sender, tpu_vote_receiver) = bounded(SIGVERIFY_WORK_CHANNEL_SIZE);
@@ -170,6 +180,7 @@ impl SigVerifyWorkerPool {
             forward_stage_sender,
             non_vote_stats,
             tpu_vote_stats,
+            scheduler_priority_floor,
         };
         let exit = Arc::new(AtomicBool::new(false));
         let worker_hdls = (0..num_workers.get())
@@ -219,6 +230,7 @@ impl SigVerifyWorkerPool {
                             forward_non_votes,
                             false,
                             &channels.non_vote_stats,
+                            channels.scheduler_priority_floor.as_ref(),
                         ),
                         Err(_) => false,
                     }
@@ -233,6 +245,7 @@ impl SigVerifyWorkerPool {
                             true,
                             true,
                             &channels.tpu_vote_stats,
+                            None,
                         ),
                         Err(_) => false,
                     }
@@ -256,19 +269,45 @@ impl SigVerifyWorkerPool {
     }
 
     fn run_transaction_task(
-        mut work: TransactionVerifyTask,
+        work: TransactionVerifyTask,
         reject_non_vote: bool,
         banking_stage_sender: &BankingPacketSender,
         forward_stage_sender: &Sender<(BankingPacketBatch, bool)>,
         should_forward: bool,
         is_tpu_vote: bool,
         stats: &SigVerifyWorkerStats,
+        scheduler_priority_floor: Option<&Arc<SchedulerPriorityFloor>>,
     ) -> bool {
+        let TransactionVerifyTask { batch } = work;
+
+        // Second-stage pf-floor drop. Catches packets that passed the
+        // verifier_service first-stage check but were in the worker channel
+        // or about to be signature-verified when the floor was raised.
+        // Performed before sigverify so we also save the GPU verify cost on
+        // dropped packets. Skipped for tpu_vote packets (votes are immune
+        // to the floor; mirrors the first-stage behavior).
+        let mut batch = if let Some(floor) = scheduler_priority_floor.and_then(|f| f.get()) {
+            let mut batches = vec![batch];
+            let dropped = apply_priority_floor(&mut batches, floor);
+            if dropped > 0 {
+                stats
+                    .total_dropped_below_priority_floor_late
+                    .fetch_add(dropped, Ordering::Relaxed);
+            }
+            // Entire batch went below-floor: nothing to verify or send.
+            let Some(batch) = batches.into_iter().next() else {
+                return true;
+            };
+            batch
+        } else {
+            batch
+        };
+
         let (_, verify_time_us) = measure_us!(sigverify::ed25519_verify_serial(
-            &mut work.batch,
+            &mut batch,
             reject_non_vote
         ));
-        let num_valid_packets = sigverify::count_valid_packets(std::iter::once(&work.batch));
+        let num_valid_packets = sigverify::count_valid_packets(std::iter::once(&batch));
         stats
             .total_valid_packets
             .fetch_add(num_valid_packets, Ordering::Relaxed);
@@ -276,7 +315,7 @@ impl SigVerifyWorkerPool {
             .total_verify_time_us
             .fetch_add(verify_time_us as usize, Ordering::Relaxed);
 
-        let banking_packet_batch = BankingPacketBatch::new(vec![work.batch]);
+        let banking_packet_batch = BankingPacketBatch::new(vec![batch]);
         if let Err(err) = banking_stage_sender.send(banking_packet_batch.clone()) {
             error!("sigverify send failed: {err:?}");
             return false;
