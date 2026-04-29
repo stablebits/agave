@@ -7,14 +7,13 @@
 use {
     crate::{
         banking_trace::BankingPacketSender,
-        priority_formula::calculate_pf_drop_priority,
+        priority_formula::approximate_priority,
         sigverify::{
             GossipSigVerifier, GossipVerifiedVoteBatch, SigVerifyWorkerPool, SigVerifyWorkerStats,
             TransactionSigVerifier,
         },
     },
     agave_banking_stage_ingress_types::{BankingPacketBatch, BankingStageFeedback},
-    agave_transaction_view::transaction_view::SanitizedTransactionView,
     core::time::Duration,
     crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded},
     solana_measure::measure::Measure,
@@ -22,9 +21,8 @@ use {
         deduper::{self, Deduper},
         packet::{PacketBatch, PacketFlags},
     },
-    solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
     solana_streamer::streamer::{self, StreamerError},
-    solana_transaction::{Transaction, sanitized::MessageHash},
+    solana_transaction::Transaction,
     std::{
         num::NonZeroUsize,
         sync::{
@@ -190,28 +188,6 @@ impl SigVerifierStats {
         self.batches_hist = histogram::Histogram::new();
         self.packets_hist = histogram::Histogram::new();
     }
-}
-
-/// Approximate banking-stage priority for a packet from its raw bytes.
-///
-/// Delegates to [`calculate_pf_drop_priority`], which evaluates the same
-/// `reward * 1_000_000 / (cost + 1)` formula the scheduler uses for queue
-/// ordering, against `MAINNET_FEE_CONTEXT` (sigverify has no live bank).
-/// Bank-vs-mainnet drift is small in practice; the comparison against the
-/// scheduler-published floor is effectively unit-consistent.
-///
-/// Returns `None` if the packet cannot be parsed; callers should leave
-/// such packets alone (they will be rejected downstream if genuinely
-/// invalid).
-pub(crate) fn approximate_priority(data: &[u8]) -> Option<u64> {
-    let view = SanitizedTransactionView::try_new_sanitized(data, true).ok()?;
-    let runtime_tx = RuntimeTransaction::<SanitizedTransactionView<_>>::try_new(
-        view,
-        MessageHash::Compute,
-        None,
-    )
-    .ok()?;
-    calculate_pf_drop_priority(&runtime_tx)
 }
 
 /// Drop below-floor packets from `batches`. Below-floor packets are marked

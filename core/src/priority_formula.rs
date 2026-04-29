@@ -12,11 +12,16 @@
 //! on accepted transactions.
 use {
     agave_feature_set::FeatureSet,
+    agave_transaction_view::transaction_view::SanitizedTransactionView,
     solana_cost_model::cost_model::CostModel,
     solana_fee::FeeFeatures,
     solana_runtime::bank::Bank,
-    solana_runtime_transaction::transaction_meta::{TransactionConfiguration, TransactionMeta},
+    solana_runtime_transaction::{
+        runtime_transaction::RuntimeTransaction,
+        transaction_meta::{TransactionConfiguration, TransactionMeta},
+    },
     solana_svm_transaction::svm_message::SVMStaticMessage,
+    solana_transaction::sanitized::MessageHash,
     std::sync::{Arc, LazyLock},
 };
 
@@ -138,6 +143,27 @@ pub fn calculate_simple_pf_priority<Tx: TransactionMeta>(transaction: &Tx) -> Op
         .transaction_configuration(&MAINNET_FEE_CONTEXT.feature_set)
         .ok()?;
     Some(config.compute_unit_price_in_microlamports())
+}
+
+/// Approximate banking-stage priority for a packet from raw bytes.
+///
+/// Parses the packet into a `SanitizedTransactionView` + `RuntimeTransaction`
+/// and runs [`calculate_pf_drop_priority`]. This is the entry point sigverify
+/// uses for its pf-floor check; lives here (rather than next to sigverify)
+/// so sigverify_stage doesn't pull in transaction-parsing dependencies just
+/// for one helper.
+///
+/// Returns `None` if the packet cannot be parsed; callers should leave such
+/// packets alone (they will be rejected downstream if genuinely invalid).
+pub fn approximate_priority(data: &[u8]) -> Option<u64> {
+    let view = SanitizedTransactionView::try_new_sanitized(data, true).ok()?;
+    let runtime_tx = RuntimeTransaction::<SanitizedTransactionView<_>>::try_new(
+        view,
+        MessageHash::Compute,
+        None,
+    )
+    .ok()?;
+    calculate_pf_drop_priority(&runtime_tx)
 }
 
 #[cfg(test)]
