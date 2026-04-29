@@ -819,7 +819,15 @@ impl AdminRpc for AdminRpcImpl {
                 .try_send(BankingControlMsg::Internal {
                     block_production_method,
                     num_workers,
-                    config: SchedulerConfig { scheduler_pacing },
+                    // manage_block_production only accepts scheduler_pacing;
+                    // other SchedulerConfig fields are spread from the
+                    // operator's startup config so a runtime pacing change
+                    // doesn't silently reset pf-floor / token-bucket /
+                    // saturation tuning.
+                    config: SchedulerConfig {
+                        scheduler_pacing,
+                        ..post_init.block_production_scheduler_config.clone()
+                    },
                 })
                 .is_err()
             {
@@ -1162,6 +1170,7 @@ mod tests {
                     ),
                     node: None,
                     banking_control_sender: mpsc::channel(1).0,
+                    block_production_scheduler_config: SchedulerConfig::default(),
                     snapshot_controller,
                     blockstore,
                     votor_event_sender,
