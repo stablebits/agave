@@ -109,13 +109,12 @@ pub fn calculate_priority_and_cost<Tx: TransactionMeta + SVMStaticMessage>(
     )
 }
 
-/// Calculate the pf-floor proxy priority used by sigverify (full
-/// formula version).
+/// Calculate the pf-floor proxy priority used by sigverify.
 ///
 /// Runs the shared formula against [`MAINNET_FEE_CONTEXT`] instead of a
-/// live bank snapshot. Unit-correct mirror of scheduler admission, but
-/// empirically not aggressive enough to keep the scheduler from hitting
-/// `num_dropped_on_capacity` under sustained load — kept for future use.
+/// live bank snapshot. This keeps the scheduler-published floor and the
+/// sigverify / receive-side drop checks in the same full-formula comparison
+/// space, independent of bank-vs-mainnet fee-context drift.
 pub fn calculate_pf_drop_priority<Tx: TransactionMeta + SVMStaticMessage>(
     transaction: &Tx,
 ) -> Option<u64> {
@@ -128,21 +127,6 @@ pub fn calculate_pf_drop_priority<Tx: TransactionMeta + SVMStaticMessage>(
         &MAINNET_FEE_CONTEXT,
     );
     Some(priority)
-}
-
-/// Simple pf-floor proxy: `priority_fee_lamports * 1_000_000 /
-/// compute_unit_limit`. NOT the same units as
-/// [`calculate_priority_and_cost`] (denominator is `compute_unit_limit`,
-/// not `CostModel::calculate_cost`; numerator omits the base-fee
-/// reward). Used on both sides of the pf-floor publication so the
-/// comparison is self-consistent. The simpler shape is empirically
-/// more aggressive than the full-formula mirror, which is the
-/// desired load-shedding behavior under saturation.
-pub fn calculate_simple_pf_priority<Tx: TransactionMeta>(transaction: &Tx) -> Option<u64> {
-    let config = transaction
-        .transaction_configuration(&MAINNET_FEE_CONTEXT.feature_set)
-        .ok()?;
-    Some(config.compute_unit_price_in_microlamports())
 }
 
 /// Approximate banking-stage priority for a packet from raw bytes.

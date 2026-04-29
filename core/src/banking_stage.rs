@@ -439,6 +439,11 @@ impl BankingStage {
     }
 
     async fn cycle_threads(&mut self, args: BankingControlMsg) -> Result<(), ()> {
+        // Feedback is produced only by the internal scheduler. Clear it before
+        // cycling workers so sigverify does not keep applying a stale floor
+        // while the scheduler is stopped or switching modes.
+        self.feedback.clear_priority_floor();
+
         // Shutdown all current threads.
         self.worker_exit_signal.store(true, Ordering::Relaxed);
         while let Some((name, res)) = self.threads.next().await {
@@ -467,6 +472,10 @@ impl BankingStage {
     }
 
     fn spawn_scheduler(&mut self, args: BankingControlMsg) -> Result<(), ()> {
+        // The requested scheduler may be external, disabled, or have different
+        // pf-floor settings than the previous one. Always start unsaturated.
+        self.feedback.clear_priority_floor();
+
         let threads = (match args {
             BankingControlMsg::Internal {
                 block_production_method,

@@ -180,6 +180,10 @@ where
         let buffer_guard_threshold =
             TOTAL_BUFFERED_PACKETS.saturating_mul(config.saturation_min_queue_pct as usize) / 100;
         let desaturate_tokens_threshold = config.token_bucket_burst.saturating_div(2);
+        // The feedback channel outlives individual scheduler controllers.
+        // Start every controller from an unsaturated state so a stale floor
+        // from a previous scheduler cannot keep sigverify dropping packets.
+        feedback.clear_priority_floor();
         Self {
             exit,
             config,
@@ -380,7 +384,6 @@ where
         }
     }
 
-
     /// Update the scheduler saturation feedback channel based on incoming
     /// packet arrivals and the current queue state.
     ///
@@ -421,8 +424,11 @@ where
     /// the buffer drains below the guard), we clear the published floor.
     fn update_scheduler_saturation_feedback(&mut self) {
         let Some(bucket) = self.saturation_token_bucket.as_ref() else {
+            // Feature disabled. `SchedulerController::new` already cleared the
+            // floor at construction and nothing on this path writes to it, so
+            // no per-tick clear is needed here.
             self.tick_arrivals = 0;
-            return; // feature disabled
+            return;
         };
 
         // Consume this tick's arrivals from the bucket, taking whatever is
@@ -446,9 +452,9 @@ where
 
         if self.saturated {
             // Refresh the floor from the queue's current min (in sigverify
-            // simple-priority units). If the priority queue is momentarily
+            // full-formula units). If the priority queue is momentarily
             // empty (heavy in-flight scheduling) or the queue-min tx parses
-            // to a zero simple-priority, keep the previous floor implicitly
+            // to a zero full-formula priority, keep the previous floor implicitly
             // rather than clearing — the buffer is still under pressure.
             if let Some(floor) = self.compute_pf_floor() {
                 self.feedback.set_priority_floor(floor);
@@ -461,6 +467,9 @@ where
             if current_tokens >= self.desaturate_tokens_threshold || !buffer_guard_met {
                 self.saturated = false;
                 self.feedback.clear_priority_floor();
+                self.count_metrics.update(|count_metrics| {
+                    count_metrics.current_priority_fee_floor = 0;
+                });
             }
         } else if over_budget > 0 && buffer_guard_met {
             self.saturated = true;
@@ -641,6 +650,16 @@ where
         });
 
         Ok(receiving_stats)
+    }
+}
+
+impl<R, S> Drop for SchedulerController<R, S>
+where
+    R: ReceiveAndBuffer,
+    S: Scheduler<R::Transaction>,
+{
+    fn drop(&mut self) {
+        self.feedback.clear_priority_floor();
     }
 }
 

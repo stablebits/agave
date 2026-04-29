@@ -86,7 +86,7 @@ pub struct SchedulerCountMetricsInner {
     /// Number of transactions that were dropped due to exceeded capacity.
     pub num_dropped_on_capacity: Saturating<usize>,
     /// Transactions dropped at the scheduler-receive boundary because the
-    /// tx's simple-priority was below the published pf-floor. Catches the
+    /// tx's full-formula priority was below the published pf-floor. Catches the
     /// in-flight backlog that already passed sigverify's filter; without
     /// this, that backlog fills the buffer at cold-start saturation and
     /// triggers a `num_dropped_on_capacity` spike.

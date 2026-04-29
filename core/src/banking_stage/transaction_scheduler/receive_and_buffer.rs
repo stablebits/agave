@@ -66,7 +66,7 @@ pub(crate) struct ReceivingStats {
     pub num_dropped_on_fee_payer: usize,
     pub num_dropped_on_capacity: usize,
     /// Packets dropped at the scheduler-receive boundary because their
-    /// simple-priority was below the published pf-floor. Catches the
+    /// full-formula priority was below the published pf-floor. Catches the
     /// in-flight backlog that already passed sigverify before the floor
     /// was published; see the second-stage drop in `try_handle_packet`.
     pub num_dropped_below_priority_floor: usize,
@@ -243,7 +243,7 @@ pub(crate) enum PacketHandlingError {
     LockValidation,
     ComputeBudget,
     ALTResolution,
-    /// Tx's sigverify-space simple priority is below the scheduler-published
+    /// Tx's sigverify-space full-formula priority is below the scheduler-published
     /// pf-floor. Catches the in-flight backlog that already passed sigverify
     /// before the floor was published; without this, the buffer fills with
     /// low-priority arrivals during cold-start saturation and triggers a
@@ -480,9 +480,7 @@ impl TransactionViewReceiveAndBuffer {
         // what the scheduler would evict on insert, and the equality case
         // matters for uniformly-priced traffic where `<` would degenerate
         // to a no-op.
-        if pf_floor > 0
-            && calculate_pf_drop_priority(&view).is_some_and(|p| p <= pf_floor)
-        {
+        if pf_floor > 0 && calculate_pf_drop_priority(&view).is_some_and(|p| p <= pf_floor) {
             return Err(PacketHandlingError::BelowPriorityFloor);
         }
 
