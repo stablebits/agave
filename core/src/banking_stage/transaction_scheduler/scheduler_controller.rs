@@ -394,7 +394,7 @@ where
     /// in-queue transactions to derive it from (otherwise the min priority
     /// of a near-empty queue is arbitrary and the floor would be noise).
     ///
-    /// **Published floor:** the queue-min tx's full-formula priority
+    /// **Published floor:** the queue-min tx's priority
     /// evaluated against `MAINNET_FEE_CONTEXT` (see
     /// `scheduler_priority::calculate_pf_drop_priority`). Sigverify and the
     /// scheduler-receive second-stage check use the same function on
@@ -450,11 +450,6 @@ where
         let buffer_guard_met = self.container.buffer_size() >= self.buffer_guard_threshold;
 
         if self.saturated {
-            // Refresh the floor from the queue's current min (in sigverify
-            // full-formula units). If the priority queue is momentarily
-            // empty (heavy in-flight scheduling) or the queue-min tx parses
-            // to a zero full-formula priority, keep the previous floor implicitly
-            // rather than clearing — the buffer is still under pressure.
             if let Some(floor) = self.compute_pf_floor() {
                 self.priority_floor.publish(floor);
                 self.count_metrics.update(|count_metrics| {
@@ -481,8 +476,8 @@ where
         }
     }
 
-    /// Compute the pf-floor to publish: full-formula priority of the
-    /// queue's lowest-priority tx evaluated against `MAINNET_FEE_CONTEXT`.
+    /// Compute the pf-floor to publish: priority of the queue's
+    /// lowest-priority tx evaluated against `MAINNET_FEE_CONTEXT`.
     /// Returns `None` when the queue is empty, the queue-min tx isn't
     /// parseable, or the priority is zero (`SchedulerPriorityFloor` rejects
     /// a zero floor — `0` is the "not saturated" sentinel).
@@ -612,7 +607,6 @@ where
         self.count_metrics.update(|count_metrics| {
             let ReceivingStats {
                 num_received,
-                num_total_packets_drained: _,
                 num_dropped_without_parsing: num_dropped_without_buffering,
                 num_dropped_on_parsing_and_sanitization,
                 num_dropped_on_lock_validation,

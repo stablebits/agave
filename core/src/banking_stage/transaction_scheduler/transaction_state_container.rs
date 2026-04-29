@@ -109,8 +109,7 @@ pub(crate) trait StateContainer<Tx: TransactionWithMeta> {
     /// Lowest-priority entry in the queue. Exposes the `TransactionPriorityId`
     /// (rather than just the priority) so callers can look up the underlying
     /// transaction via [`StateContainer::get_transaction`] — the pf-floor
-    /// controller needs the actual tx to compute its sigverify-space
-    /// full-formula priority.
+    /// controller needs the actual tx to compute its priority.
     fn get_min_priority_id(&self) -> Option<TransactionPriorityId>;
 
     /// Return an iterator over priority IDs strictly below `cursor` in descending order,

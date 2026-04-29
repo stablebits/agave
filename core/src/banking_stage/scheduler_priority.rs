@@ -113,8 +113,8 @@ pub fn calculate_priority_and_cost<Tx: TransactionMeta + SVMStaticMessage>(
 ///
 /// Runs the shared formula against [`MAINNET_FEE_CONTEXT`] instead of a
 /// live bank snapshot. This keeps the scheduler-published floor and the
-/// sigverify / receive-side drop checks in the same full-formula comparison
-/// space, independent of bank-vs-mainnet fee-context drift.
+/// sigverify / receive-side drop checks in the same comparison space,
+/// independent of bank-vs-mainnet fee-context drift.
 pub fn calculate_pf_drop_priority<Tx: TransactionMeta + SVMStaticMessage>(
     transaction: &Tx,
 ) -> Option<u64> {

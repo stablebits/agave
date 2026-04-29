@@ -48,11 +48,6 @@ pub(crate) struct DisconnectedError;
 /// Stats/metrics returned by `receive_and_buffer_packets`.
 pub(crate) struct ReceivingStats {
     pub num_received: usize,
-    /// Total packets drained from the sigverify→scheduler channel,
-    /// *including* packets marked `discard`. Used to decrement the
-    /// channel-depth gauge symmetrically with sigverify's per-batch
-    /// `add_in_flight(total)`.
-    pub num_total_packets_drained: usize,
     /// Count of packets that passed sigverify but were dropped
     /// without further checks because we were outside the holding
     /// window.
@@ -66,9 +61,9 @@ pub(crate) struct ReceivingStats {
     pub num_dropped_on_fee_payer: usize,
     pub num_dropped_on_capacity: usize,
     /// Packets dropped at the scheduler-receive boundary because their
-    /// full-formula priority was below the published pf-floor. Catches the
-    /// in-flight backlog that already passed sigverify before the floor
-    /// was published; see the second-stage drop in `try_handle_packet`.
+    /// priority was below the published pf-floor. Catches the in-flight
+    /// backlog that already passed sigverify before the floor was published;
+    /// see the second-stage drop in `try_handle_packet`.
     pub num_dropped_below_priority_floor: usize,
 
     pub num_buffered: usize,
@@ -80,7 +75,6 @@ pub(crate) struct ReceivingStats {
 impl ReceivingStats {
     fn accumulate(&mut self, other: ReceivingStats) {
         self.num_received += other.num_received;
-        self.num_total_packets_drained += other.num_total_packets_drained;
         self.num_dropped_without_parsing += other.num_dropped_without_parsing;
         self.num_dropped_on_parsing_and_sanitization +=
             other.num_dropped_on_parsing_and_sanitization;
@@ -141,7 +135,6 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
         let mut received_message = false;
         let mut stats = ReceivingStats {
             num_received: 0,
-            num_total_packets_drained: 0,
             num_dropped_without_parsing: 0,
             num_dropped_on_parsing_and_sanitization: 0,
             num_dropped_on_lock_validation: 0,
@@ -220,7 +213,6 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
 
         Ok(ReceivingStats {
             num_received: stats.num_received,
-            num_total_packets_drained: stats.num_total_packets_drained,
             num_dropped_without_parsing: stats.num_dropped_without_parsing,
             num_dropped_on_parsing_and_sanitization: stats.num_dropped_on_parsing_and_sanitization,
             num_dropped_on_lock_validation: stats.num_dropped_on_lock_validation,
@@ -242,11 +234,6 @@ pub(crate) enum PacketHandlingError {
     LockValidation,
     ComputeBudget,
     ALTResolution,
-    /// Tx's sigverify-space full-formula priority is below the scheduler-published
-    /// pf-floor. Catches the in-flight backlog that already passed sigverify
-    /// before the floor was published; without this, the buffer fills with
-    /// low-priority arrivals during cold-start saturation and triggers a
-    /// `dropped_on_capacity` spike from the eviction wave.
     BelowPriorityFloor,
 }
 
@@ -353,7 +340,6 @@ impl TransactionViewReceiveAndBuffer {
             };
 
         let mut num_received = 0;
-        let mut num_total_packets_drained = 0;
         let mut num_dropped_without_parsing = 0;
         let mut num_dropped_on_parsing_and_sanitization = 0;
         let mut num_dropped_on_lock_validation = 0;
@@ -361,7 +347,6 @@ impl TransactionViewReceiveAndBuffer {
 
         for packet_batch in packet_batch_message.iter() {
             for packet in packet_batch.iter() {
-                num_total_packets_drained += 1;
                 let Some(packet_data) = packet.data(..) else {
                     continue;
                 };
@@ -427,7 +412,6 @@ impl TransactionViewReceiveAndBuffer {
 
         ReceivingStats {
             num_received,
-            num_total_packets_drained,
             num_dropped_without_parsing,
             num_dropped_on_parsing_and_sanitization,
             num_dropped_on_lock_validation,
@@ -710,7 +694,6 @@ mod tests {
 
         let ReceivingStats {
             num_received,
-            num_total_packets_drained: _,
             num_dropped_without_parsing,
             num_dropped_on_parsing_and_sanitization,
             num_dropped_on_lock_validation,
@@ -766,7 +749,6 @@ mod tests {
 
         let ReceivingStats {
             num_received,
-            num_total_packets_drained: _,
             num_dropped_without_parsing,
             num_dropped_on_parsing_and_sanitization,
             num_dropped_on_lock_validation,
@@ -811,7 +793,6 @@ mod tests {
 
         let ReceivingStats {
             num_received,
-            num_total_packets_drained: _,
             num_dropped_without_parsing,
             num_dropped_on_parsing_and_sanitization,
             num_dropped_on_lock_validation,
@@ -855,7 +836,6 @@ mod tests {
 
         let ReceivingStats {
             num_received,
-            num_total_packets_drained: _,
             num_dropped_without_parsing,
             num_dropped_on_parsing_and_sanitization,
             num_dropped_on_lock_validation,
@@ -904,7 +884,6 @@ mod tests {
 
         let ReceivingStats {
             num_received,
-            num_total_packets_drained: _,
             num_dropped_without_parsing,
             num_dropped_on_parsing_and_sanitization,
             num_dropped_on_lock_validation,
@@ -968,7 +947,6 @@ mod tests {
 
         let ReceivingStats {
             num_received,
-            num_total_packets_drained: _,
             num_dropped_without_parsing,
             num_dropped_on_parsing_and_sanitization,
             num_dropped_on_lock_validation,
@@ -1017,7 +995,6 @@ mod tests {
 
         let ReceivingStats {
             num_received,
-            num_total_packets_drained: _,
             num_dropped_without_parsing,
             num_dropped_on_parsing_and_sanitization,
             num_dropped_on_lock_validation,
@@ -1070,7 +1047,6 @@ mod tests {
 
         let ReceivingStats {
             num_received,
-            num_total_packets_drained: _,
             num_dropped_without_parsing,
             num_dropped_on_parsing_and_sanitization,
             num_dropped_on_lock_validation,
@@ -1151,7 +1127,6 @@ mod tests {
 
         let ReceivingStats {
             num_received,
-            num_total_packets_drained: _,
             num_dropped_without_parsing,
             num_dropped_on_parsing_and_sanitization,
             num_dropped_on_lock_validation,
