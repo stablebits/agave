@@ -85,12 +85,6 @@ pub struct SchedulerCountMetricsInner {
     pub num_dropped_on_clean: Saturating<usize>,
     /// Number of transactions that were dropped due to exceeded capacity.
     pub num_dropped_on_capacity: Saturating<usize>,
-    /// Transactions dropped at the scheduler-receive boundary because the
-    /// tx's priority was below the published pf-floor. Catches the
-    /// in-flight backlog that already passed sigverify's filter; without
-    /// this, that backlog fills the buffer at cold-start saturation and
-    /// triggers a `num_dropped_on_capacity` spike.
-    pub num_dropped_below_priority_floor: Saturating<usize>,
     /// Min prioritization fees in the transaction container
     pub min_prioritization_fees: u64,
     /// Max prioritization fees in the transaction container
@@ -154,7 +148,6 @@ impl SchedulerCountMetricsInner {
             num_dropped_on_clear: Saturating(num_dropped_on_clear),
             num_dropped_on_clean: Saturating(num_dropped_on_clean),
             num_dropped_on_capacity: Saturating(num_dropped_on_capacity),
-            num_dropped_below_priority_floor: Saturating(num_dropped_below_priority_floor),
             min_prioritization_fees: _min_prioritization_fees,
             max_prioritization_fees: _max_prioritization_fees,
             rate_limiter_tokens_remaining,
@@ -208,11 +201,6 @@ impl SchedulerCountMetricsInner {
                 i64
             ),
             ("num_dropped_on_capacity", num_dropped_on_capacity, i64),
-            (
-                "num_dropped_below_priority_floor",
-                num_dropped_below_priority_floor,
-                i64
-            ),
             ("min_priority", self.get_min_priority(), i64),
             ("max_priority", self.get_max_priority(), i64),
             (
@@ -258,7 +246,6 @@ impl SchedulerCountMetricsInner {
         self.num_dropped_on_clear = Saturating(0);
         self.num_dropped_on_clean = Saturating(0);
         self.num_dropped_on_capacity = Saturating(0);
-        self.num_dropped_below_priority_floor = Saturating(0);
         self.min_prioritization_fees = u64::MAX;
         self.max_prioritization_fees = 0;
         self.rate_limiter_tokens_remaining = 0;

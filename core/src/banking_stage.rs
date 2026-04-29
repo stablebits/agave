@@ -522,7 +522,6 @@ impl BankingStage {
         let receive_and_buffer = TransactionViewReceiveAndBuffer {
             receiver: self.non_vote_receiver.clone(),
             sharable_banks: sharable_banks.clone(),
-            priority_floor: self.priority_floor.clone(),
         };
 
         // Spawn vote worker.
