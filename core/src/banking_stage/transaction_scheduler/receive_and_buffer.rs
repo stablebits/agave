@@ -240,9 +240,6 @@ impl TransactionViewReceiveAndBuffer {
         let enable_instruction_accounts_limit =
             root_bank.feature_set.snapshot().limit_instruction_accounts;
         let transaction_account_lock_limit = working_bank.get_transaction_account_lock_limit();
-        // Snapshot the bank-side fee inputs once per batch; they don't
-        // change mid-batch and per-packet construction would re-Arc-clone
-        // the feature set on every tx.
         let fee_context = FeeContext::from_bank(working_bank);
 
         // Create temporary batches of transactions to be age-checked.

@@ -92,6 +92,108 @@ const DEFAULT_SCHEDULER_PACING_NON_FILL_TIME_MILLIS: u64 = 50;
 pub(crate) const DEFAULT_SCHEDULER_PACING_FILL_TIME_MILLIS: NonZeroU64 =
     NonZeroU64::new(DEFAULT_MS_PER_SLOT - DEFAULT_SCHEDULER_PACING_NON_FILL_TIME_MILLIS).unwrap();
 
+/// Saturation detection + pf-floor publication. Constructed only when
+/// `pf_floor_enabled = true`; held as `Option<SaturationState>` on the
+/// controller so the disabled path is a single early-out.
+struct SaturationState {
+    /// Published to sigverify as the pf-floor when saturated.
+    priority_floor: Arc<SchedulerPriorityFloor>,
+    /// Hysteresis latch for the saturation state.
+    saturated: bool,
+    /// Drives the saturation signal: depleted by arrivals, refilled at a
+    /// fixed TPS.
+    token_bucket: TokenBucket,
+    /// AND-guard on saturation entry: required absolute buffer occupancy.
+    /// Uses buffer size rather than priority-queue size so saturation stays
+    /// active while the scheduler is actively scheduling and the priority
+    /// queue is momentarily near-empty.
+    buffer_guard_threshold: usize,
+    /// Token-bucket level at which saturation de-asserts (hysteresis).
+    desaturate_tokens_threshold: u64,
+}
+
+impl SaturationState {
+    /// Builds the state when the feature is enabled. Caller must clear the
+    /// floor at controller-construction time *unconditionally* so a stale
+    /// floor from a prior controller can't keep sigverify dropping packets.
+    fn new(
+        config: &SchedulerConfig,
+        priority_floor: Arc<SchedulerPriorityFloor>,
+    ) -> Option<Self> {
+        config.pf_floor_enabled.then(|| {
+            // Start full: at startup the scheduler isn't behind on anything,
+            // so the full burst budget is available to absorb the first wave
+            // of arrivals (e.g. a non-leader backlog).
+            let token_bucket = TokenBucket::new(
+                config.token_bucket_burst,
+                config.token_bucket_burst,
+                config.token_bucket_refill_tps as f64,
+            );
+            let buffer_guard_threshold = TOTAL_BUFFERED_PACKETS
+                .saturating_mul(config.saturation_min_queue_pct as usize)
+                / 100;
+            let desaturate_tokens_threshold = config.token_bucket_burst.saturating_div(2);
+            Self {
+                priority_floor,
+                saturated: false,
+                token_bucket,
+                buffer_guard_threshold,
+                desaturate_tokens_threshold,
+            }
+        })
+    }
+
+    /// Per-tick update. `floor` is the current queue-min proxy priority (None
+    /// if queue is empty / unparseable / zero); only consulted while
+    /// saturated. Returns `(rate_limiter_tokens_remaining,
+    /// current_priority_fee_floor)` for metrics; the floor is `0` when not
+    /// saturated.
+    fn tick(
+        &mut self,
+        num_received: u64,
+        buffer_size: usize,
+        floor: Option<u64>,
+    ) -> (u64, u64) {
+        let consumed = self.token_bucket.consume_tokens_saturating(num_received);
+        let over_budget = num_received.saturating_sub(consumed);
+        let current_tokens = self.token_bucket.current_tokens();
+        let buffer_guard_met = buffer_size >= self.buffer_guard_threshold;
+
+        // State transitions.
+        if self.saturated {
+            // Exit when the bucket has refilled past the threshold, or the
+            // buffer has drained below the guard (pressure is gone).
+            if current_tokens >= self.desaturate_tokens_threshold || !buffer_guard_met {
+                self.saturated = false;
+                self.priority_floor.clear();
+            }
+        } else if over_budget > 0 && buffer_guard_met {
+            self.saturated = true;
+        }
+
+        // While saturated, publish the current floor every tick (the queue
+        // evolves; the floor follows it).
+        let current_priority_fee_floor = if self.saturated {
+            floor
+                .inspect(|&f| self.priority_floor.publish(f))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        (current_tokens, current_priority_fee_floor)
+    }
+}
+
+impl Drop for SaturationState {
+    fn drop(&mut self) {
+        // The priority floor outlives individual scheduler controllers (it's
+        // shared with sigverify). Clear it on tear-down so a stale floor
+        // from this controller can't keep sigverify dropping packets.
+        self.priority_floor.clear();
+    }
+}
+
 /// Controls packet and transaction flow into scheduler, and scheduling execution.
 pub(crate) struct SchedulerController<R, S>
 where
@@ -124,29 +226,9 @@ where
     recheck_cursor: Option<TransactionPriorityId>,
     /// Recheck IDs scratch space.
     recheck_chunk: Vec<TransactionPriorityId>,
-    /// Scheduler-published priority floor read by sigverify.
-    priority_floor: Arc<SchedulerPriorityFloor>,
-    /// Whether the scheduler is currently in the saturated state (simple
-    /// boolean latch for hysteresis bookkeeping).
-    saturated: bool,
-    /// Token bucket driving the pf-floor saturation signal. `None` when
+    /// Saturation detection + pf-floor publication. `None` when
     /// `pf_floor_enabled` is false to keep the mechanism fully zero-cost.
-    saturation_token_bucket: Option<TokenBucket>,
-    /// Per-tick arrivals counter, accumulated from each
-    /// `receive_and_buffer_packets` call's `num_received` and consumed by
-    /// `update_scheduler_priority_floor`. Local rather than shared
-    /// (sigverify does not participate in saturation detection).
-    tick_arrivals: u64,
-    /// Precomputed from config: buffer occupancy (absolute packets, i.e.
-    /// `id_to_transaction_state.len()`) at which the AND-guard on saturation
-    /// entry is satisfied. Uses buffer size rather than priority-queue size
-    /// so that saturation still fires when the scheduler is actively
-    /// scheduling and the priority queue is momentarily near-empty while the
-    /// full buffer remains under pressure.
-    buffer_guard_threshold: usize,
-    /// Precomputed from config: token-bucket level at which saturation
-    /// de-asserts (hysteresis), currently `token_bucket_burst / 2`.
-    desaturate_tokens_threshold: u64,
+    saturation_state: Option<SaturationState>,
 }
 
 impl<R, S> SchedulerController<R, S>
@@ -164,25 +246,12 @@ where
         worker_metrics: Vec<Arc<ConsumeWorkerMetrics>>,
         priority_floor: Arc<SchedulerPriorityFloor>,
     ) -> Self {
-        let saturation_token_bucket = config.pf_floor_enabled.then(|| {
-            // Start full: the bucket represents slack for absorbing a burst,
-            // not work done. At startup the scheduler isn't behind on
-            // anything, so give it its full burst budget to absorb the first
-            // wave of arrivals (e.g. a backlog accumulated during a preceding
-            // non-leader period).
-            TokenBucket::new(
-                config.token_bucket_burst,
-                config.token_bucket_burst,
-                config.token_bucket_refill_tps as f64,
-            )
-        });
-        let buffer_guard_threshold =
-            TOTAL_BUFFERED_PACKETS.saturating_mul(config.saturation_min_queue_pct as usize) / 100;
-        let desaturate_tokens_threshold = config.token_bucket_burst.saturating_div(2);
         // The priority floor outlives individual scheduler controllers.
-        // Start every controller from an unsaturated state so a stale floor
-        // from a previous scheduler cannot keep sigverify dropping packets.
+        // Start every controller from an unsaturated state — independent of
+        // whether the feature is enabled now — so a stale floor from a prior
+        // scheduler can't keep sigverify dropping packets.
         priority_floor.clear();
+        let saturation_state = SaturationState::new(&config, priority_floor);
         Self {
             exit,
             config,
@@ -197,12 +266,7 @@ where
             scheduling_details: SchedulingDetails::default(),
             recheck_cursor: None,
             recheck_chunk: Vec::with_capacity(CHECK_CHUNK),
-            priority_floor,
-            saturated: false,
-            saturation_token_bucket,
-            tick_arrivals: 0,
-            buffer_guard_threshold,
-            desaturate_tokens_threshold,
+            saturation_state,
         }
     }
 
@@ -280,7 +344,7 @@ where
                     timing_metrics.clean_time_us += clean_time_us;
                 });
             }
-            self.receive_and_buffer_packets(&decision).map_err(|_| {
+            let receiving_stats = self.receive_and_buffer_packets(&decision).map_err(|_| {
                 SchedulerError::DisconnectedRecvChannel("receive and buffer disconnected")
             })?;
             // Report metrics only if there is data.
@@ -290,7 +354,7 @@ where
             self.count_metrics.update(|count_metrics| {
                 count_metrics.update_priority_stats(priority_min_max);
             });
-            self.update_scheduler_priority_floor();
+            self.update_scheduler_priority_floor(receiving_stats.num_received as u64);
             self.count_metrics
                 .maybe_report_and_reset_interval(should_report);
             self.timing_metrics
@@ -421,77 +485,30 @@ where
     ///
     /// When the bucket is replenished past half of its burst capacity (or
     /// the buffer drains below the guard), we clear the published floor.
-    fn update_scheduler_priority_floor(&mut self) {
-        let Some(bucket) = self.saturation_token_bucket.as_ref() else {
-            // Feature disabled. `SchedulerController::new` already cleared the
-            // floor at construction and nothing on this path writes to it, so
-            // no per-tick clear is needed here.
-            self.tick_arrivals = 0;
+    fn update_scheduler_priority_floor(&mut self, num_received: u64) {
+        // Feature disabled: nothing on this path writes to the floor.
+        if self.saturation_state.is_none() {
             return;
-        };
-
-        // Consume this tick's arrivals from the bucket, taking whatever is
-        // available. The remainder (requested - consumed) is the amount by
-        // which arrivals exceeded the bucket this tick, i.e. "over budget."
-        let arrivals = std::mem::take(&mut self.tick_arrivals);
-        let consumed = bucket.consume_tokens_saturating(arrivals);
-        let over_budget = arrivals.saturating_sub(consumed);
-        let current_tokens = bucket.current_tokens();
-
-        // Record observability metrics regardless of saturation state.
-        self.count_metrics.update(|count_metrics| {
-            count_metrics.rate_limiter_tokens_remaining = current_tokens;
-        });
-
-        // Buffer guard: require a meaningfully full buffer before publishing
-        // a floor. Uses the full buffer (priority-queue + held/in-flight) so
-        // that saturation stays active while the scheduler is actively
-        // scheduling and the priority queue is momentarily near-empty.
-        let buffer_guard_met = self.container.buffer_size() >= self.buffer_guard_threshold;
-
-        if self.saturated {
-            if let Some(floor) = self.compute_pf_floor() {
-                self.priority_floor.publish(floor);
-                self.count_metrics.update(|count_metrics| {
-                    count_metrics.current_priority_fee_floor = floor;
-                });
-            }
-            // Exit hysteresis: bucket refilled past threshold, or buffer
-            // drained below guard (pressure is gone).
-            if current_tokens >= self.desaturate_tokens_threshold || !buffer_guard_met {
-                self.saturated = false;
-                self.priority_floor.clear();
-                self.count_metrics.update(|count_metrics| {
-                    count_metrics.current_priority_fee_floor = 0;
-                });
-            }
-        } else if over_budget > 0 && buffer_guard_met {
-            self.saturated = true;
-            if let Some(floor) = self.compute_pf_floor() {
-                self.priority_floor.publish(floor);
-                self.count_metrics.update(|count_metrics| {
-                    count_metrics.current_priority_fee_floor = floor;
-                });
-            }
         }
+        let buffer_size = self.container.buffer_size();
+        let floor = self.compute_pf_floor();
+        let state = self.saturation_state.as_mut().expect("checked above");
+        let (tokens, fee_floor) = state.tick(num_received, buffer_size, floor);
+        self.count_metrics.update(|count_metrics| {
+            count_metrics.rate_limiter_tokens_remaining = tokens;
+            count_metrics.current_priority_fee_floor = fee_floor;
+        });
     }
 
-    /// Compute the pf-floor to publish: priority of the queue's
-    /// lowest-priority tx evaluated against `MAINNET_FEE_CONTEXT`.
-    /// Returns `None` when the queue is empty, the queue-min tx isn't
-    /// parseable, or the priority is zero (`SchedulerPriorityFloor` rejects
-    /// a zero floor — `0` is the "not saturated" sentinel).
-    ///
-    /// We re-derive instead of reading the cached bank-context priority off
-    /// `TransactionPriorityId` so the floor is exactly comparable to the
-    /// values sigverify and the scheduler-receive check compute on
-    /// arriving txs (both use the same `calculate_pf_drop_priority`
-    /// function with the same fee-context constants).
+    /// Queue-min priority evaluated against `MAINNET_FEE_CONTEXT` — the same
+    /// function sigverify runs on arriving txs, so floor and arrivals
+    /// compare in identical units regardless of bank-vs-mainnet drift.
+    /// `None` when the queue is empty, queue-min unparseable, or priority
+    /// is zero (`0` is the "not saturated" sentinel).
     fn compute_pf_floor(&self) -> Option<u64> {
         let priority_id = self.container.get_min_priority_id()?;
         let tx = self.container.get_transaction(priority_id.id)?;
-        let floor = calculate_pf_drop_priority(tx)?;
-        (floor > 0).then_some(floor)
+        calculate_pf_drop_priority(tx).filter(|&f| f > 0)
     }
 
     /// Clears the transaction state container.
@@ -598,12 +615,6 @@ where
             .receive_and_buffer
             .receive_and_buffer_packets(&mut self.container, decision)?;
 
-        // Track per-tick arrivals locally so the saturation token bucket
-        // can be driven without any sigverify-side writes.
-        self.tick_arrivals = self
-            .tick_arrivals
-            .saturating_add(receiving_stats.num_received as u64);
-
         self.count_metrics.update(|count_metrics| {
             let ReceivingStats {
                 num_received,
@@ -640,16 +651,6 @@ where
         });
 
         Ok(receiving_stats)
-    }
-}
-
-impl<R, S> Drop for SchedulerController<R, S>
-where
-    R: ReceiveAndBuffer,
-    S: Scheduler<R::Transaction>,
-{
-    fn drop(&mut self) {
-        self.priority_floor.clear();
     }
 }
 

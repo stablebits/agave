@@ -14,12 +14,9 @@ pub type BankingPacketReceiver = Receiver<BankingPacketBatch>;
 /// Priority floor shared from the banking-stage scheduler to sigverify.
 ///
 /// When saturated, the scheduler publishes the queue-min transaction's
-/// priority. Sigverify drops at-or-below-floor arrivals: anything no better
-/// than what the scheduler would evict on overflow.
-/// `0` means "no floor published."
+/// priority. Sigverify drops at-or-below-floor arrivals. `0` means "not saturated".
 #[derive(Debug, Default)]
 pub struct SchedulerPriorityFloor {
-    // `0` is the "not saturated" sentinel; published floors are positive.
     priority_floor: AtomicU64,
 }
 
