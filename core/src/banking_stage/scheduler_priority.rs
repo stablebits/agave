@@ -68,8 +68,8 @@ pub static MAINNET_FEE_CONTEXT: LazyLock<FeeContext> = LazyLock::new(FeeContext:
 /// - `cost = CostModel::calculate_cost(...).sum()`
 /// - `reward = priority_fee + non_burned_share_of_base_fee` when the
 ///   base fee is non-zero; `reward = 0` when the base fee is zero
-///   (matches `Bank::calculate_reward_and_burn_fee_details`'s
-///   short-circuit; affects test banks with `lamports_per_signature = 0`).
+///   (via `solana_fee::split_reward_and_burn`'s zero-fee short-circuit;
+///   affects test banks with `lamports_per_signature = 0`).
 ///
 /// The `+1` in the denominator avoids divide-by-zero from a buggy
 /// zero-cost return; cost-model results are bounded away from zero in
@@ -86,19 +86,11 @@ pub fn calculate_priority_and_cost<Tx: TransactionMeta + SVMStaticMessage>(
         transaction_configuration.priority_fee_lamports,
         FeeFeatures::from(fee_context.feature_set.as_ref()),
     );
-    // Match `Bank::calculate_reward_and_burn_fee_details`: when there is
-    // no base fee (e.g. test bank with `lamports_per_signature = 0`),
-    // reward is zero regardless of priority_fee.
-    if fee_details.transaction_fee() == 0 {
-        return (0, cost);
-    }
-    let burn = fee_details
-        .transaction_fee()
-        .saturating_mul(fee_context.burn_percent)
-        / 100;
-    let reward = fee_details
-        .prioritization_fee()
-        .saturating_add(fee_details.transaction_fee().saturating_sub(burn));
+    let (reward, _burn) = solana_fee::split_reward_and_burn(
+        fee_details.transaction_fee(),
+        fee_details.prioritization_fee(),
+        fee_context.burn_percent,
+    );
 
     const MULTIPLIER: u64 = 1_000_000;
     (
