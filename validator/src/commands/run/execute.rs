@@ -35,7 +35,9 @@ use {
     },
     solana_clock::{DEFAULT_SLOTS_PER_EPOCH, Slot},
     solana_core::{
-        banking_stage::transaction_scheduler::scheduler_controller::SchedulerConfig,
+        banking_stage::transaction_scheduler::scheduler_controller::{
+            SchedulerConfig, SchedulerSaturation,
+        },
         banking_trace::DISABLED_BAKING_TRACE_DIR,
         consensus::tower_storage,
         repair::repair_handler::RepairHandlerType,
@@ -904,10 +906,15 @@ pub fn execute(
                     "block_production_pacing_fill_time_millis",
                     SchedulerPacing
                 ),
-                pf_floor_enabled: !matches.is_present("scheduler_pf_floor_disable"),
-                token_bucket_refill_tps: refill_tps,
-                token_bucket_burst: burst,
-                saturation_min_queue_pct: min_queue_pct,
+                saturation: if matches.is_present("scheduler_pf_floor_disable") {
+                    SchedulerSaturation::Disabled
+                } else {
+                    SchedulerSaturation::Enabled {
+                        token_bucket_refill_tps: refill_tps,
+                        token_bucket_burst: burst,
+                        min_queue_pct,
+                    }
+                },
             }
         },
         enable_block_production_forwarding: staked_nodes_overrides_path.is_some(),
