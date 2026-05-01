@@ -1714,7 +1714,6 @@ impl Validator {
             cluster_slots,
             node: Some(node_multihoming),
             banking_control_sender,
-            block_production_scheduler_config: config.block_production_scheduler_config.clone(),
             snapshot_controller,
             blockstore: blockstore.clone(),
             votor_event_sender,

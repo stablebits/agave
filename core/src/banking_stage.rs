@@ -13,11 +13,12 @@ use {
                 prio_graph_scheduler::PrioGraphScheduler,
                 scheduler_controller::{
                     DEFAULT_SCHEDULER_PACING_FILL_TIME_MILLIS, SchedulerConfig, SchedulerController,
+                    SchedulerSaturation,
                 },
                 scheduler_error::SchedulerError,
             },
         },
-        validator::BlockProductionMethod,
+        validator::{BlockProductionMethod, SchedulerPacing},
     },
     agave_banking_stage_ingress_types::{BankingPacketReceiver, SchedulerPriorityFloor},
     crossbeam_channel::{Receiver, Sender, unbounded},
@@ -340,6 +341,11 @@ pub struct BankingStage {
     log_messages_bytes_limit: Option<usize>,
     priority_floor: Arc<SchedulerPriorityFloor>,
     threads: FuturesUnordered<NamedTask<std::thread::Result<()>>>,
+    /// Source-of-truth scheduler config. Mutated by `SetPacing` /
+    /// `SetSaturation` control messages and consumed on every `Cycle` to
+    /// build the new scheduler. Initialized from the operator's CLI-supplied
+    /// config in `new_num_threads`.
+    scheduler_config: SchedulerConfig,
 }
 
 impl BankingStage {
@@ -383,6 +389,7 @@ impl BankingStage {
             log_messages_bytes_limit,
             priority_floor,
             threads: FuturesUnordered::default(),
+            scheduler_config,
         };
 
         // Spawn the manager thread.
@@ -393,10 +400,9 @@ impl BankingStage {
                     .enable_all()
                     .build()
                     .unwrap();
-                rt.block_on(manager.run(BankingControlMsg::Internal {
+                rt.block_on(manager.run(BankingControlMsg::Cycle {
                     block_production_method,
                     num_workers,
-                    config: scheduler_config,
                 }))
             })
             .unwrap();
@@ -415,9 +421,19 @@ impl BankingStage {
                 biased;
 
                 _ = self.banking_shutdown_signal.cancelled() => break,
-                Some(args) = self.banking_control_receiver.recv() => {
-                    if self.cycle_threads(args).await.is_err() {
-                        self.cycle_threads_fallback().await.unwrap();
+                Some(msg) = self.banking_control_receiver.recv() => {
+                    match msg {
+                        BankingControlMsg::SetPacing(p) => {
+                            self.scheduler_config.scheduler_pacing = p;
+                        }
+                        BankingControlMsg::SetSaturation(s) => {
+                            self.scheduler_config.saturation = s;
+                        }
+                        cycle_msg => {
+                            if self.cycle_threads(cycle_msg).await.is_err() {
+                                self.cycle_threads_fallback().await.unwrap();
+                            }
+                        }
                     }
                 },
                 Some((name, res)) = self.threads.next() => {
@@ -464,10 +480,13 @@ impl BankingStage {
     async fn cycle_threads_fallback(&mut self) -> Result<(), ()> {
         error!("Spawning the default block production method as a fallback...");
 
-        self.cycle_threads(BankingControlMsg::Internal {
+        // Reset stored config to defaults too: a fallback is for catastrophic
+        // failures, and we want the safest known-good config on the next
+        // scheduler, not whatever override an RPC might have set.
+        self.scheduler_config = SchedulerConfig::default();
+        self.cycle_threads(BankingControlMsg::Cycle {
             block_production_method: BlockProductionMethod::default(),
             num_workers: BankingStage::default_num_workers(),
-            config: SchedulerConfig::default(),
         })
         .await
     }
@@ -478,20 +497,24 @@ impl BankingStage {
         self.priority_floor.clear();
 
         let threads = (match args {
-            BankingControlMsg::Internal {
+            BankingControlMsg::Cycle {
                 block_production_method,
                 num_workers,
-                config,
             } => match block_production_method {
                 BlockProductionMethod::CentralScheduler => {
-                    self.spawn_internal_central(false, num_workers, config)
+                    self.spawn_internal_central(false, num_workers)
                 }
                 BlockProductionMethod::CentralSchedulerGreedy => {
-                    self.spawn_internal_central(true, num_workers, config)
+                    self.spawn_internal_central(true, num_workers)
                 }
             },
             #[cfg(unix)]
             BankingControlMsg::External { session } => self.spawn_external(session),
+            BankingControlMsg::SetPacing(_) | BankingControlMsg::SetSaturation(_) => {
+                // These are handled in `run()` and never reach `cycle_threads`
+                // / `spawn_scheduler`.
+                unreachable!("Set* messages are handled by the run() dispatcher")
+            }
         })?;
 
         self.threads.extend(threads.into_iter().map(|handle| {
@@ -508,13 +531,13 @@ impl BankingStage {
         &self,
         use_greedy_scheduler: bool,
         num_workers: NonZeroUsize,
-        scheduler_config: SchedulerConfig,
     ) -> Result<Vec<JoinHandle<()>>, ()> {
         info!("Spawning internal central scheduler");
 
         assert!(num_workers <= BankingStage::max_num_workers());
         let num_workers = num_workers.get();
 
+        let scheduler_config = self.scheduler_config.clone();
         let exit = self.worker_exit_signal.clone();
 
         // Setup receive & buffer.
@@ -786,11 +809,22 @@ impl BankingStageHandle {
 }
 
 pub enum BankingControlMsg {
-    Internal {
+    /// Cycle the banking-stage threads: shut down the current scheduler /
+    /// workers and spawn a fresh internal central scheduler with the given
+    /// `block_production_method` and `num_workers`. The scheduler config
+    /// (pacing, saturation tuning) is read from the manager's stored
+    /// `SchedulerConfig`; mutate it ahead of `Cycle` via `SetPacing` /
+    /// `SetSaturation` if you need a non-default value on the new scheduler.
+    Cycle {
         block_production_method: BlockProductionMethod,
         num_workers: NonZeroUsize,
-        config: SchedulerConfig,
     },
+    /// Update the manager's stored pacing. Takes effect on the next `Cycle`;
+    /// does not by itself restart the scheduler.
+    SetPacing(SchedulerPacing),
+    /// Update the manager's stored saturation tuning. Takes effect on the
+    /// next `Cycle`; does not by itself restart the scheduler.
+    SetSaturation(SchedulerSaturation),
     #[cfg(unix)]
     External {
         session: agave_scheduling_utils::handshake::AgaveSession,

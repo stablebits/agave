@@ -12,10 +12,7 @@ use {
     solana_clock::Slot,
     solana_core::{
         admin_rpc_post_init::AdminRpcRequestMetadataPostInit,
-        banking_stage::{
-            BankingControlMsg, BankingStage,
-            transaction_scheduler::scheduler_controller::SchedulerConfig,
-        },
+        banking_stage::{BankingControlMsg, BankingStage},
         consensus::{Tower, tower_storage::TowerStorage},
         repair::repair_service,
         validator::{
@@ -814,22 +811,21 @@ impl AdminRpc for AdminRpcImpl {
         }
 
         meta.with_post_init(|post_init| {
-            if post_init
-                .banking_control_sender
-                .try_send(BankingControlMsg::Internal {
-                    block_production_method,
-                    num_workers,
-                    // manage_block_production only accepts scheduler_pacing;
-                    // other SchedulerConfig fields are spread from the
-                    // operator's startup config so a runtime pacing change
-                    // doesn't silently reset pf-floor / token-bucket /
-                    // saturation tuning.
-                    config: SchedulerConfig {
-                        scheduler_pacing,
-                        ..post_init.block_production_scheduler_config.clone()
-                    },
-                })
+            // Update the manager's stored pacing first, then trigger a thread
+            // cycle so the new scheduler picks it up. The two-message form
+            // means the RPC only sends what it actually changes; the rest of
+            // `SchedulerConfig` (pf-floor / token-bucket / saturation tuning)
+            // is preserved by the manager.
+            let sender = &post_init.banking_control_sender;
+            if sender
+                .try_send(BankingControlMsg::SetPacing(scheduler_pacing))
                 .is_err()
+                || sender
+                    .try_send(BankingControlMsg::Cycle {
+                        block_production_method,
+                        num_workers,
+                    })
+                    .is_err()
             {
                 error!("Banking stage already switching schedulers");
 
@@ -1170,7 +1166,6 @@ mod tests {
                     ),
                     node: None,
                     banking_control_sender: mpsc::channel(1).0,
-                    block_production_scheduler_config: SchedulerConfig::default(),
                     snapshot_controller,
                     blockstore,
                     votor_event_sender,
