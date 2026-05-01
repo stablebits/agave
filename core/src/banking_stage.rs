@@ -399,7 +399,7 @@ impl BankingStage {
                     .enable_all()
                     .build()
                     .unwrap();
-                rt.block_on(manager.run(BankingControlMsg::Cycle {
+                rt.block_on(manager.run(BankingControlMsg::Internal {
                     block_production_method,
                     num_workers,
                     pacing_override: None,
@@ -469,7 +469,7 @@ impl BankingStage {
         // failures, and we want the safest known-good config on the next
         // scheduler, not whatever override an RPC might have set.
         self.scheduler_config = SchedulerConfig::default();
-        self.cycle_threads(BankingControlMsg::Cycle {
+        self.cycle_threads(BankingControlMsg::Internal {
             block_production_method: BlockProductionMethod::default(),
             num_workers: BankingStage::default_num_workers(),
             pacing_override: None,
@@ -479,7 +479,7 @@ impl BankingStage {
 
     fn spawn_scheduler(&mut self, args: BankingControlMsg) -> Result<(), ()> {
         let threads = (match args {
-            BankingControlMsg::Cycle {
+            BankingControlMsg::Internal {
                 block_production_method,
                 num_workers,
                 pacing_override,
@@ -792,14 +792,14 @@ impl BankingStageHandle {
 }
 
 pub enum BankingControlMsg {
-    /// Cycle the banking-stage threads: shut down the current scheduler /
+    /// Restart the banking-stage threads: shut down the current scheduler /
     /// workers and spawn a fresh internal central scheduler with the given
     /// `block_production_method` and `num_workers`. The scheduler config is
     /// read from the manager's stored `SchedulerConfig`; `pacing_override`
     /// atomically applies a pacing change in the same message before
     /// spawning, so callers don't have to issue two messages and worry
     /// about ordering on a small mpsc.
-    Cycle {
+    Internal {
         block_production_method: BlockProductionMethod,
         num_workers: NonZeroUsize,
         pacing_override: Option<SchedulerPacing>,

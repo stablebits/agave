@@ -471,10 +471,19 @@ where
             .saturation_state
             .transition(num_received, buffer_size);
 
-        // Phase 2: only run `compute_pf_floor` (parse + cost-model + fee on
-        // the queue-min tx) when we'll actually publish.
+        // Phase 2: only compute the queue-min floor (parse + cost-model + fee
+        // on the queue-min tx) when we'll actually publish. The floor is
+        // evaluated against `MAINNET_FEE_CONTEXT` — the same function
+        // sigverify runs on arriving txs, so floor and arrivals compare in
+        // identical units regardless of bank-vs-mainnet drift. `None` when
+        // the queue is empty, queue-min unparseable, or priority is zero.
         let fee_floor = if needs_floor {
-            let floor = self.compute_pf_floor();
+            let floor = self
+                .container
+                .get_min_priority_id()
+                .and_then(|id| self.container.get_transaction(id.id))
+                .and_then(calculate_pf_drop_priority)
+                .filter(|&f| f > 0);
             self.saturation_state.publish_floor(floor)
         } else {
             0
@@ -484,17 +493,6 @@ where
             count_metrics.rate_limiter_tokens_remaining = tokens;
             count_metrics.current_priority_fee_floor = fee_floor;
         });
-    }
-
-    /// Queue-min priority evaluated against `MAINNET_FEE_CONTEXT` — the same
-    /// function sigverify runs on arriving txs, so floor and arrivals
-    /// compare in identical units regardless of bank-vs-mainnet drift.
-    /// `None` when the queue is empty, queue-min unparseable, or priority
-    /// is zero (`0` is the "not saturated" sentinel).
-    fn compute_pf_floor(&self) -> Option<u64> {
-        let priority_id = self.container.get_min_priority_id()?;
-        let tx = self.container.get_transaction(priority_id.id)?;
-        calculate_pf_drop_priority(tx).filter(|&f| f > 0)
     }
 
     /// Clears the transaction state container.

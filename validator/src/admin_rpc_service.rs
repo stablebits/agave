@@ -816,7 +816,7 @@ impl AdminRpc for AdminRpcImpl {
             // saturation tuning) is preserved by the manager.
             if post_init
                 .banking_control_sender
-                .try_send(BankingControlMsg::Cycle {
+                .try_send(BankingControlMsg::Internal {
                     block_production_method,
                     num_workers,
                     pacing_override: Some(scheduler_pacing),
