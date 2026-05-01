@@ -32,6 +32,11 @@ pub(crate) struct TransactionSigVerifier {
 
 struct TransactionVerifyTask {
     batch: PacketBatch,
+    /// Pf-floor value applied at the verifier-service intake check, or `0`
+    /// if no floor was enforced there (feature disabled or floor was 0 at
+    /// the time). The worker compares this to the current floor and skips
+    /// the second-stage parse pass when the floor hasn't moved up since.
+    intake_floor: u64,
 }
 
 struct GossipVerifyTask {
@@ -59,10 +64,14 @@ impl TransactionSigVerifier {
     pub(crate) fn verify_and_send_packets(
         &mut self,
         batches: Vec<PacketBatch>,
+        intake_floor: u64,
     ) -> Result<usize, SigVerifyServiceError> {
         let mut dropped_packets = 0;
         for batch in batches {
-            match self.worker_sender.try_send(TransactionVerifyTask { batch }) {
+            match self.worker_sender.try_send(TransactionVerifyTask {
+                batch,
+                intake_floor,
+            }) {
                 Ok(()) => {}
                 Err(TrySendError::Full(task)) => {
                     dropped_packets += task.batch.len();
@@ -278,7 +287,10 @@ impl SigVerifyWorkerPool {
         stats: &SigVerifyWorkerStats,
         scheduler_priority_floor: Option<&Arc<SchedulerPriorityFloor>>,
     ) -> bool {
-        let TransactionVerifyTask { batch } = work;
+        let TransactionVerifyTask {
+            batch,
+            intake_floor,
+        } = work;
         let mut batch = batch;
 
         // Second-stage pf-floor drop. Catches packets that passed the
@@ -287,8 +299,17 @@ impl SigVerifyWorkerPool {
         // Performed before sigverify so we also save the GPU verify cost on
         // dropped packets. Skipped for tpu_vote packets (votes are immune
         // to the floor; mirrors the first-stage behavior).
-        if let Some(floor) = scheduler_priority_floor.and_then(|f| f.get()) {
-            let (dropped, all_below) = apply_priority_floor_to_batch(&mut batch, floor);
+        //
+        // Re-check only if the current floor is *higher* than what was
+        // applied at intake — anything above intake_floor was already
+        // filtered, so a re-check at the same floor is a guaranteed no-op
+        // (and the per-packet parse + cost-model + fee compute is not
+        // free).
+        let current_floor = scheduler_priority_floor
+            .and_then(|f| f.get())
+            .unwrap_or(0);
+        if current_floor > intake_floor {
+            let (dropped, all_below) = apply_priority_floor_to_batch(&mut batch, current_floor);
             if dropped > 0 {
                 stats
                     .total_dropped_below_priority_floor_late

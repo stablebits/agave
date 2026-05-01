@@ -364,9 +364,14 @@ impl SigVerifyStage {
         dedup_time.stop();
 
         // Apply the scheduler-published pf-floor to drop low-priority transactions
-        // earlier when the scheduler is saturated.
-        if let Some(floor) = scheduler_priority_floor.and_then(|f| f.get()) {
-            let dropped = apply_priority_floor(&mut batches, floor);
+        // earlier when the scheduler is saturated. The floor value applied
+        // here is forwarded with the batch so the worker can skip its own
+        // re-check when the floor hasn't moved up since.
+        let intake_floor = scheduler_priority_floor
+            .and_then(|f| f.get())
+            .unwrap_or(0);
+        if intake_floor > 0 {
+            let dropped = apply_priority_floor(&mut batches, intake_floor);
             if dropped > 0 {
                 stats.total_dropped_below_priority_floor = stats
                     .total_dropped_below_priority_floor
@@ -374,7 +379,8 @@ impl SigVerifyStage {
             }
         }
 
-        stats.total_dropped_on_capacity += verifier.verify_and_send_packets(batches)?;
+        stats.total_dropped_on_capacity +=
+            verifier.verify_and_send_packets(batches, intake_floor)?;
         stats
             .dedup_packets_pp_us_hist
             .increment(dedup_time.as_us() / (num_packets as u64))
