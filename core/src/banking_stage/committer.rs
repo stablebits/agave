@@ -8,7 +8,7 @@ use {
     },
     solana_measure::measure_us,
     solana_runtime::{
-        bank::{Bank, ProcessedTransactionCounts},
+        bank::{Bank, CollectorFeeDetails, ProcessedTransactionCounts},
         bank_utils,
         prioritization_fee_cache::PrioritizationFeeCache,
         transaction_batch::TransactionBatch,
@@ -31,6 +31,10 @@ pub enum CommitTransactionDetails {
         loaded_accounts_data_size: u32,
         fee_payer_post_balance: u64,
         result: Result<(), TransactionError>,
+        /// Lamports actually deposited to the leader (priority fee + the
+        /// non-burned share of the base fee). Mirrors the bank's
+        /// `calculate_reward_and_burn_fee_details` deposit.
+        collected_fee_lamports: u64,
     },
     NotCommitted(TransactionError),
 }
@@ -68,7 +72,7 @@ impl Committer {
         balance_collector: Option<BalanceCollector>,
         execute_and_commit_timings: &mut LeaderExecuteAndCommitTimings,
         processed_counts: &ProcessedTransactionCounts,
-    ) -> (u64, Vec<CommitTransactionDetails>, u64) {
+    ) -> (u64, Vec<CommitTransactionDetails>) {
         let (commit_results, commit_time_us) = measure_us!(bank.commit_transactions(
             batch.sanitized_transactions(),
             processing_results,
@@ -77,7 +81,6 @@ impl Committer {
         ));
         execute_and_commit_timings.commit_us = commit_time_us;
 
-        let mut block_priority_fees_lamports: u64 = 0;
         let commit_transaction_statuses = commit_results
             .iter()
             .map(|commit_result| match commit_result {
@@ -85,13 +88,11 @@ impl Committer {
                 // transaction committed to block. qos_service uses these information to adjust
                 // reserved block space.
                 Ok(committed_tx) => {
-                    // Sum prioritization-fee revenue for the slot. Used by the
-                    // pf-floor evaluation to measure block-fee quality (paired
-                    // with `block_cost` for the per-CU economic ratio); not
-                    // every drop counter is a regression — what matters is
-                    // whether high-fee work is making it through.
-                    block_priority_fees_lamports = block_priority_fees_lamports
-                        .saturating_add(committed_tx.fee_details.prioritization_fee());
+                    let collected_fee_lamports = bank
+                        .calculate_reward_and_burn_fee_details(&CollectorFeeDetails::from(
+                            committed_tx.fee_details,
+                        ))
+                        .get_deposit();
                     CommitTransactionDetails::Committed {
                         compute_units: committed_tx.executed_units,
                         loaded_accounts_data_size: committed_tx
@@ -99,6 +100,7 @@ impl Committer {
                             .loaded_accounts_data_size,
                         result: committed_tx.status.clone(),
                         fee_payer_post_balance: committed_tx.fee_payer_post_balance,
+                        collected_fee_lamports,
                     }
                 }
                 Err(err) => CommitTransactionDetails::NotCommitted(err.clone()),
@@ -130,11 +132,7 @@ impl Committer {
             );
         });
         execute_and_commit_timings.find_and_send_votes_us = find_and_send_votes_us;
-        (
-            commit_time_us,
-            commit_transaction_statuses,
-            block_priority_fees_lamports,
-        )
+        (commit_time_us, commit_transaction_statuses)
     }
 
     fn collect_balances_and_send_status_batch(
