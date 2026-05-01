@@ -41,54 +41,23 @@ use {
 
 const CHECK_CHUNK: usize = 128;
 
-/// Default token-bucket refill rate (packets per second) for the pf-floor
-/// saturation signal. Approximates the rate at which the scheduler can drain
-/// its receive+parse+schedule loop.
-pub const DEFAULT_TOKEN_BUCKET_REFILL_TPS: u64 = 100_000;
-/// Default token-bucket burst capacity (packets). Controls how much of a
-/// short-term spike is absorbed before saturation triggers.
-pub const DEFAULT_TOKEN_BUCKET_BURST: u64 = 25_000;
-/// Default AND-guard on saturation entry: require the scheduler queue to hold
-/// at least this percentage of `TOTAL_BUFFERED_PACKETS` before the token
-/// bucket is allowed to drive saturation. This prevents publishing a stale
-/// floor when the queue is near-empty (the min priority of a tiny set of
+/// Token-bucket refill rate (packets per second) for the pf-floor saturation
+/// signal. Approximates the rate at which the scheduler can drain its
+/// receive+parse+schedule loop.
+const TOKEN_BUCKET_REFILL_TPS: u64 = 100_000;
+/// Token-bucket burst capacity (packets). Controls how much of a short-term
+/// spike is absorbed before saturation triggers.
+const TOKEN_BUCKET_BURST: u64 = 25_000;
+/// AND-guard on saturation entry: require the scheduler queue to hold at
+/// least this percentage of `TOTAL_BUFFERED_PACKETS` before the token bucket
+/// is allowed to drive saturation. This prevents publishing a stale floor
+/// when the queue is near-empty (the min priority of a tiny set of
 /// stragglers is noise, not signal).
-pub const DEFAULT_SATURATION_MIN_QUEUE_PCT: u8 = 90;
-
-/// Saturation detection / pf-floor configuration. `Disabled` makes the
-/// mechanism a true no-op (no token bucket, no published floor); `Enabled`
-/// carries the tuning knobs.
-#[derive(Clone)]
-pub enum SchedulerSaturation {
-    Disabled,
-    Enabled {
-        /// Token-bucket refill rate (packets per second). Incoming arrivals
-        /// above this rate deplete the bucket and drive saturation.
-        token_bucket_refill_tps: u64,
-        /// Token-bucket burst capacity (packets). Short-term arrival spikes
-        /// up to this many packets are absorbed before saturation triggers.
-        token_bucket_burst: u64,
-        /// AND-guard on saturation entry: the token bucket must be empty
-        /// AND the scheduler queue must contain at least this percentage of
-        /// `TOTAL_BUFFERED_PACKETS` for saturation to fire.
-        min_queue_pct: u8,
-    },
-}
-
-impl Default for SchedulerSaturation {
-    fn default() -> Self {
-        Self::Enabled {
-            token_bucket_refill_tps: DEFAULT_TOKEN_BUCKET_REFILL_TPS,
-            token_bucket_burst: DEFAULT_TOKEN_BUCKET_BURST,
-            min_queue_pct: DEFAULT_SATURATION_MIN_QUEUE_PCT,
-        }
-    }
-}
+const SATURATION_MIN_QUEUE_PCT: u8 = 90;
 
 #[derive(Clone)]
 pub struct SchedulerConfig {
     pub scheduler_pacing: SchedulerPacing,
-    pub saturation: SchedulerSaturation,
 }
 
 impl Default for SchedulerConfig {
@@ -97,7 +66,6 @@ impl Default for SchedulerConfig {
             scheduler_pacing: SchedulerPacing::FillTimeMillis(
                 DEFAULT_SCHEDULER_PACING_FILL_TIME_MILLIS,
             ),
-            saturation: SchedulerSaturation::default(),
         }
     }
 }
@@ -106,10 +74,7 @@ const DEFAULT_SCHEDULER_PACING_NON_FILL_TIME_MILLIS: u64 = 50;
 pub(crate) const DEFAULT_SCHEDULER_PACING_FILL_TIME_MILLIS: NonZeroU64 =
     NonZeroU64::new(DEFAULT_MS_PER_SLOT - DEFAULT_SCHEDULER_PACING_NON_FILL_TIME_MILLIS).unwrap();
 
-/// Saturation detection + pf-floor publication. Constructed only when the
-/// `SchedulerSaturation::Enabled` variant is configured; held as
-/// `Option<SaturationState>` on the controller so the disabled path is a
-/// single early-out.
+/// Saturation detection + pf-floor publication.
 struct SaturationState {
     /// Published to sigverify as the pf-floor when saturated.
     priority_floor: Arc<SchedulerPriorityFloor>,
@@ -128,39 +93,28 @@ struct SaturationState {
 }
 
 impl SaturationState {
-    /// Builds the state when the feature is enabled. Caller must clear the
-    /// floor at controller-construction time *unconditionally* so a stale
-    /// floor from a prior controller can't keep sigverify dropping packets.
-    fn new(
-        saturation: &SchedulerSaturation,
-        priority_floor: Arc<SchedulerPriorityFloor>,
-    ) -> Option<Self> {
-        let &SchedulerSaturation::Enabled {
-            token_bucket_refill_tps,
-            token_bucket_burst,
-            min_queue_pct,
-        } = saturation
-        else {
-            return None;
-        };
+    /// Caller must clear the floor at controller-construction time
+    /// *unconditionally* so a stale floor from a prior controller can't
+    /// keep sigverify dropping packets.
+    fn new(priority_floor: Arc<SchedulerPriorityFloor>) -> Self {
         // Start full: at startup the scheduler isn't behind on anything, so
         // the full burst budget is available to absorb the first wave of
         // arrivals (e.g. a non-leader backlog).
         let token_bucket = TokenBucket::new(
-            token_bucket_burst,
-            token_bucket_burst,
-            token_bucket_refill_tps as f64,
+            TOKEN_BUCKET_BURST,
+            TOKEN_BUCKET_BURST,
+            TOKEN_BUCKET_REFILL_TPS as f64,
         );
         let buffer_guard_threshold =
-            TOTAL_BUFFERED_PACKETS.saturating_mul(min_queue_pct as usize) / 100;
-        let desaturate_tokens_threshold = token_bucket_burst.saturating_div(2);
-        Some(Self {
+            TOTAL_BUFFERED_PACKETS.saturating_mul(SATURATION_MIN_QUEUE_PCT as usize) / 100;
+        let desaturate_tokens_threshold = TOKEN_BUCKET_BURST.saturating_div(2);
+        Self {
             priority_floor,
             saturated: false,
             token_bucket,
             buffer_guard_threshold,
             desaturate_tokens_threshold,
-        })
+        }
     }
 
     /// Update token-bucket / hysteresis state from this tick's arrivals.
@@ -251,9 +205,8 @@ where
     recheck_cursor: Option<TransactionPriorityId>,
     /// Recheck IDs scratch space.
     recheck_chunk: Vec<TransactionPriorityId>,
-    /// Saturation detection + pf-floor publication. `None` when
-    /// `pf_floor_enabled` is false to keep the mechanism fully zero-cost.
-    saturation_state: Option<SaturationState>,
+    /// Saturation detection + pf-floor publication.
+    saturation_state: SaturationState,
 }
 
 impl<R, S> SchedulerController<R, S>
@@ -272,11 +225,10 @@ where
         priority_floor: Arc<SchedulerPriorityFloor>,
     ) -> Self {
         // The priority floor outlives individual scheduler controllers.
-        // Start every controller from an unsaturated state — independent of
-        // whether the feature is enabled now — so a stale floor from a prior
-        // scheduler can't keep sigverify dropping packets.
+        // Start every controller from an unsaturated state so a stale floor
+        // from a prior scheduler can't keep sigverify dropping packets.
         priority_floor.clear();
-        let saturation_state = SaturationState::new(&config.saturation, priority_floor);
+        let saturation_state = SaturationState::new(priority_floor);
         Self {
             exit,
             config,
@@ -511,25 +463,19 @@ where
     /// When the bucket is replenished past half of its burst capacity (or
     /// the buffer drains below the guard), we clear the published floor.
     fn update_scheduler_priority_floor(&mut self, num_received: u64) {
-        // Feature disabled: nothing on this path writes to the floor.
-        if self.saturation_state.is_none() {
-            return;
-        }
         let buffer_size = self.container.buffer_size();
 
         // Phase 1: state transition (mutates `saturated`, may clear floor on
         // de-saturation). No queue parse needed.
-        let state = self.saturation_state.as_mut().expect("checked above");
-        let (tokens, needs_floor) = state.transition(num_received, buffer_size);
+        let (tokens, needs_floor) = self
+            .saturation_state
+            .transition(num_received, buffer_size);
 
         // Phase 2: only run `compute_pf_floor` (parse + cost-model + fee on
         // the queue-min tx) when we'll actually publish.
         let fee_floor = if needs_floor {
             let floor = self.compute_pf_floor();
-            self.saturation_state
-                .as_ref()
-                .expect("checked above")
-                .publish_floor(floor)
+            self.saturation_state.publish_floor(floor)
         } else {
             0
         };

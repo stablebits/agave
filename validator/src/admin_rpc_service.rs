@@ -820,7 +820,6 @@ impl AdminRpc for AdminRpcImpl {
                     block_production_method,
                     num_workers,
                     pacing_override: Some(scheduler_pacing),
-                    saturation_override: None,
                 })
                 .is_err()
             {
