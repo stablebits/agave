@@ -811,21 +811,18 @@ impl AdminRpc for AdminRpcImpl {
         }
 
         meta.with_post_init(|post_init| {
-            // Update the manager's stored pacing first, then trigger a thread
-            // cycle so the new scheduler picks it up. The two-message form
-            // means the RPC only sends what it actually changes; the rest of
-            // `SchedulerConfig` (pf-floor / token-bucket / saturation tuning)
-            // is preserved by the manager.
-            let sender = &post_init.banking_control_sender;
-            if sender
-                .try_send(BankingControlMsg::SetPacing(scheduler_pacing))
+            // Single atomic message: the manager applies `pacing_override`
+            // before spawning. The rest of `SchedulerConfig` (pf-floor /
+            // saturation tuning) is preserved by the manager.
+            if post_init
+                .banking_control_sender
+                .try_send(BankingControlMsg::Cycle {
+                    block_production_method,
+                    num_workers,
+                    pacing_override: Some(scheduler_pacing),
+                    saturation_override: None,
+                })
                 .is_err()
-                || sender
-                    .try_send(BankingControlMsg::Cycle {
-                        block_production_method,
-                        num_workers,
-                    })
-                    .is_err()
             {
                 error!("Banking stage already switching schedulers");
 
