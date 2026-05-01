@@ -163,23 +163,18 @@ impl SaturationState {
         })
     }
 
-    /// Per-tick update. `floor` is the current queue-min proxy priority (None
-    /// if queue is empty / unparseable / zero); only consulted while
-    /// saturated. Returns `(rate_limiter_tokens_remaining,
-    /// current_priority_fee_floor)` for metrics; the floor is `0` when not
-    /// saturated.
-    fn tick(
-        &mut self,
-        num_received: u64,
-        buffer_size: usize,
-        floor: Option<u64>,
-    ) -> (u64, u64) {
+    /// Update token-bucket / hysteresis state from this tick's arrivals.
+    /// Returns `(current_tokens, needs_floor)` — `needs_floor=true` iff the
+    /// state is now saturated and the caller must compute and pass a floor
+    /// to [`Self::publish_floor`]. Splitting this out lets the caller skip
+    /// the per-tick `compute_pf_floor` parse + cost-model + fee work on
+    /// quiescent (unsaturated) ticks.
+    fn transition(&mut self, num_received: u64, buffer_size: usize) -> (u64, bool) {
         let consumed = self.token_bucket.consume_tokens_saturating(num_received);
         let over_budget = num_received.saturating_sub(consumed);
         let current_tokens = self.token_bucket.current_tokens();
         let buffer_guard_met = buffer_size >= self.buffer_guard_threshold;
 
-        // State transitions.
         if self.saturated {
             // Exit when the bucket has refilled past the threshold, or the
             // buffer has drained below the guard (pressure is gone).
@@ -191,17 +186,27 @@ impl SaturationState {
             self.saturated = true;
         }
 
-        // While saturated, publish the current floor every tick (the queue
-        // evolves; the floor follows it).
-        let current_priority_fee_floor = if self.saturated {
-            floor
-                .inspect(|&f| self.priority_floor.publish(f))
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        (current_tokens, self.saturated)
+    }
 
-        (current_tokens, current_priority_fee_floor)
+    /// Publish (or clear) the priority floor based on `floor`. Caller invokes
+    /// this only after [`Self::transition`] reports `needs_floor=true`. The
+    /// returned `current_priority_fee_floor` is what's emitted as a metric;
+    /// `0` means "saturated but no usable floor right now" (queue empty /
+    /// unparseable), in which case the shared atomic is *cleared* so
+    /// sigverify doesn't keep dropping against a stale value from a
+    /// previous tick.
+    fn publish_floor(&self, floor: Option<u64>) -> u64 {
+        match floor {
+            Some(f) => {
+                self.priority_floor.publish(f);
+                f
+            }
+            None => {
+                self.priority_floor.clear();
+                0
+            }
+        }
     }
 }
 
@@ -511,9 +516,24 @@ where
             return;
         }
         let buffer_size = self.container.buffer_size();
-        let floor = self.compute_pf_floor();
+
+        // Phase 1: state transition (mutates `saturated`, may clear floor on
+        // de-saturation). No queue parse needed.
         let state = self.saturation_state.as_mut().expect("checked above");
-        let (tokens, fee_floor) = state.tick(num_received, buffer_size, floor);
+        let (tokens, needs_floor) = state.transition(num_received, buffer_size);
+
+        // Phase 2: only run `compute_pf_floor` (parse + cost-model + fee on
+        // the queue-min tx) when we'll actually publish.
+        let fee_floor = if needs_floor {
+            let floor = self.compute_pf_floor();
+            self.saturation_state
+                .as_ref()
+                .expect("checked above")
+                .publish_floor(floor)
+        } else {
+            0
+        };
+
         self.count_metrics.update(|count_metrics| {
             count_metrics.rate_limiter_tokens_remaining = tokens;
             count_metrics.current_priority_fee_floor = fee_floor;
