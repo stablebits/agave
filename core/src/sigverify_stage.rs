@@ -201,52 +201,64 @@ impl SigVerifierStats {
     }
 }
 
-/// Drop below-floor packets from `batches`. Below-floor packets are marked
-/// `discard`; a batch is removed from the outer `Vec` entirely when no
-/// packets survive (which covers the `PacketBatch::Single` below-floor case
-/// uniformly and also reclaims multi-packet batches whose packets all got
-/// dropped).
+/// Apply the pf-floor to a single batch in place. Below-floor packets are
+/// marked `discard`. Returns `(dropped, all_below)` — `dropped` is the
+/// number of packets newly marked, `all_below` is true iff no useful
+/// packets remain in the batch (so the caller can skip a downstream send).
+///
+/// `<=` instead of `<` so uniformly-priced traffic still gets shed: a tx
+/// tied with queue_min is no better than what the scheduler would evict
+/// on insert, so dropping it preserves the "no worse than queue_min"
+/// semantics and avoids degenerate no-op behavior when all incoming
+/// arrivals have the same priority as queue_min.
+pub(crate) fn apply_priority_floor_to_batch(
+    batch: &mut PacketBatch,
+    floor: u64,
+) -> (usize, bool) {
+    let mut dropped: usize = 0;
+    let mut any_kept = false;
+    for mut packet in batch.iter_mut() {
+        if packet.meta().discard() {
+            // Pre-existing discard: stays discarded, doesn't count as
+            // kept (so an all-prediscarded batch is reported all-below).
+            continue;
+        }
+        if packet.meta().flags.contains(PacketFlags::SIMPLE_VOTE_TX) {
+            // Votes are immune to the priority floor (vote priority is
+            // governed by a separate policy in banking stage).
+            any_kept = true;
+            continue;
+        }
+        let Some(data) = packet.data(..) else {
+            // Zero-length or otherwise unreadable: leave to downstream
+            // stages to reject.
+            any_kept = true;
+            continue;
+        };
+        match approximate_priority(data) {
+            Some(priority) if priority <= floor => {
+                packet.meta_mut().set_discard(true);
+                dropped = dropped.saturating_add(1);
+            }
+            _ => any_kept = true,
+        }
+    }
+    (dropped, !any_kept)
+}
+
+/// Drop below-floor packets from `batches`. A batch is removed from the
+/// outer `Vec` entirely when no packets survive (covers `PacketBatch::Single`
+/// uniformly and reclaims multi-packet batches whose packets all dropped).
 ///
 /// Returns the number of packets newly dropped.
 pub(crate) fn apply_priority_floor(batches: &mut Vec<PacketBatch>, floor: u64) -> usize {
-    let mut dropped: usize = 0;
+    let mut total: usize = 0;
     batches.retain_mut(|batch| {
-        let mut any_kept = false;
-        for mut packet in batch.iter_mut() {
-            if packet.meta().discard() {
-                // Pre-existing discard: stays discarded, doesn't count as
-                // kept (so an all-prediscarded batch is dropped too).
-                continue;
-            }
-            if packet.meta().flags.contains(PacketFlags::SIMPLE_VOTE_TX) {
-                // Votes are immune to the priority floor (vote priority is
-                // governed by a separate policy in banking stage).
-                any_kept = true;
-                continue;
-            }
-            let Some(data) = packet.data(..) else {
-                // Zero-length or otherwise unreadable: leave to downstream
-                // stages to reject.
-                any_kept = true;
-                continue;
-            };
-            match approximate_priority(data) {
-                // `<=` instead of `<` so uniformly-priced traffic still
-                // gets shed: a tx tied with queue_min is no better than
-                // what the scheduler would evict on insert, so dropping
-                // it preserves the "no worse than queue_min" semantics
-                // and avoids degenerate no-op behavior when all incoming
-                // arrivals have the same priority as queue_min.
-                Some(priority) if priority <= floor => {
-                    packet.meta_mut().set_discard(true);
-                    dropped = dropped.saturating_add(1);
-                }
-                _ => any_kept = true,
-            }
-        }
-        any_kept
+        let (dropped, all_below) = apply_priority_floor_to_batch(batch, floor);
+        total = total.saturating_add(dropped);
+        !all_below
     });
-    dropped
+    total
 }
 
 impl SigVerifyStage {

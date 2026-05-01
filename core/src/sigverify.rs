@@ -5,7 +5,7 @@
 use {
     crate::{
         banking_trace::BankingPacketSender,
-        sigverify_stage::{SigVerifyServiceError, apply_priority_floor},
+        sigverify_stage::{SigVerifyServiceError, apply_priority_floor_to_batch},
     },
     agave_banking_stage_ingress_types::{BankingPacketBatch, SchedulerPriorityFloor},
     crossbeam_channel::{Receiver, Sender, TrySendError, bounded},
@@ -279,6 +279,7 @@ impl SigVerifyWorkerPool {
         scheduler_priority_floor: Option<&Arc<SchedulerPriorityFloor>>,
     ) -> bool {
         let TransactionVerifyTask { batch } = work;
+        let mut batch = batch;
 
         // Second-stage pf-floor drop. Catches packets that passed the
         // verifier_service first-stage check but were in the worker channel
@@ -286,22 +287,18 @@ impl SigVerifyWorkerPool {
         // Performed before sigverify so we also save the GPU verify cost on
         // dropped packets. Skipped for tpu_vote packets (votes are immune
         // to the floor; mirrors the first-stage behavior).
-        let mut batch = if let Some(floor) = scheduler_priority_floor.and_then(|f| f.get()) {
-            let mut batches = vec![batch];
-            let dropped = apply_priority_floor(&mut batches, floor);
+        if let Some(floor) = scheduler_priority_floor.and_then(|f| f.get()) {
+            let (dropped, all_below) = apply_priority_floor_to_batch(&mut batch, floor);
             if dropped > 0 {
                 stats
                     .total_dropped_below_priority_floor_late
                     .fetch_add(dropped, Ordering::Relaxed);
             }
-            // Entire batch went below-floor: nothing to verify or send.
-            let Some(batch) = batches.into_iter().next() else {
+            if all_below {
+                // Entire batch went below-floor: nothing to verify or send.
                 return true;
-            };
-            batch
-        } else {
-            batch
-        };
+            }
+        }
 
         let (_, verify_time_us) = measure_us!(sigverify::ed25519_verify_serial(
             &mut batch,
