@@ -12,7 +12,10 @@ use {
     solana_clock::Slot,
     solana_core::{
         admin_rpc_post_init::AdminRpcRequestMetadataPostInit,
-        banking_stage::{BankingControlMsg, BankingStage},
+        banking_stage::{
+            BankingControlMsg, BankingStage,
+            transaction_scheduler::scheduler_controller::SchedulerConfig,
+        },
         consensus::{Tower, tower_storage::TowerStorage},
         repair::repair_service,
         validator::{
@@ -816,7 +819,7 @@ impl AdminRpc for AdminRpcImpl {
                 .try_send(BankingControlMsg::Internal {
                     block_production_method,
                     num_workers,
-                    pacing_override: Some(scheduler_pacing),
+                    config: SchedulerConfig { scheduler_pacing },
                 })
                 .is_err()
             {

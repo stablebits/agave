@@ -16,7 +16,7 @@ use {
                 scheduler_error::SchedulerError,
             },
         },
-        validator::{BlockProductionMethod, SchedulerPacing},
+        validator::BlockProductionMethod,
     },
     agave_banking_stage_ingress_types::{BankingPacketReceiver, SchedulerPriorityFloor},
     crossbeam_channel::{Receiver, Sender, unbounded},
@@ -339,11 +339,6 @@ pub struct BankingStage {
     filter_keys: Arc<HashSet<Pubkey>>,
     priority_floor: Arc<SchedulerPriorityFloor>,
     threads: FuturesUnordered<NamedTask<std::thread::Result<()>>>,
-    /// Source-of-truth scheduler config. Mutated by `Cycle.pacing_override`
-    /// and consumed on every `Cycle` to build the new scheduler.
-    /// Initialized from the operator's CLI-supplied config in
-    /// `new_num_threads`.
-    scheduler_config: SchedulerConfig,
 }
 
 impl BankingStage {
@@ -389,7 +384,6 @@ impl BankingStage {
             filter_keys,
             priority_floor,
             threads: FuturesUnordered::default(),
-            scheduler_config,
         };
 
         // Spawn the manager thread.
@@ -403,7 +397,7 @@ impl BankingStage {
                 rt.block_on(manager.run(BankingControlMsg::Internal {
                     block_production_method,
                     num_workers,
-                    pacing_override: None,
+                    config: scheduler_config,
                 }))
             })
             .unwrap();
@@ -466,11 +460,10 @@ impl BankingStage {
     async fn cycle_threads_fallback(&mut self) -> Result<(), ()> {
         error!("Spawning the default block production method as a fallback...");
 
-        self.scheduler_config = SchedulerConfig::default();
         self.cycle_threads(BankingControlMsg::Internal {
             block_production_method: BlockProductionMethod::default(),
             num_workers: BankingStage::default_num_workers(),
-            pacing_override: None,
+            config: SchedulerConfig::default(),
         })
         .await
     }
@@ -480,18 +473,13 @@ impl BankingStage {
             BankingControlMsg::Internal {
                 block_production_method,
                 num_workers,
-                pacing_override,
-            } => {
-                if let Some(p) = pacing_override {
-                    self.scheduler_config.scheduler_pacing = p;
+                config,
+            } => match block_production_method {
+                BlockProductionMethod::CentralScheduler
+                | BlockProductionMethod::CentralSchedulerGreedy => {
+                    self.spawn_internal_central(num_workers, config)
                 }
-                match block_production_method {
-                    BlockProductionMethod::CentralScheduler
-                    | BlockProductionMethod::CentralSchedulerGreedy => {
-                        self.spawn_internal_central(num_workers)
-                    }
-                }
-            }
+            },
             #[cfg(unix)]
             BankingControlMsg::External { session } => self.spawn_external(session),
         })?;
@@ -506,7 +494,11 @@ impl BankingStage {
         Ok(())
     }
 
-    fn spawn_internal_central(&self, num_workers: NonZeroUsize) -> Result<Vec<JoinHandle<()>>, ()> {
+    fn spawn_internal_central(
+        &self,
+        num_workers: NonZeroUsize,
+        scheduler_config: SchedulerConfig,
+    ) -> Result<Vec<JoinHandle<()>>, ()> {
         info!("Spawning internal central scheduler");
 
         assert!(num_workers <= BankingStage::max_num_workers());
@@ -569,7 +561,6 @@ impl BankingStage {
             GreedySchedulerConfig::default(),
         );
         let priority_floor = self.priority_floor.clone();
-        let scheduler_config = self.scheduler_config.clone();
         let exit = exit.clone();
         let shutdown_signal = self.banking_shutdown_signal.clone();
         threads.push(
@@ -772,7 +763,7 @@ pub enum BankingControlMsg {
     Internal {
         block_production_method: BlockProductionMethod,
         num_workers: NonZeroUsize,
-        pacing_override: Option<SchedulerPacing>,
+        config: SchedulerConfig,
     },
     #[cfg(unix)]
     External {
