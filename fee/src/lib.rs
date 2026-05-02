@@ -47,6 +47,29 @@ pub fn calculate_fee_details(
     )
 }
 
+/// Split a transaction's collected fee into the leader's reward (deposit)
+/// and the amount that should be burned, given a burn percentage. Single
+/// source of truth for the runtime's fee-distribution math, also used by
+/// the banking-stage scheduler's priority calculation and sigverify's
+/// pf-floor proxy so they cannot drift from what the leader would actually
+/// be paid.
+///
+/// Returns `(reward, burn)`. When `transaction_fee == 0`, returns
+/// `(0, 0)` — mirrors the early-out in fee distribution and keeps test
+/// banks with `lamports_per_signature == 0` consistent.
+pub fn split_reward_and_burn(
+    transaction_fee: u64,
+    priority_fee: u64,
+    burn_percent: u64,
+) -> (u64, u64) {
+    if transaction_fee == 0 {
+        return (0, 0);
+    }
+    let burn = transaction_fee.saturating_mul(burn_percent) / 100;
+    let reward = priority_fee.saturating_add(transaction_fee.saturating_sub(burn));
+    (reward, burn)
+}
+
 /// Calculate fees from signatures.
 pub fn calculate_signature_fee(
     SignatureCounts {
@@ -85,6 +108,24 @@ impl<Tx: SVMStaticMessage> From<&Tx> for SignatureCounts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_split_reward_and_burn() {
+        // Zero transaction fee → no reward, no burn (regardless of priority fee).
+        assert_eq!(split_reward_and_burn(0, 0, 50), (0, 0));
+        assert_eq!(split_reward_and_burn(0, 100, 50), (0, 0));
+
+        // 50% burn (mainnet default): half of base fee burns, the rest plus
+        // priority fee goes to the leader.
+        assert_eq!(split_reward_and_burn(1000, 0, 50), (500, 500));
+        assert_eq!(split_reward_and_burn(1000, 200, 50), (700, 500));
+
+        // 100% burn: leader gets only the priority fee.
+        assert_eq!(split_reward_and_burn(1000, 200, 100), (200, 1000));
+
+        // 0% burn: leader gets the full fee.
+        assert_eq!(split_reward_and_burn(1000, 200, 0), (1200, 0));
+    }
 
     #[test]
     fn test_calculate_signature_fee() {

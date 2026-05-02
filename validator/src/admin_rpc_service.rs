@@ -12,10 +12,7 @@ use {
     solana_clock::Slot,
     solana_core::{
         admin_rpc_post_init::AdminRpcRequestMetadataPostInit,
-        banking_stage::{
-            BankingControlMsg, BankingStage,
-            transaction_scheduler::scheduler_controller::SchedulerConfig,
-        },
+        banking_stage::{BankingControlMsg, BankingStage},
         consensus::{Tower, tower_storage::TowerStorage},
         repair::repair_service,
         validator::{
@@ -814,12 +811,15 @@ impl AdminRpc for AdminRpcImpl {
         }
 
         meta.with_post_init(|post_init| {
+            // Single atomic message: the manager applies `pacing_override`
+            // before spawning. The rest of `SchedulerConfig` (pf-floor /
+            // saturation tuning) is preserved by the manager.
             if post_init
                 .banking_control_sender
                 .try_send(BankingControlMsg::Internal {
                     block_production_method,
                     num_workers,
-                    config: SchedulerConfig { scheduler_pacing },
+                    pacing_override: Some(scheduler_pacing),
                 })
                 .is_err()
             {

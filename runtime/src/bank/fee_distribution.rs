@@ -90,14 +90,11 @@ impl Bank {
         &self,
         fee_details: &CollectorFeeDetails,
     ) -> FeeDistribution {
-        if fee_details.transaction_fee == 0 {
-            return FeeDistribution::default();
-        }
-
-        let burn = fee_details.transaction_fee * self.burn_percent() / 100;
-        let deposit = fee_details
-            .priority_fee
-            .saturating_add(fee_details.transaction_fee.saturating_sub(burn));
+        let (deposit, burn) = solana_fee::split_reward_and_burn(
+            fee_details.transaction_fee,
+            fee_details.priority_fee,
+            self.burn_percent(),
+        );
         FeeDistribution { deposit, burn }
     }
 

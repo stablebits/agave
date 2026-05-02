@@ -8,7 +8,10 @@ use {
         },
     },
     crate::banking_stage::{
-        consumer::Consumer, decision_maker::BufferedPacketsDecision, scheduler_messages::MaxAge,
+        consumer::Consumer,
+        decision_maker::BufferedPacketsDecision,
+        scheduler_messages::MaxAge,
+        scheduler_priority::{FeeContext, calculate_priority_and_cost},
     },
     agave_banking_stage_ingress_types::{BankingPacketBatch, BankingPacketReceiver},
     agave_transaction_view::{
@@ -21,7 +24,6 @@ use {
     solana_accounts_db::account_locks::validate_account_locks,
     solana_address_lookup_table_interface::state::estimate_last_valid_slot,
     solana_clock::{Epoch, Slot},
-    solana_cost_model::cost_model::CostModel,
     solana_message::v0::LoadedAddresses,
     solana_pubkey::Pubkey,
     solana_runtime::{
@@ -29,8 +31,7 @@ use {
         bank_forks::{BankPair, SharableBanks},
     },
     solana_runtime_transaction::{
-        runtime_transaction::RuntimeTransaction,
-        transaction_meta::{TransactionConfiguration, TransactionMeta},
+        runtime_transaction::RuntimeTransaction, transaction_meta::TransactionMeta,
         transaction_with_meta::TransactionWithMeta,
     },
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
@@ -246,6 +247,7 @@ impl TransactionViewReceiveAndBuffer {
         let enable_instruction_accounts_limit =
             root_bank.feature_set.snapshot().limit_instruction_accounts;
         let transaction_account_lock_limit = working_bank.get_transaction_account_lock_limit();
+        let fee_context = FeeContext::from_bank(working_bank);
 
         // Create temporary batches of transactions to be age-checked.
         let mut transaction_priority_ids = ArrayVec::<_, EXTRA_CAPACITY>::new();
@@ -347,6 +349,7 @@ impl TransactionViewReceiveAndBuffer {
                             bytes,
                             root_bank,
                             working_bank,
+                            &fee_context,
                             transaction_account_lock_limit,
                             enable_instruction_accounts_limit,
                             &self.filter_keys,
@@ -413,6 +416,7 @@ impl TransactionViewReceiveAndBuffer {
         bytes: SharedBytes,
         root_bank: &Bank,
         working_bank: &Bank,
+        fee_context: &FeeContext,
         transaction_account_lock_limit: usize,
         enable_instruction_accounts_limit: bool,
         filter_keys: &HashSet<Pubkey>,
@@ -441,7 +445,7 @@ impl TransactionViewReceiveAndBuffer {
 
         let max_age = calculate_max_age(root_bank.epoch(), deactivation_slot, root_bank.slot());
         let (priority, cost) =
-            calculate_priority_and_cost(&view, &transaction_configuration, working_bank);
+            calculate_priority_and_cost(&view, &transaction_configuration, fee_context);
 
         Ok(TransactionState::new(view, max_age, priority, cost))
     }
@@ -513,46 +517,6 @@ pub(crate) fn load_addresses_for_view<D: TransactionData>(
             })
             .map_err(|_| PacketHandlingError::ALTResolution),
     }
-}
-
-/// Calculate priority and cost for a transaction:
-///
-/// Cost is calculated through the `CostModel`,
-/// and priority is calculated through a formula here that attempts to sell
-/// blockspace to the highest bidder.
-///
-/// The priority is calculated as:
-/// P = R / (1 + C)
-/// where P is the priority, R is the reward,
-/// and C is the cost towards block-limits.
-///
-/// Current minimum costs are on the order of several hundred,
-/// so the denominator is effectively C, and the +1 is simply
-/// to avoid any division by zero due to a bug - these costs
-/// are calculated by the cost-model and are not direct
-/// from user input. They should never be zero.
-/// Any difference in the prioritization is negligible for
-/// the current transaction costs.
-pub(crate) fn calculate_priority_and_cost(
-    transaction: &impl TransactionWithMeta,
-    transaction_configuration: &TransactionConfiguration,
-    bank: &Bank,
-) -> (u64, u64) {
-    let cost = CostModel::calculate_cost(transaction, &bank.feature_set).sum();
-    let reward = bank.calculate_reward_for_transaction(transaction, transaction_configuration);
-
-    // We need a multiplier here to avoid rounding down too aggressively.
-    // For many transactions, the cost will be greater than the fees in terms of raw lamports.
-    // For the purposes of calculating prioritization, we multiply the fees by a large number so that
-    // the cost is a small fraction.
-    // An offset of 1 is used in the denominator to explicitly avoid division by zero.
-    const MULTIPLIER: u64 = 1_000_000;
-    (
-        reward
-            .saturating_mul(MULTIPLIER)
-            .saturating_div(cost.saturating_add(1)),
-        cost,
-    )
 }
 
 /// Given the epoch, the minimum deactivation slot, and the current slot,

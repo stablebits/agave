@@ -16,9 +16,9 @@ use {
                 scheduler_error::SchedulerError,
             },
         },
-        validator::BlockProductionMethod,
+        validator::{BlockProductionMethod, SchedulerPacing},
     },
-    agave_banking_stage_ingress_types::BankingPacketReceiver,
+    agave_banking_stage_ingress_types::{BankingPacketReceiver, SchedulerPriorityFloor},
     crossbeam_channel::{Receiver, Sender, unbounded},
     futures::{StreamExt, stream::FuturesUnordered},
     histogram::Histogram,
@@ -67,6 +67,7 @@ mod leader_slot_metrics;
 mod leader_slot_timing_metrics;
 mod qos_service;
 mod scheduler_messages;
+pub mod scheduler_priority;
 mod vote_packet_receiver;
 mod vote_storage;
 mod vote_worker;
@@ -336,7 +337,13 @@ pub struct BankingStage {
     committer: Committer,
     log_messages_bytes_limit: Option<usize>,
     filter_keys: Arc<HashSet<Pubkey>>,
+    priority_floor: Arc<SchedulerPriorityFloor>,
     threads: FuturesUnordered<NamedTask<std::thread::Result<()>>>,
+    /// Source-of-truth scheduler config. Mutated by `Cycle.pacing_override`
+    /// and consumed on every `Cycle` to build the new scheduler.
+    /// Initialized from the operator's CLI-supplied config in
+    /// `new_num_threads`.
+    scheduler_config: SchedulerConfig,
 }
 
 impl BankingStage {
@@ -357,6 +364,7 @@ impl BankingStage {
         bank_forks: Arc<RwLock<BankForks>>,
         prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
         filter_keys: Arc<HashSet<Pubkey>>,
+        priority_floor: Arc<SchedulerPriorityFloor>,
     ) -> BankingStageHandle {
         let committer = Committer::new(
             transaction_status_sender,
@@ -379,7 +387,9 @@ impl BankingStage {
             committer,
             log_messages_bytes_limit,
             filter_keys,
+            priority_floor,
             threads: FuturesUnordered::default(),
+            scheduler_config,
         };
 
         // Spawn the manager thread.
@@ -393,7 +403,7 @@ impl BankingStage {
                 rt.block_on(manager.run(BankingControlMsg::Internal {
                     block_production_method,
                     num_workers,
-                    config: scheduler_config,
+                    pacing_override: None,
                 }))
             })
             .unwrap();
@@ -412,8 +422,8 @@ impl BankingStage {
                 biased;
 
                 _ = self.banking_shutdown_signal.cancelled() => break,
-                Some(args) = self.banking_control_receiver.recv() => {
-                    if self.cycle_threads(args).await.is_err() {
+                Some(msg) = self.banking_control_receiver.recv() => {
+                    if self.cycle_threads(msg).await.is_err() {
                         self.cycle_threads_fallback().await.unwrap();
                     }
                 },
@@ -456,10 +466,14 @@ impl BankingStage {
     async fn cycle_threads_fallback(&mut self) -> Result<(), ()> {
         error!("Spawning the default block production method as a fallback...");
 
+        // Reset stored config to defaults too: a fallback is for catastrophic
+        // failures, and we want the safest known-good config on the next
+        // scheduler, not whatever override an RPC might have set.
+        self.scheduler_config = SchedulerConfig::default();
         self.cycle_threads(BankingControlMsg::Internal {
             block_production_method: BlockProductionMethod::default(),
             num_workers: BankingStage::default_num_workers(),
-            config: SchedulerConfig::default(),
+            pacing_override: None,
         })
         .await
     }
@@ -469,13 +483,18 @@ impl BankingStage {
             BankingControlMsg::Internal {
                 block_production_method,
                 num_workers,
-                config,
-            } => match block_production_method {
-                BlockProductionMethod::CentralScheduler
-                | BlockProductionMethod::CentralSchedulerGreedy => {
-                    self.spawn_internal_central(num_workers, config)
+                pacing_override,
+            } => {
+                if let Some(p) = pacing_override {
+                    self.scheduler_config.scheduler_pacing = p;
                 }
-            },
+                match block_production_method {
+                    BlockProductionMethod::CentralScheduler
+                    | BlockProductionMethod::CentralSchedulerGreedy => {
+                        self.spawn_internal_central(num_workers)
+                    }
+                }
+            }
             #[cfg(unix)]
             BankingControlMsg::External { session } => self.spawn_external(session),
         })?;
@@ -493,7 +512,6 @@ impl BankingStage {
     fn spawn_internal_central(
         &self,
         num_workers: NonZeroUsize,
-        scheduler_config: SchedulerConfig,
     ) -> Result<Vec<JoinHandle<()>>, ()> {
         info!("Spawning internal central scheduler");
 
@@ -556,6 +574,8 @@ impl BankingStage {
             finished_work_receiver,
             GreedySchedulerConfig::default(),
         );
+        let priority_floor = self.priority_floor.clone();
+        let scheduler_config = self.scheduler_config.clone();
         let exit = exit.clone();
         let shutdown_signal = self.banking_shutdown_signal.clone();
         threads.push(
@@ -570,6 +590,7 @@ impl BankingStage {
                         sharable_banks,
                         scheduler,
                         worker_metrics,
+                        priority_floor,
                     );
 
                     match scheduler_controller.run() {
@@ -754,10 +775,17 @@ impl BankingStageHandle {
 }
 
 pub enum BankingControlMsg {
+    /// Restart the banking-stage threads: shut down the current scheduler /
+    /// workers and spawn a fresh internal central scheduler with the given
+    /// `block_production_method` and `num_workers`. The scheduler config is
+    /// read from the manager's stored `SchedulerConfig`; `pacing_override`
+    /// atomically applies a pacing change in the same message before
+    /// spawning, so callers don't have to issue two messages and worry
+    /// about ordering on a small mpsc.
     Internal {
         block_production_method: BlockProductionMethod,
         num_workers: NonZeroUsize,
-        config: SchedulerConfig,
+        pacing_override: Option<SchedulerPacing>,
     },
     #[cfg(unix)]
     External {
@@ -904,6 +932,7 @@ mod tests {
             DEFAULT_NUM_WORKERS,
             SchedulerConfig {
                 scheduler_pacing: SchedulerPacing::Disabled,
+                ..SchedulerConfig::default()
             },
             None,
             replay_vote_sender,
@@ -911,6 +940,7 @@ mod tests {
             bank_forks,
             None,
             Arc::default(),
+            Arc::new(SchedulerPriorityFloor::default()),
         );
         drop(non_vote_sender);
         drop(tpu_vote_sender);
@@ -965,6 +995,7 @@ mod tests {
             DEFAULT_NUM_WORKERS,
             SchedulerConfig {
                 scheduler_pacing: SchedulerPacing::Disabled,
+                ..SchedulerConfig::default()
             },
             None,
             replay_vote_sender,
@@ -972,6 +1003,7 @@ mod tests {
             bank_forks, // keep a local-copy of bank-forks so worker threads do not lose weak access to bank-forks
             None,
             Arc::default(),
+            Arc::new(SchedulerPriorityFloor::default()),
         );
 
         // good tx, and no verify
@@ -1120,6 +1152,7 @@ mod tests {
                 DEFAULT_NUM_WORKERS,
                 SchedulerConfig {
                     scheduler_pacing: SchedulerPacing::Disabled,
+                    ..SchedulerConfig::default()
                 },
                 None,
                 replay_vote_sender,
@@ -1127,6 +1160,7 @@ mod tests {
                 bank_forks,
                 None,
                 Arc::default(),
+                Arc::new(SchedulerPriorityFloor::default()),
             );
 
             // wait for banking_stage to eat the packets
@@ -1274,6 +1308,7 @@ mod tests {
             DEFAULT_NUM_WORKERS,
             SchedulerConfig {
                 scheduler_pacing: SchedulerPacing::Disabled,
+                ..SchedulerConfig::default()
             },
             None,
             replay_vote_sender,
@@ -1281,6 +1316,7 @@ mod tests {
             bank_forks,
             None,
             Arc::default(),
+            Arc::new(SchedulerPriorityFloor::default()),
         );
 
         let keypairs = (0..100).map(|_| Keypair::new()).collect_vec();
