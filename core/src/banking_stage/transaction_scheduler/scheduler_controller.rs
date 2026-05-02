@@ -13,7 +13,6 @@ use {
             TOTAL_BUFFERED_PACKETS,
             consume_worker::ConsumeWorkerMetrics,
             decision_maker::{BufferedPacketsDecision, DecisionMaker},
-            scheduler_priority::{FeeContext, floor_priority},
             transaction_scheduler::{
                 receive_and_buffer::ReceivingStats, transaction_priority_id::TransactionPriorityId,
                 transaction_state_container::StateContainer,
@@ -113,7 +112,6 @@ impl SaturationState {
     /// caller must compute and pass a floor to [`Self::publish_floor`].
     fn transition(&mut self, num_received: u64, buffer_size: usize) -> bool {
         let consumed = self.token_bucket.consume_tokens_saturating(num_received);
-        let over_budget = num_received.saturating_sub(consumed);
         let buffer_guard_met = buffer_size >= self.buffer_guard_threshold;
 
         if self.saturated {
@@ -125,31 +123,21 @@ impl SaturationState {
                 self.saturated = false;
                 self.priority_floor.clear();
             }
-        } else if over_budget > 0 && buffer_guard_met {
+        } else if num_received > consumed && buffer_guard_met {
             self.saturated = true;
         }
 
         self.saturated
     }
 
-    /// Publish (or clear) the priority floor based on `floor`. Caller invokes
-    /// this only after [`Self::transition`] reports `needs_floor=true`. The
-    /// returned `current_priority_floor` is what's emitted as a metric;
-    /// `0` means "saturated but no usable floor right now" (queue empty /
-    /// unparseable), in which case the shared atomic is *cleared* so
-    /// sigverify doesn't keep dropping against a stale value from a
-    /// previous tick.
+    /// Publish the floor (or clear if `floor` is `None` / `0`). Caller
+    /// invokes this only after [`Self::transition`] reports `needs_floor`.
+    /// Returns the value just published (`0` when nothing usable was
+    /// available — queue empty or queue-min priority was zero).
     fn publish_floor(&self, floor: Option<u64>) -> u64 {
-        match floor {
-            Some(f) => {
-                self.priority_floor.publish(f);
-                f
-            }
-            None => {
-                self.priority_floor.clear();
-                0
-            }
-        }
+        let floor = floor.unwrap_or(0);
+        self.priority_floor.publish(floor);
+        floor
     }
 }
 
@@ -393,12 +381,12 @@ where
         let buffer_size = self.container.buffer_size();
         let needs_floor = self.saturation_state.transition(num_received, buffer_size);
         let priority_floor = if needs_floor {
-            let fee_context = FeeContext::from_bank(&self.sharable_banks.working());
+            // The queue-min priority — same value sigverify computes against
+            // arrivals (both use bank-context via `priority_and_cost`).
             let floor = self
                 .container
-                .get_min_priority_id()
-                .and_then(|id| self.container.get_transaction(id.id))
-                .and_then(|tx| floor_priority(tx, &fee_context))
+                .get_min_max_priority()
+                .map(|(min, _)| min)
                 .filter(|&f| f > 0);
             self.saturation_state.publish_floor(floor)
         } else {

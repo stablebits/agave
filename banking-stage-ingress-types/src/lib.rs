@@ -21,8 +21,9 @@ pub struct SchedulerPriorityFloor {
 }
 
 impl SchedulerPriorityFloor {
+    /// Publish a new floor (or clear with `0` — `0` is the "not saturated"
+    /// sentinel and equivalent to [`Self::clear`]).
     pub fn publish(&self, floor: u64) {
-        debug_assert!(floor > 0, "published priority floor must be positive");
         self.priority_floor.store(floor, Ordering::Relaxed);
     }
 

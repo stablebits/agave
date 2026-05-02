@@ -106,12 +106,6 @@ pub(crate) trait StateContainer<Tx: TransactionWithMeta> {
 
     fn get_min_max_priority(&self) -> Option<(u64, u64)>;
 
-    /// Lowest-priority entry in the queue. Exposes the `TransactionPriorityId`
-    /// (rather than just the priority) so callers can look up the underlying
-    /// transaction via [`StateContainer::get_transaction`] — the pf-floor
-    /// controller needs the actual tx to compute its priority.
-    fn get_min_priority_id(&self) -> Option<TransactionPriorityId>;
-
     /// Return an iterator over priority IDs strictly below `cursor` in descending order,
     /// or all IDs in descending order if `cursor` is `None`.
     fn recheck_iter(
@@ -211,10 +205,6 @@ impl<Tx: TransactionWithMeta> StateContainer<Tx> for TransactionStateContainer<T
         let max = self.priority_queue.last().unwrap().priority;
 
         Some((min, max))
-    }
-
-    fn get_min_priority_id(&self) -> Option<TransactionPriorityId> {
-        self.priority_queue.first().copied()
     }
 
     fn recheck_iter(
@@ -384,11 +374,6 @@ impl StateContainer<RuntimeTransactionView> for TransactionViewStateContainer {
     #[inline]
     fn get_min_max_priority(&self) -> Option<(u64, u64)> {
         self.inner.get_min_max_priority()
-    }
-
-    #[inline]
-    fn get_min_priority_id(&self) -> Option<TransactionPriorityId> {
-        self.inner.get_min_priority_id()
     }
 
     #[inline]
