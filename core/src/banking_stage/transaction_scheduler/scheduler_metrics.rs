@@ -89,6 +89,10 @@ pub struct SchedulerCountMetricsInner {
     pub min_prioritization_fees: u64,
     /// Max prioritization fees in the transaction container
     pub max_prioritization_fees: u64,
+    /// Most recently published pf-floor in the interval, expressed in
+    /// sigverify's comparison space. 0 means no floor was published
+    /// (i.e. scheduler was not saturated or pf-floor is disabled).
+    pub current_priority_floor: u64,
 }
 
 impl IntervalSchedulerCountMetrics {
@@ -142,6 +146,7 @@ impl SchedulerCountMetricsInner {
             num_dropped_on_capacity: Saturating(num_dropped_on_capacity),
             min_prioritization_fees: _min_prioritization_fees,
             max_prioritization_fees: _max_prioritization_fees,
+            current_priority_floor,
         } = self;
         let mut datapoint = create_datapoint!(
             @point name,
@@ -188,7 +193,8 @@ impl SchedulerCountMetricsInner {
             ),
             ("num_dropped_on_capacity", num_dropped_on_capacity, i64),
             ("min_priority", self.get_min_priority(), i64),
-            ("max_priority", self.get_max_priority(), i64)
+            ("max_priority", self.get_max_priority(), i64),
+            ("current_priority_floor", current_priority_floor, i64)
         );
         if let Some(slot) = slot {
             datapoint.add_field_i64("slot", slot as i64);
@@ -228,6 +234,7 @@ impl SchedulerCountMetricsInner {
         self.num_dropped_on_capacity = Saturating(0);
         self.min_prioritization_fees = u64::MAX;
         self.max_prioritization_fees = 0;
+        self.current_priority_floor = 0;
     }
 
     pub fn update_priority_stats(&mut self, min_max_fees: Option<(u64, u64)>) {

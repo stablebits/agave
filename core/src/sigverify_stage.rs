@@ -6,19 +6,20 @@
 
 use {
     crate::{
+        banking_stage::scheduler_priority::{FeeContext, floor_priority_from_bytes},
         banking_trace::BankingPacketSender,
         sigverify::{
             GossipSigVerifier, GossipVerifiedVoteBatch, SigVerifyWorkerPool, SigVerifyWorkerStats,
             TransactionSigVerifier,
         },
     },
-    agave_banking_stage_ingress_types::BankingPacketBatch,
+    agave_banking_stage_ingress_types::{BankingPacketBatch, SchedulerPriorityFloor},
     core::time::Duration,
     crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded},
     solana_measure::measure::Measure,
     solana_perf::{
         deduper::{self, Deduper},
-        packet::PacketBatch,
+        packet::{PacketBatch, PacketFlags},
     },
     solana_runtime::bank_forks::SharableBanks,
     solana_streamer::streamer::{self, StreamerError},
@@ -71,6 +72,7 @@ struct SigVerifierStats {
     total_dedup_time_us: usize,
     total_verify_time_us: Arc<AtomicUsize>,
     total_dropped_on_capacity: usize,
+    total_dropped_below_priority_floor: Arc<AtomicUsize>,
 }
 
 impl SigVerifierStats {
@@ -167,6 +169,12 @@ impl SigVerifierStats {
                 i64
             ),
             (
+                "total_dropped_below_priority_floor",
+                self.total_dropped_below_priority_floor
+                    .swap(0, Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
                 "total_valid_packets",
                 self.total_valid_packets.swap(0, Ordering::Relaxed) as i64,
                 i64
@@ -185,6 +193,61 @@ impl SigVerifierStats {
     }
 }
 
+/// Apply the pf-floor to a single batch in place. Below-floor packets are
+/// marked `discard`. Returns `(dropped, all_below)` — `dropped` is the
+/// number of packets newly marked, `all_below` is true iff no useful
+/// packets remain in the batch (so the caller can skip a downstream send).
+pub(crate) fn apply_priority_floor_to_batch(
+    batch: &mut PacketBatch,
+    floor: u64,
+    fee_context: &FeeContext,
+) -> (usize, bool) {
+    let mut dropped: usize = 0;
+    let mut any_kept = false;
+    for mut packet in batch.iter_mut() {
+        if packet.meta().discard() {
+            continue;
+        }
+        if packet.meta().flags.contains(PacketFlags::SIMPLE_VOTE_TX) {
+            // Votes are immune to the priority floor (vote priority is
+            // governed by a separate policy in banking stage).
+            any_kept = true;
+            continue;
+        }
+        let Some(data) = packet.data(..) else {
+            // Zero-length or otherwise unreadable: leave to downstream
+            // stages to reject.
+            any_kept = true;
+            continue;
+        };
+        match floor_priority_from_bytes(data, fee_context) {
+            Some(priority) if priority <= floor => {
+                packet.meta_mut().set_discard(true);
+                dropped = dropped.saturating_add(1);
+            }
+            _ => any_kept = true,
+        }
+    }
+    (dropped, !any_kept)
+}
+
+/// Drop below-floor packets from `batches`. A batch is removed from the
+/// outer `Vec` entirely when all packets were discarded.
+/// Returns the number of packets newly dropped.
+pub(crate) fn apply_priority_floor(
+    batches: &mut Vec<PacketBatch>,
+    floor: u64,
+    fee_context: &FeeContext,
+) -> usize {
+    let mut total: usize = 0;
+    batches.retain_mut(|batch| {
+        let (dropped, all_below) = apply_priority_floor_to_batch(batch, floor, fee_context);
+        total = total.saturating_add(dropped);
+        !all_below
+    });
+    total
+}
+
 impl SigVerifyStage {
     pub fn new(
         packet_receiver: Receiver<PacketBatch>,
@@ -195,6 +258,7 @@ impl SigVerifyStage {
         num_workers: NonZeroUsize,
         forward_non_votes: bool,
         sharable_banks: SharableBanks,
+        scheduler_priority_floor: Option<Arc<SchedulerPriorityFloor>>,
     ) -> (Self, GossipSigVerifyHandle) {
         let (gossip_verified_vote_sender, verified_vote_receiver) = unbounded();
         let non_vote_stats = SigVerifierStats::default();
@@ -206,15 +270,22 @@ impl SigVerifyStage {
             gossip_verified_vote_sender,
             forward_stage_sender,
             forward_non_votes,
-            sharable_banks,
+            sharable_banks.clone(),
             SigVerifyWorkerStats {
                 total_valid_packets: non_vote_stats.total_valid_packets.clone(),
                 total_verify_time_us: non_vote_stats.total_verify_time_us.clone(),
+                total_dropped_below_priority_floor: non_vote_stats
+                    .total_dropped_below_priority_floor
+                    .clone(),
             },
             SigVerifyWorkerStats {
                 total_valid_packets: tpu_vote_stats.total_valid_packets.clone(),
                 total_verify_time_us: tpu_vote_stats.total_verify_time_us.clone(),
+                total_dropped_below_priority_floor: tpu_vote_stats
+                    .total_dropped_below_priority_floor
+                    .clone(),
             },
+            scheduler_priority_floor.clone(),
         );
         let non_vote_thread_hdl = Self::verifier_service(
             packet_receiver,
@@ -222,6 +293,8 @@ impl SigVerifyStage {
             "solSigVerTpu",
             "tpu-verifier",
             non_vote_stats,
+            Some(sharable_banks),
+            scheduler_priority_floor,
         );
         let tpu_vote_thread_hdl = Self::verifier_service(
             vote_packet_receiver,
@@ -229,6 +302,8 @@ impl SigVerifyStage {
             "solSigVerTpuVot",
             "tpu-vote-verifier",
             tpu_vote_stats,
+            None,
+            None,
         );
         let gossip_sigverify_handle = GossipSigVerifyHandle {
             verifier: worker_pool.gossip_verifier(),
@@ -258,6 +333,8 @@ impl SigVerifyStage {
         recvr: &Receiver<PacketBatch>,
         verifier: &mut TransactionSigVerifier,
         stats: &mut SigVerifierStats,
+        sharable_banks: Option<&SharableBanks>,
+        scheduler_priority_floor: Option<&Arc<SchedulerPriorityFloor>>,
     ) -> Result<()> {
         const SOFT_RECEIVE_CAP: usize = 5_000;
         let (mut batches, num_packets, recv_duration) =
@@ -277,7 +354,28 @@ impl SigVerifyStage {
         let discard_or_dedup_fail =
             deduper::dedup_packets_and_count_discards(deduper, &mut batches) as usize;
         dedup_time.stop();
-        stats.total_dropped_on_capacity += verifier.send_packets_to_worker_pool(batches)?;
+
+        // Apply the scheduler-published pf-floor to drop low-priority transactions
+        // earlier when the scheduler is saturated. The floor value applied
+        // here is forwarded with the batch so the worker can skip its own
+        // re-check when the floor hasn't moved up since.
+        let intake_floor = scheduler_priority_floor.and_then(|f| f.get()).unwrap_or(0);
+        if intake_floor > 0 {
+            // SAFETY: when a floor is published, the non-vote verifier_service
+            // path always supplies `sharable_banks`. The vote path passes
+            // `None` for the floor, so we never enter this branch.
+            let banks = sharable_banks.expect("sharable_banks must be set when floor is enforced");
+            let fee_context = FeeContext::from_bank(&banks.working());
+            let dropped = apply_priority_floor(&mut batches, intake_floor, &fee_context);
+            if dropped > 0 {
+                stats
+                    .total_dropped_below_priority_floor
+                    .fetch_add(dropped, Ordering::Relaxed);
+            }
+        }
+
+        stats.total_dropped_on_capacity +=
+            verifier.send_packets_to_worker_pool(batches, intake_floor)?;
         stats
             .dedup_packets_pp_us_hist
             .increment(dedup_time.as_us() / (num_packets as u64))
@@ -294,6 +392,8 @@ impl SigVerifyStage {
         thread_name: &'static str,
         metrics_name: &'static str,
         mut stats: SigVerifierStats,
+        sharable_banks: Option<SharableBanks>,
+        scheduler_priority_floor: Option<Arc<SchedulerPriorityFloor>>,
     ) -> JoinHandle<()> {
         let mut last_print = Instant::now();
         const MAX_DEDUPER_AGE: Duration = Duration::from_secs(2);
@@ -308,9 +408,14 @@ impl SigVerifyStage {
                     if deduper.maybe_reset(&mut rng, DEDUPER_FALSE_POSITIVE_RATE, MAX_DEDUPER_AGE) {
                         stats.num_deduper_saturations += 1;
                     }
-                    if let Err(e) =
-                        Self::verifier(&deduper, &packet_receiver, &mut verifier, &mut stats)
-                    {
+                    if let Err(e) = Self::verifier(
+                        &deduper,
+                        &packet_receiver,
+                        &mut verifier,
+                        &mut stats,
+                        sharable_banks.as_ref(),
+                        scheduler_priority_floor.as_ref(),
+                    ) {
                         match e {
                             SigVerifyServiceError::Streamer(StreamerError::RecvTimeout(
                                 RecvTimeoutError::Disconnected,
@@ -452,6 +557,7 @@ mod tests {
             NonZeroUsize::new(4).unwrap(),
             false,
             sharable_banks,
+            None,
         );
 
         let now = Instant::now();
@@ -526,6 +632,7 @@ mod tests {
             NonZeroUsize::new(1).unwrap(),
             false,
             sharable_banks,
+            None,
         );
 
         let mut bytes_batch = BytesPacketBatch::with_capacity(1);

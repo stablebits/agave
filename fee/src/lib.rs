@@ -47,6 +47,21 @@ pub fn calculate_fee_details(
     )
 }
 
+/// Split a transaction's collected fee into the leader's reward (deposit)
+/// and the amount that should be burned, given a burn percentage.
+pub fn split_reward_and_burn(
+    transaction_fee: u64,
+    priority_fee: u64,
+    burn_percent: u64,
+) -> (u64, u64) {
+    if transaction_fee == 0 {
+        return (0, 0);
+    }
+    let burn = transaction_fee.saturating_mul(burn_percent) / 100;
+    let reward = priority_fee.saturating_add(transaction_fee.saturating_sub(burn));
+    (reward, burn)
+}
+
 /// Calculate fees from signatures.
 pub fn calculate_signature_fee(
     SignatureCounts {

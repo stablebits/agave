@@ -3,8 +3,12 @@
 //! cores.
 
 use {
-    crate::{banking_trace::BankingPacketSender, sigverify_stage::SigVerifyServiceError},
-    agave_banking_stage_ingress_types::BankingPacketBatch,
+    crate::{
+        banking_stage::scheduler_priority::FeeContext,
+        banking_trace::BankingPacketSender,
+        sigverify_stage::{SigVerifyServiceError, apply_priority_floor_to_batch},
+    },
+    agave_banking_stage_ingress_types::{BankingPacketBatch, SchedulerPriorityFloor},
     crossbeam_channel::{Receiver, Sender, TrySendError, bounded},
     solana_measure::measure_us,
     solana_perf::{
@@ -30,6 +34,11 @@ pub(crate) struct TransactionSigVerifier {
 
 struct TransactionVerifyTask {
     batch: PacketBatch,
+    /// Pf-floor value applied at the verifier-service intake check, or `0`
+    /// if no floor was enforced there (feature disabled or floor was 0 at
+    /// the time). The worker compares this to the current floor and skips
+    /// the second-stage parse pass when the floor hasn't moved up since.
+    intake_floor: u64,
 }
 
 pub(crate) struct GossipVerifyTask {
@@ -46,6 +55,7 @@ pub(crate) struct GossipVerifiedVoteBatch {
 pub(crate) struct SigVerifyWorkerStats {
     pub(crate) total_valid_packets: Arc<AtomicUsize>,
     pub(crate) total_verify_time_us: Arc<AtomicUsize>,
+    pub(crate) total_dropped_below_priority_floor: Arc<AtomicUsize>,
 }
 
 impl TransactionSigVerifier {
@@ -56,10 +66,14 @@ impl TransactionSigVerifier {
     pub(crate) fn send_packets_to_worker_pool(
         &mut self,
         batches: Vec<PacketBatch>,
+        intake_floor: u64,
     ) -> Result<usize, SigVerifyServiceError> {
         let mut dropped_packets = 0;
         for batch in batches {
-            match self.worker_sender.try_send(TransactionVerifyTask { batch }) {
+            match self.worker_sender.try_send(TransactionVerifyTask {
+                batch,
+                intake_floor,
+            }) {
                 Ok(()) => {}
                 Err(TrySendError::Full(task)) => {
                     dropped_packets += task.batch.len();
@@ -136,6 +150,11 @@ struct WorkerPoolChannels {
     sharable_banks: SharableBanks,
     non_vote_stats: SigVerifyWorkerStats,
     tpu_vote_stats: SigVerifyWorkerStats,
+    /// Scheduler-published pf-floor read by non-vote workers as a
+    /// second-stage drop. Catches packets that passed the verifier_service
+    /// first-stage check but were in the worker channel or about to be
+    /// signature-verified when the floor was raised. `None` disables.
+    scheduler_priority_floor: Option<Arc<SchedulerPriorityFloor>>,
 }
 
 pub(crate) struct SigVerifyWorkerPool {
@@ -158,6 +177,7 @@ impl Drop for SigVerifyWorkerPool {
 }
 
 impl SigVerifyWorkerPool {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         num_workers: NonZeroUsize,
         non_vote_banking_sender: BankingPacketSender,
@@ -168,6 +188,7 @@ impl SigVerifyWorkerPool {
         sharable_banks: SharableBanks,
         non_vote_stats: SigVerifyWorkerStats,
         tpu_vote_stats: SigVerifyWorkerStats,
+        scheduler_priority_floor: Option<Arc<SchedulerPriorityFloor>>,
     ) -> Self {
         let (non_vote_sender, non_vote_receiver) = bounded(SIGVERIFY_NON_VOTE_WORK_CHANNEL_SIZE);
         let (tpu_vote_sender, tpu_vote_receiver) = bounded(SIGVERIFY_TPU_VOTE_WORK_CHANNEL_SIZE);
@@ -183,6 +204,7 @@ impl SigVerifyWorkerPool {
             sharable_banks,
             non_vote_stats,
             tpu_vote_stats,
+            scheduler_priority_floor,
         };
         let exit = Arc::new(AtomicBool::new(false));
         let worker_hdls = (0..num_workers.get())
@@ -241,6 +263,7 @@ impl SigVerifyWorkerPool {
                         false,
                         &channels.sharable_banks,
                         &channels.non_vote_stats,
+                        channels.scheduler_priority_floor.as_ref(),
                     ),
                     Err(_) => false,
                 }
@@ -256,6 +279,7 @@ impl SigVerifyWorkerPool {
                         true,
                         &channels.sharable_banks,
                         &channels.tpu_vote_stats,
+                        None,
                     ),
                     Err(_) => false,
                 }
@@ -274,7 +298,7 @@ impl SigVerifyWorkerPool {
     }
 
     fn run_transaction_task(
-        mut work: TransactionVerifyTask,
+        work: TransactionVerifyTask,
         reject_non_vote: bool,
         banking_stage_sender: &BankingPacketSender,
         forward_stage_sender: &Sender<(BankingPacketBatch, bool)>,
@@ -282,14 +306,43 @@ impl SigVerifyWorkerPool {
         is_tpu_vote: bool,
         sharable_banks: &SharableBanks,
         stats: &SigVerifyWorkerStats,
+        scheduler_priority_floor: Option<&Arc<SchedulerPriorityFloor>>,
     ) -> bool {
-        let enable_tx_v1 = sharable_banks.working().feature_set.snapshot().enable_tx_v1;
+        let TransactionVerifyTask {
+            mut batch,
+            intake_floor,
+        } = work;
+
+        // Second-stage pf-floor drop. Catches packets that passed the
+        // verifier_service first-stage check but were in the worker channel
+        // or about to be signature-verified when the floor was raised.
+        //
+        // Re-check only if the current floor is *higher* than what was
+        // applied at intake.
+        let working_bank = sharable_banks.working();
+        let current_floor = scheduler_priority_floor.and_then(|f| f.get()).unwrap_or(0);
+        if current_floor > intake_floor {
+            let fee_context = FeeContext::from_bank(&working_bank);
+            let (dropped, all_below) =
+                apply_priority_floor_to_batch(&mut batch, current_floor, &fee_context);
+            if dropped > 0 {
+                stats
+                    .total_dropped_below_priority_floor
+                    .fetch_add(dropped, Ordering::Relaxed);
+            }
+            if all_below {
+                // Entire batch went below-floor: nothing to verify or send.
+                return true;
+            }
+        }
+
+        let enable_tx_v1 = working_bank.feature_set.snapshot().enable_tx_v1;
         let (_, verify_time_us) = measure_us!(sigverify::ed25519_verify_serial(
-            &mut work.batch,
+            &mut batch,
             reject_non_vote,
             enable_tx_v1,
         ));
-        let num_valid_packets = sigverify::count_valid_packets(std::iter::once(&work.batch));
+        let num_valid_packets = sigverify::count_valid_packets(std::iter::once(&batch));
         stats
             .total_valid_packets
             .fetch_add(num_valid_packets, Ordering::Relaxed);
@@ -297,7 +350,7 @@ impl SigVerifyWorkerPool {
             .total_verify_time_us
             .fetch_add(verify_time_us as usize, Ordering::Relaxed);
 
-        let banking_packet_batch = BankingPacketBatch::new(vec![work.batch]);
+        let banking_packet_batch = BankingPacketBatch::new(vec![batch]);
         if let Err(err) = banking_stage_sender.send(banking_packet_batch.clone()) {
             error!("sigverify send failed: {err:?}");
             return false;

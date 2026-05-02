@@ -13,6 +13,7 @@ use {
             TOTAL_BUFFERED_PACKETS,
             consume_worker::ConsumeWorkerMetrics,
             decision_maker::{BufferedPacketsDecision, DecisionMaker},
+            scheduler_priority::{FeeContext, floor_priority},
             transaction_scheduler::{
                 receive_and_buffer::ReceivingStats, transaction_priority_id::TransactionPriorityId,
                 transaction_state_container::StateContainer,
@@ -20,9 +21,11 @@ use {
         },
         validator::SchedulerPacing,
     },
+    agave_banking_stage_ingress_types::SchedulerPriorityFloor,
     solana_clock::DEFAULT_MS_PER_SLOT,
     solana_cost_model::cost_tracker::SharedBlockCost,
     solana_measure::measure_us,
+    solana_net_utils::token_bucket::TokenBucket,
     solana_runtime::bank_forks::SharableBanks,
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
     std::{
@@ -36,6 +39,18 @@ use {
 };
 
 const CHECK_CHUNK: usize = 128;
+
+/// Token-bucket refill rate (packets per second) for the pf-floor saturation
+/// signal. Approximates the rate at which the scheduler can drain its
+/// receive+parse+schedule loop.
+const TOKEN_BUCKET_REFILL_TPS: u64 = 100_000;
+/// Token-bucket burst capacity (packets). Controls how much of a short-term
+/// spike is absorbed before saturation triggers.
+const TOKEN_BUCKET_BURST: u64 = 25_000;
+/// AND-guard on saturation entry: require the scheduler queue to hold at
+/// least this percentage of `TOTAL_BUFFERED_PACKETS` before the token bucket
+/// is allowed to drive saturation.
+const SATURATION_MIN_QUEUE_PCT: u8 = 90;
 
 #[derive(Clone)]
 pub struct SchedulerConfig {
@@ -55,6 +70,97 @@ impl Default for SchedulerConfig {
 const DEFAULT_SCHEDULER_PACING_NON_FILL_TIME_MILLIS: u64 = 50;
 pub(crate) const DEFAULT_SCHEDULER_PACING_FILL_TIME_MILLIS: NonZeroU64 =
     NonZeroU64::new(DEFAULT_MS_PER_SLOT - DEFAULT_SCHEDULER_PACING_NON_FILL_TIME_MILLIS).unwrap();
+
+/// Saturation detection + pf-floor publication.
+struct SaturationState {
+    /// Published to sigverify as the pf-floor when saturated.
+    priority_floor: Arc<SchedulerPriorityFloor>,
+    /// Hysteresis latch for the saturation state.
+    saturated: bool,
+    /// Drives the saturation signal: depleted by arrivals, refilled at a
+    /// fixed TPS.
+    token_bucket: TokenBucket,
+    /// AND-guard on saturation entry:
+    /// Uses buffer size rather than priority-queue size so saturation stays
+    /// active while the scheduler is actively scheduling and the priority
+    /// queue is momentarily near-empty.
+    buffer_guard_threshold: usize,
+    /// Token-bucket level at which saturation de-asserts (hysteresis).
+    desaturate_tokens_threshold: u64,
+}
+
+impl SaturationState {
+    fn new(priority_floor: Arc<SchedulerPriorityFloor>) -> Self {
+        let token_bucket = TokenBucket::new(
+            TOKEN_BUCKET_BURST,
+            TOKEN_BUCKET_BURST,
+            TOKEN_BUCKET_REFILL_TPS as f64,
+        );
+        let buffer_guard_threshold =
+            TOTAL_BUFFERED_PACKETS.saturating_mul(SATURATION_MIN_QUEUE_PCT as usize) / 100;
+        let desaturate_tokens_threshold = TOKEN_BUCKET_BURST.saturating_div(2);
+        Self {
+            priority_floor,
+            saturated: false,
+            token_bucket,
+            buffer_guard_threshold,
+            desaturate_tokens_threshold,
+        }
+    }
+
+    /// Update token-bucket / hysteresis state from this tick's arrivals.
+    /// Returns `needs_floor=true` iff the state is now saturated and the
+    /// caller must compute and pass a floor to [`Self::publish_floor`].
+    fn transition(&mut self, num_received: u64, buffer_size: usize) -> bool {
+        let consumed = self.token_bucket.consume_tokens_saturating(num_received);
+        let over_budget = num_received.saturating_sub(consumed);
+        let buffer_guard_met = buffer_size >= self.buffer_guard_threshold;
+
+        if self.saturated {
+            // Exit when the bucket has refilled past the threshold, or the
+            // buffer has drained below the guard (pressure is gone).
+            if self.token_bucket.current_tokens() >= self.desaturate_tokens_threshold
+                || !buffer_guard_met
+            {
+                self.saturated = false;
+                self.priority_floor.clear();
+            }
+        } else if over_budget > 0 && buffer_guard_met {
+            self.saturated = true;
+        }
+
+        self.saturated
+    }
+
+    /// Publish (or clear) the priority floor based on `floor`. Caller invokes
+    /// this only after [`Self::transition`] reports `needs_floor=true`. The
+    /// returned `current_priority_floor` is what's emitted as a metric;
+    /// `0` means "saturated but no usable floor right now" (queue empty /
+    /// unparseable), in which case the shared atomic is *cleared* so
+    /// sigverify doesn't keep dropping against a stale value from a
+    /// previous tick.
+    fn publish_floor(&self, floor: Option<u64>) -> u64 {
+        match floor {
+            Some(f) => {
+                self.priority_floor.publish(f);
+                f
+            }
+            None => {
+                self.priority_floor.clear();
+                0
+            }
+        }
+    }
+}
+
+impl Drop for SaturationState {
+    fn drop(&mut self) {
+        // The priority floor outlives individual scheduler controllers (it's
+        // shared with sigverify). Clear it on tear-down so a stale floor
+        // from this controller can't keep sigverify dropping packets.
+        self.priority_floor.clear();
+    }
+}
 
 /// Controls packet and transaction flow into scheduler, and scheduling execution.
 pub(crate) struct SchedulerController<R, S>
@@ -88,6 +194,8 @@ where
     recheck_cursor: Option<TransactionPriorityId>,
     /// Recheck IDs scratch space.
     recheck_chunk: Vec<TransactionPriorityId>,
+    /// Saturation detection + pf-floor publication.
+    saturation_state: SaturationState,
 }
 
 impl<R, S> SchedulerController<R, S>
@@ -103,7 +211,10 @@ where
         sharable_banks: SharableBanks,
         scheduler: S,
         worker_metrics: Vec<Arc<ConsumeWorkerMetrics>>,
+        priority_floor: Arc<SchedulerPriorityFloor>,
     ) -> Self {
+        priority_floor.clear();
+        let saturation_state = SaturationState::new(priority_floor);
         Self {
             exit,
             config,
@@ -118,6 +229,7 @@ where
             scheduling_details: SchedulingDetails::default(),
             recheck_cursor: None,
             recheck_chunk: Vec::with_capacity(CHECK_CHUNK),
+            saturation_state,
         }
     }
 
@@ -195,7 +307,7 @@ where
                     timing_metrics.clean_time_us += clean_time_us;
                 });
             }
-            self.receive_and_buffer_packets(&decision).map_err(|_| {
+            let receiving_stats = self.receive_and_buffer_packets(&decision).map_err(|_| {
                 SchedulerError::DisconnectedRecvChannel("receive and buffer disconnected")
             })?;
             // Report metrics only if there is data.
@@ -205,6 +317,7 @@ where
             self.count_metrics.update(|count_metrics| {
                 count_metrics.update_priority_stats(priority_min_max);
             });
+            self.update_scheduler_priority_floor(receiving_stats.num_received as u64);
             self.count_metrics
                 .maybe_report_and_reset_interval(should_report);
             self.timing_metrics
@@ -263,6 +376,38 @@ where
         };
 
         Ok(scheduled)
+    }
+
+    /// Update the scheduler-published pf-floor.
+    ///
+    /// Saturation is driven by a token bucket fed at a fixed TPS and consumed
+    /// by `num_received`, AND-guarded by a minimum buffer occupancy so we
+    /// don't publish a floor derived from a near-empty queue. The published
+    /// floor is the queue-min tx's [`floor_priority`] — the same function
+    /// sigverify runs on arrivals, so both compare in identical units.
+    ///
+    /// Semantics: "drop arrivals that are worse than what we'd evict
+    /// anyway." Self-stabilizing — as the queue evicts low-priority entries
+    /// the floor rises with queue-min; as the queue drains it falls.
+    fn update_scheduler_priority_floor(&mut self, num_received: u64) {
+        let buffer_size = self.container.buffer_size();
+        let needs_floor = self.saturation_state.transition(num_received, buffer_size);
+        let priority_floor = if needs_floor {
+            let fee_context = FeeContext::from_bank(&self.sharable_banks.working());
+            let floor = self
+                .container
+                .get_min_priority_id()
+                .and_then(|id| self.container.get_transaction(id.id))
+                .and_then(|tx| floor_priority(tx, &fee_context))
+                .filter(|&f| f > 0);
+            self.saturation_state.publish_floor(floor)
+        } else {
+            0
+        };
+
+        self.count_metrics.update(|count_metrics| {
+            count_metrics.current_priority_floor = priority_floor;
+        });
     }
 
     /// Clears the transaction state container.
@@ -547,6 +692,7 @@ mod tests {
             bank_forks.read().unwrap().sharable_banks(),
             scheduler,
             vec![], // no actual workers with metrics to report, this can be empty
+            Arc::new(SchedulerPriorityFloor::default()),
         );
 
         (test_frame, scheduler_controller)
