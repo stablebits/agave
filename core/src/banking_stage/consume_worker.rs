@@ -1,5 +1,6 @@
 use {
     super::{
+        committer::CommitTransactionDetails,
         consumer::{Consumer, ExecuteAndCommitTransactionsOutput, ProcessTransactionBatchOutput},
         leader_slot_timing_metrics::LeaderExecuteAndCommitTimings,
         scheduler_messages::{ConsumeWork, FinishedConsumeWork},
@@ -1462,12 +1463,14 @@ pub(crate) mod external {
                             0,
                             solana_transaction::InstructionError::Custom(0),
                         )),
+                        collected_fee_lamports: 0,
                     },
                     CommitTransactionDetails::Committed {
                         compute_units: 10,
                         loaded_accounts_data_size: 2048,
                         fee_payer_post_balance: 2_000_000,
                         result: Ok(()),
+                        collected_fee_lamports: 0,
                     },
                     CommitTransactionDetails::NotCommitted(
                         TransactionError::InsufficientFundsForFee,
@@ -2336,9 +2339,9 @@ impl ConsumeWorkerMetrics {
         ExecuteAndCommitTransactionsOutput {
             transaction_counts,
             retryable_transaction_indexes,
+            commit_transactions_result,
             execute_and_commit_timings,
             error_counters,
-            ..
         }: &ExecuteAndCommitTransactionsOutput,
     ) {
         self.count_metrics
@@ -2359,6 +2362,27 @@ impl ConsumeWorkerMetrics {
         self.count_metrics
             .retryable_transaction_count
             .fetch_add(retryable_transaction_indexes.len(), Ordering::Relaxed);
+        if let Ok(commit_transaction_statuses) = commit_transactions_result {
+            let mut executed_units: u64 = 0;
+            let mut collected_fees: u64 = 0;
+            for d in commit_transaction_statuses {
+                if let CommitTransactionDetails::Committed {
+                    compute_units,
+                    collected_fee_lamports,
+                    ..
+                } = d
+                {
+                    executed_units = executed_units.saturating_add(*compute_units);
+                    collected_fees = collected_fees.saturating_add(*collected_fee_lamports);
+                }
+            }
+            self.count_metrics
+                .block_executed_units
+                .fetch_add(executed_units, Ordering::Relaxed);
+            self.count_metrics
+                .block_collected_fees_lamports
+                .fetch_add(collected_fees, Ordering::Relaxed);
+        }
         self.update_on_execute_and_commit_timings(execute_and_commit_timings);
         self.update_on_error_counters(error_counters);
     }
@@ -2517,6 +2541,14 @@ struct ConsumeWorkerCountMetrics {
     retryable_transaction_count: AtomicUsize,
     retryable_expired_bank_count: AtomicUsize,
     cost_model_throttled_transactions_count: AtomicU64,
+    /// Sum of leader deposit lamports across committed transactions since
+    /// the last report (priority fee + non-burned share of base fee — what
+    /// the validator actually earned). Pair with `block_executed_units` for
+    /// per-CU revenue economics; matches the units the pf-floor publishes.
+    block_collected_fees_lamports: AtomicU64,
+    /// Sum of executed compute units across committed transactions since
+    /// the last report.
+    block_executed_units: AtomicU64,
 }
 
 impl ConsumeWorkerCountMetrics {
@@ -2561,6 +2593,17 @@ impl ConsumeWorkerCountMetrics {
                 "cost_model_throttled_transactions_count",
                 self.cost_model_throttled_transactions_count
                     .swap(0, Ordering::Relaxed),
+                i64
+            ),
+            (
+                "block_collected_fees_lamports",
+                self.block_collected_fees_lamports
+                    .swap(0, Ordering::Relaxed),
+                i64
+            ),
+            (
+                "block_executed_units",
+                self.block_executed_units.swap(0, Ordering::Relaxed),
                 i64
             ),
         );

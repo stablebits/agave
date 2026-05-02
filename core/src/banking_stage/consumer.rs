@@ -953,8 +953,7 @@ mod tests {
                     CommitTransactionDetails::Committed {
                         compute_units,
                         loaded_accounts_data_size,
-                        result: _,
-                        fee_payer_post_balance: _,
+                        ..
                     } => (
                         *compute_units,
                         CostModel::calculate_loaded_accounts_data_size_cost(

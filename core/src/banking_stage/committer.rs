@@ -8,7 +8,7 @@ use {
     },
     solana_measure::measure_us,
     solana_runtime::{
-        bank::{Bank, ProcessedTransactionCounts},
+        bank::{Bank, CollectorFeeDetails, ProcessedTransactionCounts},
         bank_utils,
         prioritization_fee_cache::PrioritizationFeeCache,
         transaction_batch::TransactionBatch,
@@ -31,6 +31,10 @@ pub enum CommitTransactionDetails {
         loaded_accounts_data_size: u32,
         fee_payer_post_balance: u64,
         result: Result<(), TransactionError>,
+        /// Lamports actually deposited to the leader (priority fee + the
+        /// non-burned share of the base fee). Mirrors the bank's
+        /// `calculate_reward_and_burn_fee_details` deposit.
+        collected_fee_lamports: u64,
     },
     NotCommitted(TransactionError),
 }
@@ -83,14 +87,22 @@ impl Committer {
                 // reports actual execution CUs, and actual loaded accounts size for
                 // transaction committed to block. qos_service uses these information to adjust
                 // reserved block space.
-                Ok(committed_tx) => CommitTransactionDetails::Committed {
-                    compute_units: committed_tx.executed_units,
-                    loaded_accounts_data_size: committed_tx
-                        .loaded_account_stats
-                        .loaded_accounts_data_size,
-                    result: committed_tx.status.clone(),
-                    fee_payer_post_balance: committed_tx.fee_payer_post_balance,
-                },
+                Ok(committed_tx) => {
+                    let collected_fee_lamports = bank
+                        .calculate_reward_and_burn_fee_details(&CollectorFeeDetails::from(
+                            committed_tx.fee_details,
+                        ))
+                        .get_deposit();
+                    CommitTransactionDetails::Committed {
+                        compute_units: committed_tx.executed_units,
+                        loaded_accounts_data_size: committed_tx
+                            .loaded_account_stats
+                            .loaded_accounts_data_size,
+                        result: committed_tx.status.clone(),
+                        fee_payer_post_balance: committed_tx.fee_payer_post_balance,
+                        collected_fee_lamports,
+                    }
+                }
                 Err(err) => CommitTransactionDetails::NotCommitted(err.clone()),
             })
             .collect();
