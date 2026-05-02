@@ -394,7 +394,7 @@ where
         };
 
         self.count_metrics.update(|count_metrics| {
-            count_metrics.current_priority_floor = priority_floor;
+            count_metrics.update_priority_floor(priority_floor);
         });
     }
 
