@@ -8,10 +8,8 @@ use {
         },
     },
     crate::banking_stage::{
-        consumer::Consumer,
-        decision_maker::BufferedPacketsDecision,
-        scheduler_messages::MaxAge,
-        scheduler_priority::{FeeContext, priority_and_cost},
+        consumer::Consumer, decision_maker::BufferedPacketsDecision, scheduler_messages::MaxAge,
+        scheduler_priority::priority_and_cost,
     },
     agave_banking_stage_ingress_types::{BankingPacketBatch, BankingPacketReceiver},
     agave_transaction_view::{
@@ -247,7 +245,6 @@ impl TransactionViewReceiveAndBuffer {
         let enable_instruction_accounts_limit =
             root_bank.feature_set.snapshot().limit_instruction_accounts;
         let transaction_account_lock_limit = working_bank.get_transaction_account_lock_limit();
-        let fee_context = FeeContext::from_bank(working_bank);
 
         // Create temporary batches of transactions to be age-checked.
         let mut transaction_priority_ids = ArrayVec::<_, EXTRA_CAPACITY>::new();
@@ -349,7 +346,6 @@ impl TransactionViewReceiveAndBuffer {
                             bytes,
                             root_bank,
                             working_bank,
-                            &fee_context,
                             transaction_account_lock_limit,
                             enable_instruction_accounts_limit,
                             &self.filter_keys,
@@ -416,7 +412,6 @@ impl TransactionViewReceiveAndBuffer {
         bytes: SharedBytes,
         root_bank: &Bank,
         working_bank: &Bank,
-        fee_context: &FeeContext,
         transaction_account_lock_limit: usize,
         enable_instruction_accounts_limit: bool,
         filter_keys: &HashSet<Pubkey>,
@@ -444,7 +439,7 @@ impl TransactionViewReceiveAndBuffer {
         };
 
         let max_age = calculate_max_age(root_bank.epoch(), deactivation_slot, root_bank.slot());
-        let (priority, cost) = priority_and_cost(&view, &transaction_configuration, fee_context);
+        let (priority, cost) = priority_and_cost(&view, &transaction_configuration, working_bank);
 
         Ok(TransactionState::new(view, max_age, priority, cost))
     }

@@ -6,7 +6,7 @@
 
 use {
     crate::{
-        banking_stage::scheduler_priority::{FeeContext, floor_priority_from_bytes},
+        banking_stage::scheduler_priority::floor_priority_from_bytes,
         banking_trace::BankingPacketSender,
         sigverify::{
             GossipSigVerifier, GossipVerifiedVoteBatch, SigVerifyWorkerPool, SigVerifyWorkerStats,
@@ -21,7 +21,7 @@ use {
         deduper::{self, Deduper},
         packet::{PacketBatch, PacketFlags},
     },
-    solana_runtime::bank_forks::SharableBanks,
+    solana_runtime::{bank::Bank, bank_forks::SharableBanks},
     solana_streamer::streamer::{self, StreamerError},
     solana_transaction::Transaction,
     std::{
@@ -200,7 +200,7 @@ impl SigVerifierStats {
 pub(crate) fn apply_priority_floor_to_batch(
     batch: &mut PacketBatch,
     floor: u64,
-    fee_context: &FeeContext,
+    bank: &Bank,
 ) -> (usize, bool) {
     let mut dropped: usize = 0;
     let mut any_kept = false;
@@ -220,7 +220,7 @@ pub(crate) fn apply_priority_floor_to_batch(
             any_kept = true;
             continue;
         };
-        match floor_priority_from_bytes(data, fee_context) {
+        match floor_priority_from_bytes(data, bank) {
             Some(priority) if priority <= floor => {
                 packet.meta_mut().set_discard(true);
                 dropped = dropped.saturating_add(1);
@@ -237,11 +237,11 @@ pub(crate) fn apply_priority_floor_to_batch(
 pub(crate) fn apply_priority_floor(
     batches: &mut Vec<PacketBatch>,
     floor: u64,
-    fee_context: &FeeContext,
+    bank: &Bank,
 ) -> usize {
     let mut total: usize = 0;
     batches.retain_mut(|batch| {
-        let (dropped, all_below) = apply_priority_floor_to_batch(batch, floor, fee_context);
+        let (dropped, all_below) = apply_priority_floor_to_batch(batch, floor, bank);
         total = total.saturating_add(dropped);
         !all_below
     });
@@ -365,8 +365,7 @@ impl SigVerifyStage {
             // path always supplies `sharable_banks`. The vote path passes
             // `None` for the floor, so we never enter this branch.
             let banks = sharable_banks.expect("sharable_banks must be set when floor is enforced");
-            let fee_context = FeeContext::from_bank(&banks.working());
-            let dropped = apply_priority_floor(&mut batches, intake_floor, &fee_context);
+            let dropped = apply_priority_floor(&mut batches, intake_floor, &banks.working());
             if dropped > 0 {
                 stats
                     .total_dropped_below_priority_floor

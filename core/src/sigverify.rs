@@ -4,7 +4,6 @@
 
 use {
     crate::{
-        banking_stage::scheduler_priority::FeeContext,
         banking_trace::BankingPacketSender,
         sigverify_stage::{SigVerifyServiceError, apply_priority_floor_to_batch},
     },
@@ -322,9 +321,8 @@ impl SigVerifyWorkerPool {
         let working_bank = sharable_banks.working();
         let current_floor = scheduler_priority_floor.and_then(|f| f.get()).unwrap_or(0);
         if current_floor > intake_floor {
-            let fee_context = FeeContext::from_bank(&working_bank);
             let (dropped, all_below) =
-                apply_priority_floor_to_batch(&mut batch, current_floor, &fee_context);
+                apply_priority_floor_to_batch(&mut batch, current_floor, &working_bank);
             if dropped > 0 {
                 stats
                     .total_dropped_below_priority_floor
