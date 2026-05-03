@@ -263,7 +263,7 @@ impl Tpu {
         // Shared sigverify→scheduler coordination channel. The scheduler
         // publishes a priority floor under saturation; sigverify reads it
         // and drops below-floor packets ahead of signature verification.
-        let scheduler_priority_floor = Arc::new(SchedulerPriorityFloor::default());
+        let scheduler_priority_floor = Arc::new(SchedulerPriorityFloor::new());
 
         let (sigverify_stage, gossip_sigverify_handle) = SigVerifyStage::new(
             packet_receiver,

@@ -67,7 +67,7 @@ mod leader_slot_metrics;
 mod leader_slot_timing_metrics;
 mod qos_service;
 mod scheduler_messages;
-pub mod scheduler_priority;
+pub(crate) mod scheduler_priority;
 mod vote_packet_receiver;
 mod vote_storage;
 mod vote_worker;
@@ -917,7 +917,7 @@ mod tests {
             bank_forks,
             None,
             Arc::default(),
-            Arc::new(SchedulerPriorityFloor::default()),
+            Arc::new(SchedulerPriorityFloor::new()),
         );
         drop(non_vote_sender);
         drop(tpu_vote_sender);
@@ -979,7 +979,7 @@ mod tests {
             bank_forks, // keep a local-copy of bank-forks so worker threads do not lose weak access to bank-forks
             None,
             Arc::default(),
-            Arc::new(SchedulerPriorityFloor::default()),
+            Arc::new(SchedulerPriorityFloor::new()),
         );
 
         // good tx, and no verify
@@ -1135,7 +1135,7 @@ mod tests {
                 bank_forks,
                 None,
                 Arc::default(),
-                Arc::new(SchedulerPriorityFloor::default()),
+                Arc::new(SchedulerPriorityFloor::new()),
             );
 
             // wait for banking_stage to eat the packets
@@ -1290,7 +1290,7 @@ mod tests {
             bank_forks,
             None,
             Arc::default(),
-            Arc::new(SchedulerPriorityFloor::default()),
+            Arc::new(SchedulerPriorityFloor::new()),
         );
 
         let keypairs = (0..100).map(|_| Keypair::new()).collect_vec();

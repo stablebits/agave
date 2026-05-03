@@ -29,7 +29,7 @@ use {
 /// from user input. They should never be zero.
 /// Any difference in the prioritization is negligible for
 /// the current transaction costs.
-pub fn priority_and_cost<Tx: TransactionMeta + SVMStaticMessage>(
+pub(crate) fn priority_and_cost<Tx: TransactionMeta + SVMStaticMessage>(
     transaction: &Tx,
     transaction_configuration: &TransactionConfiguration,
     bank: &Bank,
@@ -65,7 +65,7 @@ pub fn priority_and_cost<Tx: TransactionMeta + SVMStaticMessage>(
 
 /// Priority value used for pf-floor comparison (dropping excessive load upstream
 /// when the scheduler is saturated).
-pub fn floor_priority<Tx: TransactionMeta + SVMStaticMessage>(
+pub(crate) fn floor_priority<Tx: TransactionMeta + SVMStaticMessage>(
     transaction: &Tx,
     bank: &Bank,
 ) -> Option<u64> {
@@ -77,7 +77,7 @@ pub fn floor_priority<Tx: TransactionMeta + SVMStaticMessage>(
 }
 
 /// [`floor_priority`] starting from raw packet bytes.
-pub fn floor_priority_from_bytes(data: &[u8], bank: &Bank) -> Option<u64> {
+pub(crate) fn floor_priority_from_bytes(data: &[u8], bank: &Bank) -> Option<u64> {
     let enable_instruction_accounts_limit = bank.feature_set.snapshot().limit_instruction_accounts;
     let view = SanitizedTransactionView::try_new_sanitized(data, enable_instruction_accounts_limit)
         .ok()?;

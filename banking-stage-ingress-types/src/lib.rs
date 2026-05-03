@@ -15,12 +15,19 @@ pub type BankingPacketReceiver = Receiver<BankingPacketBatch>;
 ///
 /// When saturated, the scheduler publishes the queue-min transaction's
 /// priority. Sigverify drops at-or-below-floor arrivals. `0` means "not saturated".
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SchedulerPriorityFloor {
     priority_floor: AtomicU64,
 }
 
 impl SchedulerPriorityFloor {
+    /// Construct a new floor in the "not saturated" state (`0`).
+    pub fn new() -> Self {
+        Self {
+            priority_floor: AtomicU64::new(0),
+        }
+    }
+
     /// Publish a new floor (or clear with `0` — `0` is the "not saturated"
     /// sentinel and equivalent to [`Self::clear`]).
     pub fn publish(&self, floor: u64) {
@@ -35,5 +42,11 @@ impl SchedulerPriorityFloor {
     pub fn get(&self) -> Option<u64> {
         let priority_floor = self.priority_floor.load(Ordering::Relaxed);
         (priority_floor != 0).then_some(priority_floor)
+    }
+}
+
+impl Default for SchedulerPriorityFloor {
+    fn default() -> Self {
+        Self::new()
     }
 }
