@@ -48,8 +48,8 @@ const MIN_RTT_STAKED_UNSATURATED: Duration = Duration::from_millis(50);
 
 /// Base MAX_STREAMS at REFERENCE_RTT. At 100ms, 1024 matches the old SWQoS
 /// ceiling for the highest-staked peers; scaling remains linear with RTT.
-const DEFAULT_BASE_MAX_STREAMS_STAKED: u32 = 1024;
-const DEFAULT_BASE_MAX_STREAMS_UNSTAKED: u32 = 20;
+const DEFAULT_BASE_MAX_STREAMS_STAKED: u32 = 10_000;
+const DEFAULT_BASE_MAX_STREAMS_UNSTAKED: u32 = 10_000;
 
 /// Per-key connection counter so compute_max_streams can divide quota evenly.
 pub(crate) struct SwQosMaxStreamsStreamerCounter {
