@@ -46,6 +46,17 @@ pub enum SigVerifyServiceError {
 
 type Result<T> = std::result::Result<T, SigVerifyServiceError>;
 
+/// Bundles the inputs the verifier needs to apply the scheduler-published
+/// pf-floor. When set, the verifier drops at-or-below-floor arrivals using
+/// `banks.working()` to compute priorities consistently with the scheduler
+/// queue. The two fields must be supplied together — making them a single
+/// optional struct keeps that contract structural rather than runtime.
+#[derive(Clone)]
+pub(crate) struct PfFloorChannel {
+    pub floor: Arc<SchedulerPriorityFloor>,
+    pub banks: SharableBanks,
+}
+
 pub struct SigVerifyStage {
     non_vote_thread_hdl: JoinHandle<()>,
     tpu_vote_thread_hdl: JoinHandle<()>,
@@ -287,14 +298,17 @@ impl SigVerifyStage {
             },
             scheduler_priority_floor.clone(),
         );
+        let pf_floor = scheduler_priority_floor.map(|floor| PfFloorChannel {
+            floor,
+            banks: sharable_banks,
+        });
         let non_vote_thread_hdl = Self::verifier_service(
             packet_receiver,
             worker_pool.non_vote_verifier(),
             "solSigVerTpu",
             "tpu-verifier",
             non_vote_stats,
-            Some(sharable_banks),
-            scheduler_priority_floor,
+            pf_floor,
         );
         let tpu_vote_thread_hdl = Self::verifier_service(
             vote_packet_receiver,
@@ -302,7 +316,6 @@ impl SigVerifyStage {
             "solSigVerTpuVot",
             "tpu-vote-verifier",
             tpu_vote_stats,
-            None,
             None,
         );
         let gossip_sigverify_handle = GossipSigVerifyHandle {
@@ -333,8 +346,7 @@ impl SigVerifyStage {
         recvr: &Receiver<PacketBatch>,
         verifier: &mut TransactionSigVerifier,
         stats: &mut SigVerifierStats,
-        sharable_banks: Option<&SharableBanks>,
-        scheduler_priority_floor: Option<&Arc<SchedulerPriorityFloor>>,
+        pf_floor: Option<&PfFloorChannel>,
     ) -> Result<()> {
         const SOFT_RECEIVE_CAP: usize = 5_000;
         let (mut batches, num_packets, recv_duration) =
@@ -359,19 +371,18 @@ impl SigVerifyStage {
         // earlier when the scheduler is saturated. The floor value applied
         // here is forwarded with the batch so the worker can skip its own
         // re-check when the floor hasn't moved up since.
-        let intake_floor = scheduler_priority_floor.and_then(|f| f.get()).unwrap_or(0);
-        if intake_floor > 0 {
-            // SAFETY: when a floor is published, the non-vote verifier_service
-            // path always supplies `sharable_banks`. The vote path passes
-            // `None` for the floor, so we never enter this branch.
-            let banks = sharable_banks.expect("sharable_banks must be set when floor is enforced");
-            let dropped = apply_priority_floor(&mut batches, intake_floor, &banks.working());
-            if dropped > 0 {
-                stats
-                    .total_dropped_below_priority_floor
-                    .fetch_add(dropped, Ordering::Relaxed);
-            }
-        }
+        let intake_floor = pf_floor
+            .and_then(|ctx| ctx.floor.get().map(|floor| (ctx, floor)))
+            .map(|(ctx, floor)| {
+                let dropped = apply_priority_floor(&mut batches, floor, &ctx.banks.working());
+                if dropped > 0 {
+                    stats
+                        .total_dropped_below_priority_floor
+                        .fetch_add(dropped, Ordering::Relaxed);
+                }
+                floor
+            })
+            .unwrap_or(0);
 
         stats.total_dropped_on_capacity +=
             verifier.send_packets_to_worker_pool(batches, intake_floor)?;
@@ -391,8 +402,7 @@ impl SigVerifyStage {
         thread_name: &'static str,
         metrics_name: &'static str,
         mut stats: SigVerifierStats,
-        sharable_banks: Option<SharableBanks>,
-        scheduler_priority_floor: Option<Arc<SchedulerPriorityFloor>>,
+        pf_floor: Option<PfFloorChannel>,
     ) -> JoinHandle<()> {
         let mut last_print = Instant::now();
         const MAX_DEDUPER_AGE: Duration = Duration::from_secs(2);
@@ -412,8 +422,7 @@ impl SigVerifyStage {
                         &packet_receiver,
                         &mut verifier,
                         &mut stats,
-                        sharable_banks.as_ref(),
-                        scheduler_priority_floor.as_ref(),
+                        pf_floor.as_ref(),
                     ) {
                         match e {
                             SigVerifyServiceError::Streamer(StreamerError::RecvTimeout(
