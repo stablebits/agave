@@ -45,10 +45,6 @@ pub(crate) fn priority_and_cost<Tx: TransactionMeta + SVMStaticMessage>(
         .calculate_reward_and_burn_fee_details(&CollectorFeeDetails::from(fee_details))
         .get_deposit();
 
-    // For many transactions, the cost will be greater than the fees in terms of raw lamports.
-    // For the purposes of calculating prioritization, we multiply the fees by a large number so that
-    // the cost is a small fraction.
-    // An offset of 1 is used in the denominator to explicitly avoid division by zero.
     // We need a multiplier here to avoid rounding down too aggressively.
     // For many transactions, the cost will be greater than the fees in terms of raw lamports.
     // For the purposes of calculating prioritization, we multiply the fees by a large number so that

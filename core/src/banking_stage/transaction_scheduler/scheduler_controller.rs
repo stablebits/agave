@@ -1127,3 +1127,81 @@ mod tests {
         assert_eq!(message_hashes, vec![&tx1_hash]);
     }
 }
+
+#[cfg(test)]
+mod saturation_state_tests {
+    use super::*;
+
+    fn buffer_at_guard() -> usize {
+        TOTAL_BUFFERED_PACKETS.saturating_mul(SATURATION_MIN_QUEUE_PCT as usize) / 100
+    }
+
+    fn make_state() -> (SaturationState, Arc<SchedulerPriorityFloor>) {
+        let priority_floor = Arc::new(SchedulerPriorityFloor::new());
+        let state = SaturationState::new(priority_floor.clone());
+        (state, priority_floor)
+    }
+
+    #[test]
+    fn starts_unsaturated() {
+        let (mut state, floor) = make_state();
+        assert!(!state.transition(0, 0));
+        assert!(floor.get().is_none());
+    }
+
+    #[test]
+    fn does_not_enter_when_buffer_below_guard() {
+        let (mut state, floor) = make_state();
+        // Massive overload but buffer is empty — guard rejects entry.
+        assert!(!state.transition(TOKEN_BUCKET_BURST + 1_000_000, 0));
+        assert!(floor.get().is_none());
+    }
+
+    #[test]
+    fn enters_when_overload_and_buffer_at_guard() {
+        let (mut state, _floor) = make_state();
+        // Drain the bucket past empty with buffer at guard — saturated.
+        assert!(state.transition(TOKEN_BUCKET_BURST + 1, buffer_at_guard()));
+    }
+
+    #[test]
+    fn publish_floor_writes_value_when_some() {
+        let (state, floor) = make_state();
+        assert_eq!(state.publish_floor(Some(42)), 42);
+        assert_eq!(floor.get(), Some(42));
+    }
+
+    #[test]
+    fn publish_floor_with_none_clears() {
+        let (state, floor) = make_state();
+        state.publish_floor(Some(42));
+        assert_eq!(floor.get(), Some(42));
+        assert_eq!(state.publish_floor(None), 0);
+        assert!(floor.get().is_none());
+    }
+
+    #[test]
+    fn exits_when_buffer_drops_below_guard() {
+        let (mut state, floor) = make_state();
+        assert!(state.transition(TOKEN_BUCKET_BURST + 1, buffer_at_guard()));
+        state.publish_floor(Some(100));
+        assert_eq!(floor.get(), Some(100));
+
+        // Buffer drains below guard — exits, floor cleared.
+        assert!(!state.transition(0, 0));
+        assert!(floor.get().is_none());
+    }
+
+    #[test]
+    fn drop_clears_floor() {
+        // The floor outlives the controller (it's shared with sigverify), so
+        // tear-down must clear any stale value.
+        let priority_floor = Arc::new(SchedulerPriorityFloor::new());
+        {
+            let state = SaturationState::new(priority_floor.clone());
+            state.publish_floor(Some(123));
+            assert_eq!(priority_floor.get(), Some(123));
+        }
+        assert!(priority_floor.get().is_none());
+    }
+}
