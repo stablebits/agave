@@ -89,3 +89,107 @@ pub fn floor_priority_from_bytes(data: &[u8], bank: &Bank) -> Option<u64> {
     .ok()?;
     floor_priority(&runtime_tx, bank)
 }
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::banking_stage::tests::create_slow_genesis_config,
+        solana_compute_budget_interface::ComputeBudgetInstruction,
+        solana_hash::Hash,
+        solana_keypair::Keypair,
+        solana_ledger::genesis_utils::GenesisConfigInfo,
+        solana_message::Message,
+        solana_pubkey::Pubkey,
+        solana_signer::Signer,
+        solana_system_interface::instruction as system_instruction,
+        solana_transaction::{Transaction, versioned::VersionedTransaction},
+        std::sync::Arc,
+    };
+
+    fn test_bank_with_lamports_per_signature(lamports_per_signature: u64) -> (Arc<Bank>, Keypair) {
+        let GenesisConfigInfo {
+            mut genesis_config,
+            mint_keypair,
+            ..
+        } = create_slow_genesis_config(u64::MAX);
+        if lamports_per_signature > 0 {
+            genesis_config.fee_rate_governor =
+                solana_fee_calculator::FeeRateGovernor::new(lamports_per_signature, 0);
+        }
+        let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+        (bank, mint_keypair)
+    }
+
+    fn test_bank() -> (Arc<Bank>, Keypair) {
+        test_bank_with_lamports_per_signature(0)
+    }
+
+    fn make_tx_bytes(mint: &Keypair, recent_blockhash: Hash, compute_unit_price: u64) -> Vec<u8> {
+        let to = Pubkey::new_unique();
+        let transfer = system_instruction::transfer(&mint.pubkey(), &to, 1);
+        let prioritization = ComputeBudgetInstruction::set_compute_unit_price(compute_unit_price);
+        let message = Message::new(&[transfer, prioritization], Some(&mint.pubkey()));
+        let tx = Transaction::new(&[mint], message, recent_blockhash);
+        bincode::serialize(&VersionedTransaction::from(tx)).unwrap()
+    }
+
+    #[test]
+    fn floor_priority_from_bytes_returns_none_for_garbage() {
+        let (bank, _) = test_bank();
+        assert!(floor_priority_from_bytes(&[], &bank).is_none());
+        assert!(floor_priority_from_bytes(&[0u8; 32], &bank).is_none());
+    }
+
+    #[test]
+    fn priority_is_zero_when_base_and_priority_fees_are_zero() {
+        // Test bank has lamports_per_signature = 0, so base fee is 0.
+        // With compute_unit_price = 0, priority fee is also 0 → reward 0 → priority 0.
+        let (bank, mint) = test_bank();
+        assert_eq!(bank.fee_structure().lamports_per_signature, 0);
+        let bytes = make_tx_bytes(&mint, bank.last_blockhash(), 0);
+        let priority = floor_priority_from_bytes(&bytes, &bank).unwrap();
+        assert_eq!(priority, 0);
+    }
+
+    #[test]
+    fn higher_compute_unit_price_yields_higher_priority() {
+        // Need non-zero base fee, otherwise the reward short-circuits to 0
+        // and all priorities collapse regardless of compute_unit_price.
+        let (bank, mint) = test_bank_with_lamports_per_signature(5_000);
+        let low = floor_priority_from_bytes(&make_tx_bytes(&mint, bank.last_blockhash(), 1), &bank)
+            .unwrap();
+        let high = floor_priority_from_bytes(
+            &make_tx_bytes(&mint, bank.last_blockhash(), 1_000_000),
+            &bank,
+        )
+        .unwrap();
+        assert!(high > low, "expected high {high} > low {low}");
+    }
+
+    #[test]
+    fn floor_priority_from_bytes_matches_typed_path() {
+        // The bytes-path and the typed-path must agree on the same packet,
+        // since the scheduler-side queue priority is computed via the typed
+        // path and the sigverify-side floor check via the bytes path.
+        let (bank, mint) = test_bank();
+        let bytes = make_tx_bytes(&mint, bank.last_blockhash(), 100);
+
+        let from_bytes = floor_priority_from_bytes(&bytes, &bank).unwrap();
+
+        let view = SanitizedTransactionView::try_new_sanitized(
+            &bytes[..],
+            bank.feature_set.snapshot().limit_instruction_accounts,
+        )
+        .unwrap();
+        let runtime_tx = RuntimeTransaction::<SanitizedTransactionView<_>>::try_new(
+            view,
+            MessageHash::Compute,
+            None,
+        )
+        .unwrap();
+        let from_typed = floor_priority(&runtime_tx, &bank).unwrap();
+
+        assert_eq!(from_bytes, from_typed);
+    }
+}
