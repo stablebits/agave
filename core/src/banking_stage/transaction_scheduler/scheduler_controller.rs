@@ -130,14 +130,10 @@ impl SaturationState {
         self.saturated
     }
 
-    /// Publish the floor (or clear if `floor` is `None` / `0`). Caller
+    /// Publish the floor (or clear if `floor` is `0`). Caller
     /// invokes this only after [`Self::transition`] reports `needs_floor`.
-    /// Returns the value just published (`0` when nothing usable was
-    /// available — queue empty or queue-min priority was zero).
-    fn publish_floor(&self, floor: Option<u64>) -> u64 {
-        let floor = floor.unwrap_or(0);
+    fn publish_floor(&self, floor: u64) {
         self.priority_floor.publish(floor);
-        floor
     }
 }
 
@@ -381,14 +377,12 @@ where
         let buffer_size = self.container.buffer_size();
         let needs_floor = self.saturation_state.transition(num_received, buffer_size);
         let priority_floor = if needs_floor {
-            // The queue-min priority — same value sigverify computes against
-            // arrivals (both use bank-context via `priority_and_cost`).
             let floor = self
                 .container
                 .get_min_max_priority()
-                .map(|(min, _)| min)
-                .filter(|&f| f > 0);
-            self.saturation_state.publish_floor(floor)
+                .map_or(0, |(min, _)| min);
+            self.saturation_state.publish_floor(floor);
+            floor
         } else {
             0
         };
@@ -1167,16 +1161,16 @@ mod saturation_state_tests {
     #[test]
     fn publish_floor_writes_value_when_some() {
         let (state, floor) = make_state();
-        assert_eq!(state.publish_floor(Some(42)), 42);
+        state.publish_floor(42);
         assert_eq!(floor.get(), Some(42));
     }
 
     #[test]
     fn publish_floor_with_none_clears() {
         let (state, floor) = make_state();
-        state.publish_floor(Some(42));
+        state.publish_floor(42);
         assert_eq!(floor.get(), Some(42));
-        assert_eq!(state.publish_floor(None), 0);
+        state.publish_floor(0);
         assert!(floor.get().is_none());
     }
 
@@ -1184,7 +1178,7 @@ mod saturation_state_tests {
     fn exits_when_buffer_drops_below_guard() {
         let (mut state, floor) = make_state();
         assert!(state.transition(TOKEN_BUCKET_BURST + 1, buffer_at_guard()));
-        state.publish_floor(Some(100));
+        state.publish_floor(100);
         assert_eq!(floor.get(), Some(100));
 
         // Buffer drains below guard — exits, floor cleared.
@@ -1199,7 +1193,7 @@ mod saturation_state_tests {
         let priority_floor = Arc::new(SchedulerPriorityFloor::new());
         {
             let state = SaturationState::new(priority_floor.clone());
-            state.publish_floor(Some(123));
+            state.publish_floor(123);
             assert_eq!(priority_floor.get(), Some(123));
         }
         assert!(priority_floor.get().is_none());

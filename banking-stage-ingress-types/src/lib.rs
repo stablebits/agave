@@ -28,14 +28,13 @@ impl SchedulerPriorityFloor {
         }
     }
 
-    /// Publish a new floor (or clear with `0` — `0` is the "not saturated"
-    /// sentinel and equivalent to [`Self::clear`]).
+    /// Publish a new floor or clear with `0`.
     pub fn publish(&self, floor: u64) {
         self.priority_floor.store(floor, Ordering::Relaxed);
     }
 
     pub fn clear(&self) {
-        self.priority_floor.store(0, Ordering::Relaxed);
+        self.publish(0);
     }
 
     /// Currently-published floor, or `None` if not saturated.
