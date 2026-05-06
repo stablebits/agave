@@ -24,7 +24,6 @@ use {
     solana_clock::DEFAULT_MS_PER_SLOT,
     solana_cost_model::cost_tracker::SharedBlockCost,
     solana_measure::measure_us,
-    solana_net_utils::token_bucket::TokenBucket,
     solana_runtime::bank_forks::SharableBanks,
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
     std::{
@@ -39,17 +38,13 @@ use {
 
 const CHECK_CHUNK: usize = 128;
 
-/// Token-bucket refill rate (packets per second) for the pf-floor saturation
-/// signal. Approximates the rate at which the scheduler can drain its
-/// receive+parse+schedule loop.
-const TOKEN_BUCKET_REFILL_TPS: u64 = 100_000;
-/// Token-bucket burst capacity (packets). Controls how much of a short-term
-/// spike is absorbed before saturation triggers.
-const TOKEN_BUCKET_BURST: u64 = 25_000;
-/// AND-guard on saturation entry: require the scheduler queue to hold at
-/// least this percentage of `TOTAL_BUFFERED_PACKETS` before the token bucket
-/// is allowed to drive saturation.
-const SATURATION_MIN_QUEUE_PCT: u8 = 90;
+/// Publish the pf-floor once the scheduler's retained transaction buffer is
+/// this full. Capacity is enforced on the buffer, not just the priority queue:
+/// scheduled/in-flight transactions still occupy buffer space until workers
+/// finish them.
+const SATURATION_BUFFER_PCT: u8 = 99;
+/// Clear the pf-floor once the retained buffer drains below this watermark.
+const DESATURATION_BUFFER_PCT: u8 = 95;
 
 #[derive(Clone)]
 pub struct SchedulerConfig {
@@ -76,68 +71,45 @@ struct SaturationState {
     priority_floor: Arc<SchedulerPriorityFloor>,
     /// Hysteresis latch for the saturation state.
     saturated: bool,
-    /// Drives the saturation signal: depleted by arrivals, refilled at a
-    /// fixed TPS.
-    token_bucket: TokenBucket,
-    /// AND-guard on saturation entry:
-    /// Uses buffer size rather than priority-queue size so saturation stays
-    /// active while the scheduler is actively scheduling and the priority
-    /// queue is momentarily near-empty.
-    buffer_guard_threshold: usize,
-    /// Token-bucket level at which saturation de-asserts (hysteresis).
-    desaturate_tokens_threshold: u64,
+    saturation_watermark: usize,
+    desaturation_watermark: usize,
 }
 
 impl SaturationState {
     fn new(priority_floor: Arc<SchedulerPriorityFloor>) -> Self {
-        let token_bucket = TokenBucket::new(
-            TOKEN_BUCKET_BURST,
-            TOKEN_BUCKET_BURST,
-            TOKEN_BUCKET_REFILL_TPS as f64,
-        );
-        let buffer_guard_threshold =
-            TOTAL_BUFFERED_PACKETS.saturating_mul(SATURATION_MIN_QUEUE_PCT as usize) / 100;
-        let desaturate_tokens_threshold = TOKEN_BUCKET_BURST.saturating_div(2);
+        let saturation_watermark =
+            TOTAL_BUFFERED_PACKETS.saturating_mul(SATURATION_BUFFER_PCT as usize) / 100;
+        let desaturation_watermark =
+            TOTAL_BUFFERED_PACKETS.saturating_mul(DESATURATION_BUFFER_PCT as usize) / 100;
         Self {
             priority_floor,
             saturated: false,
-            token_bucket,
-            buffer_guard_threshold,
-            desaturate_tokens_threshold,
+            saturation_watermark,
+            desaturation_watermark,
         }
     }
 
-    /// Update token-bucket / hysteresis state from this tick's arrivals.
-    /// Returns `needs_floor=true` iff the state is now saturated and the
-    /// caller must compute and pass a floor to [`Self::publish_floor`].
-    fn transition(&mut self, num_received: u64, buffer_size: usize) -> bool {
-        let consumed = self.token_bucket.consume_tokens_saturating(num_received);
-        let buffer_guard_met = buffer_size >= self.buffer_guard_threshold;
-
+    /// Update the buffer-watermark latch.
+    ///
+    /// Returns `needs_floor=true` iff the state is saturated and the caller
+    /// must compute and publish a queue-min floor.
+    fn update(&mut self, buffer_size: usize) -> bool {
         if self.saturated {
-            // Exit when the bucket has refilled past the threshold, or the
-            // buffer has drained below the guard (pressure is gone).
-            if self.token_bucket.current_tokens() >= self.desaturate_tokens_threshold
-                || !buffer_guard_met
-            {
+            if buffer_size < self.desaturation_watermark {
                 self.saturated = false;
                 self.priority_floor.clear();
             }
-        } else if num_received > consumed && buffer_guard_met {
+        } else if buffer_size >= self.saturation_watermark {
             self.saturated = true;
         }
 
         self.saturated
     }
 
-    /// Publish the floor (or clear if `floor` is `None` / `0`). Caller
-    /// invokes this only after [`Self::transition`] reports `needs_floor`.
-    /// Returns the value just published (`0` when nothing usable was
-    /// available — queue empty or queue-min priority was zero).
-    fn publish_floor(&self, floor: Option<u64>) -> u64 {
-        let floor = floor.unwrap_or(0);
+    /// Publish the floor (or clear if `floor` is `0`). Caller
+    /// invokes this only after [`Self::update`] reports `needs_floor`.
+    fn publish_floor(&self, floor: u64) {
         self.priority_floor.publish(floor);
-        floor
     }
 }
 
@@ -295,7 +267,7 @@ where
                     timing_metrics.clean_time_us += clean_time_us;
                 });
             }
-            let receiving_stats = self.receive_and_buffer_packets(&decision).map_err(|_| {
+            self.receive_and_buffer_packets(&decision).map_err(|_| {
                 SchedulerError::DisconnectedRecvChannel("receive and buffer disconnected")
             })?;
             // Report metrics only if there is data.
@@ -305,7 +277,7 @@ where
             self.count_metrics.update(|count_metrics| {
                 count_metrics.update_priority_stats(priority_min_max);
             });
-            self.update_scheduler_priority_floor(receiving_stats.num_received as u64);
+            self.update_scheduler_priority_floor();
             self.count_metrics
                 .maybe_report_and_reset_interval(should_report);
             self.timing_metrics
@@ -368,27 +340,19 @@ where
 
     /// Update the scheduler-published pf-floor.
     ///
-    /// Saturation is driven by a token bucket fed at a fixed TPS and consumed
-    /// by `num_received`, AND-guarded by a minimum buffer occupancy so we
-    /// don't publish a floor derived from a near-empty queue. The published
-    /// floor is the queue-min tx's [`floor_priority`] — the same function
-    /// sigverify runs on arrivals, so both compare in identical units.
-    ///
-    /// Semantics: "drop arrivals that are worse than what we'd evict
-    /// anyway." Self-stabilizing — as the queue evicts low-priority entries
-    /// the floor rises with queue-min; as the queue drains it falls.
-    fn update_scheduler_priority_floor(&mut self, num_received: u64) {
+    /// Semantics: when the retained scheduler buffer is nearly full, drop
+    /// arrivals that are at-or-below the current queue-min priority, i.e. no
+    /// better than what the bounded scheduler candidate set would evict.
+    fn update_scheduler_priority_floor(&mut self) {
         let buffer_size = self.container.buffer_size();
-        let needs_floor = self.saturation_state.transition(num_received, buffer_size);
+        let needs_floor = self.saturation_state.update(buffer_size);
         let priority_floor = if needs_floor {
-            // The queue-min priority — same value sigverify computes against
-            // arrivals (both use bank-context via `priority_and_cost`).
             let floor = self
                 .container
                 .get_min_max_priority()
-                .map(|(min, _)| min)
-                .filter(|&f| f > 0);
-            self.saturation_state.publish_floor(floor)
+                .map_or(0, |(min, _)| min);
+            self.saturation_state.publish_floor(floor);
+            floor
         } else {
             0
         };
@@ -1132,8 +1096,12 @@ mod tests {
 mod saturation_state_tests {
     use super::*;
 
-    fn buffer_at_guard() -> usize {
-        TOTAL_BUFFERED_PACKETS.saturating_mul(SATURATION_MIN_QUEUE_PCT as usize) / 100
+    fn saturation_watermark() -> usize {
+        TOTAL_BUFFERED_PACKETS.saturating_mul(SATURATION_BUFFER_PCT as usize) / 100
+    }
+
+    fn desaturation_watermark() -> usize {
+        TOTAL_BUFFERED_PACKETS.saturating_mul(DESATURATION_BUFFER_PCT as usize) / 100
     }
 
     fn make_state() -> (SaturationState, Arc<SchedulerPriorityFloor>) {
@@ -1145,50 +1113,58 @@ mod saturation_state_tests {
     #[test]
     fn starts_unsaturated() {
         let (mut state, floor) = make_state();
-        assert!(!state.transition(0, 0));
+        assert!(!state.update(0));
         assert!(floor.get().is_none());
     }
 
     #[test]
-    fn does_not_enter_when_buffer_below_guard() {
+    fn does_not_enter_when_buffer_below_saturation_watermark() {
         let (mut state, floor) = make_state();
-        // Massive overload but buffer is empty — guard rejects entry.
-        assert!(!state.transition(TOKEN_BUCKET_BURST + 1_000_000, 0));
+        assert!(!state.update(saturation_watermark() - 1));
         assert!(floor.get().is_none());
     }
 
     #[test]
-    fn enters_when_overload_and_buffer_at_guard() {
+    fn enters_when_buffer_reaches_saturation_watermark() {
         let (mut state, _floor) = make_state();
-        // Drain the bucket past empty with buffer at guard — saturated.
-        assert!(state.transition(TOKEN_BUCKET_BURST + 1, buffer_at_guard()));
+        assert!(state.update(saturation_watermark()));
     }
 
     #[test]
     fn publish_floor_writes_value_when_some() {
         let (state, floor) = make_state();
-        assert_eq!(state.publish_floor(Some(42)), 42);
+        state.publish_floor(42);
         assert_eq!(floor.get(), Some(42));
     }
 
     #[test]
-    fn publish_floor_with_none_clears() {
+    fn publish_floor_with_zero_clears() {
         let (state, floor) = make_state();
-        state.publish_floor(Some(42));
+        state.publish_floor(42);
         assert_eq!(floor.get(), Some(42));
-        assert_eq!(state.publish_floor(None), 0);
+        state.publish_floor(0);
         assert!(floor.get().is_none());
     }
 
     #[test]
-    fn exits_when_buffer_drops_below_guard() {
+    fn stays_saturated_at_desaturation_watermark() {
         let (mut state, floor) = make_state();
-        assert!(state.transition(TOKEN_BUCKET_BURST + 1, buffer_at_guard()));
-        state.publish_floor(Some(100));
+        assert!(state.update(saturation_watermark()));
+        state.publish_floor(100);
         assert_eq!(floor.get(), Some(100));
 
-        // Buffer drains below guard — exits, floor cleared.
-        assert!(!state.transition(0, 0));
+        assert!(state.update(desaturation_watermark()));
+        assert_eq!(floor.get(), Some(100));
+    }
+
+    #[test]
+    fn exits_when_buffer_drops_below_desaturation_watermark() {
+        let (mut state, floor) = make_state();
+        assert!(state.update(saturation_watermark()));
+        state.publish_floor(100);
+        assert_eq!(floor.get(), Some(100));
+
+        assert!(!state.update(desaturation_watermark() - 1));
         assert!(floor.get().is_none());
     }
 
@@ -1199,7 +1175,7 @@ mod saturation_state_tests {
         let priority_floor = Arc::new(SchedulerPriorityFloor::new());
         {
             let state = SaturationState::new(priority_floor.clone());
-            state.publish_floor(Some(123));
+            state.publish_floor(123);
             assert_eq!(priority_floor.get(), Some(123));
         }
         assert!(priority_floor.get().is_none());
