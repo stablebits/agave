@@ -29,7 +29,7 @@ use {
 /// from user input. They should never be zero.
 /// Any difference in the prioritization is negligible for
 /// the current transaction costs.
-pub(crate) fn priority_and_cost<Tx: TransactionMeta + SVMStaticMessage>(
+pub(crate) fn calculate_priority_and_cost<Tx: TransactionMeta + SVMStaticMessage>(
     transaction: &Tx,
     transaction_configuration: &TransactionConfiguration,
     bank: &Bank,
@@ -61,19 +61,19 @@ pub(crate) fn priority_and_cost<Tx: TransactionMeta + SVMStaticMessage>(
 
 /// Priority value used for pf-floor comparison (dropping excessive load upstream
 /// when the scheduler is saturated).
-pub(crate) fn floor_priority<Tx: TransactionMeta + SVMStaticMessage>(
+pub(crate) fn calculate_floor_priority<Tx: TransactionMeta + SVMStaticMessage>(
     transaction: &Tx,
     bank: &Bank,
 ) -> Option<u64> {
     let transaction_configuration = transaction
         .transaction_configuration(&bank.feature_set)
         .ok()?;
-    let (priority, _cost) = priority_and_cost(transaction, &transaction_configuration, bank);
+    let (priority, _cost) = calculate_priority_and_cost(transaction, &transaction_configuration, bank);
     Some(priority)
 }
 
-/// [`floor_priority`] starting from raw packet bytes.
-pub(crate) fn floor_priority_from_bytes(data: &[u8], bank: &Bank) -> Option<u64> {
+/// [`calculate_floor_priority`] starting from raw packet bytes.
+pub(crate) fn calculate_floor_priority_from_bytes(data: &[u8], bank: &Bank) -> Option<u64> {
     let enable_instruction_accounts_limit = bank.feature_set.snapshot().limit_instruction_accounts;
     let view = SanitizedTransactionView::try_new_sanitized(data, enable_instruction_accounts_limit)
         .ok()?;
@@ -83,7 +83,7 @@ pub(crate) fn floor_priority_from_bytes(data: &[u8], bank: &Bank) -> Option<u64>
         None,
     )
     .ok()?;
-    floor_priority(&runtime_tx, bank)
+    calculate_floor_priority(&runtime_tx, bank)
 }
 
 #[cfg(test)]
@@ -133,8 +133,8 @@ mod tests {
     #[test]
     fn floor_priority_from_bytes_returns_none_for_garbage() {
         let (bank, _) = test_bank();
-        assert!(floor_priority_from_bytes(&[], &bank).is_none());
-        assert!(floor_priority_from_bytes(&[0u8; 32], &bank).is_none());
+        assert!(calculate_floor_priority_from_bytes(&[], &bank).is_none());
+        assert!(calculate_floor_priority_from_bytes(&[0u8; 32], &bank).is_none());
     }
 
     #[test]
@@ -144,7 +144,7 @@ mod tests {
         let (bank, mint) = test_bank();
         assert_eq!(bank.fee_structure().lamports_per_signature, 0);
         let bytes = make_tx_bytes(&mint, bank.last_blockhash(), 0);
-        let priority = floor_priority_from_bytes(&bytes, &bank).unwrap();
+        let priority = calculate_floor_priority_from_bytes(&bytes, &bank).unwrap();
         assert_eq!(priority, 0);
     }
 
@@ -153,9 +153,9 @@ mod tests {
         // Need non-zero base fee, otherwise the reward short-circuits to 0
         // and all priorities collapse regardless of compute_unit_price.
         let (bank, mint) = test_bank_with_lamports_per_signature(5_000);
-        let low = floor_priority_from_bytes(&make_tx_bytes(&mint, bank.last_blockhash(), 1), &bank)
+        let low = calculate_floor_priority_from_bytes(&make_tx_bytes(&mint, bank.last_blockhash(), 1), &bank)
             .unwrap();
-        let high = floor_priority_from_bytes(
+        let high = calculate_floor_priority_from_bytes(
             &make_tx_bytes(&mint, bank.last_blockhash(), 1_000_000),
             &bank,
         )
@@ -171,7 +171,7 @@ mod tests {
         let (bank, mint) = test_bank();
         let bytes = make_tx_bytes(&mint, bank.last_blockhash(), 100);
 
-        let from_bytes = floor_priority_from_bytes(&bytes, &bank).unwrap();
+        let from_bytes = calculate_floor_priority_from_bytes(&bytes, &bank).unwrap();
 
         let view = SanitizedTransactionView::try_new_sanitized(
             &bytes[..],
@@ -184,7 +184,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let from_typed = floor_priority(&runtime_tx, &bank).unwrap();
+        let from_typed = calculate_floor_priority(&runtime_tx, &bank).unwrap();
 
         assert_eq!(from_bytes, from_typed);
     }

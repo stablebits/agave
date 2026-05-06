@@ -9,7 +9,7 @@ use {
     },
     crate::banking_stage::{
         consumer::Consumer, decision_maker::BufferedPacketsDecision, scheduler_messages::MaxAge,
-        scheduler_priority::priority_and_cost,
+        scheduler_priority::calculate_priority_and_cost,
     },
     agave_banking_stage_ingress_types::{BankingPacketBatch, BankingPacketReceiver},
     agave_transaction_view::{
@@ -439,7 +439,7 @@ impl TransactionViewReceiveAndBuffer {
         };
 
         let max_age = calculate_max_age(root_bank.epoch(), deactivation_slot, root_bank.slot());
-        let (priority, cost) = priority_and_cost(&view, &transaction_configuration, working_bank);
+        let (priority, cost) = calculate_priority_and_cost(&view, &transaction_configuration, working_bank);
 
         Ok(TransactionState::new(view, max_age, priority, cost))
     }
