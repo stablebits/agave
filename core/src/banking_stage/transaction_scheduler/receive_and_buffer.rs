@@ -439,7 +439,8 @@ impl TransactionViewReceiveAndBuffer {
         };
 
         let max_age = calculate_max_age(root_bank.epoch(), deactivation_slot, root_bank.slot());
-        let (priority, cost) = calculate_priority_and_cost(&view, &transaction_configuration, working_bank);
+        let (priority, cost) =
+            calculate_priority_and_cost(&view, &transaction_configuration, working_bank);
 
         Ok(TransactionState::new(view, max_age, priority, cost))
     }

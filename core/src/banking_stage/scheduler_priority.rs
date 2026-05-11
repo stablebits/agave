@@ -68,7 +68,8 @@ pub(crate) fn calculate_floor_priority<Tx: TransactionMeta + SVMStaticMessage>(
     let transaction_configuration = transaction
         .transaction_configuration(&bank.feature_set)
         .ok()?;
-    let (priority, _cost) = calculate_priority_and_cost(transaction, &transaction_configuration, bank);
+    let (priority, _cost) =
+        calculate_priority_and_cost(transaction, &transaction_configuration, bank);
     Some(priority)
 }
 
@@ -153,8 +154,11 @@ mod tests {
         // Need non-zero base fee, otherwise the reward short-circuits to 0
         // and all priorities collapse regardless of compute_unit_price.
         let (bank, mint) = test_bank_with_lamports_per_signature(5_000);
-        let low = calculate_floor_priority_from_bytes(&make_tx_bytes(&mint, bank.last_blockhash(), 1), &bank)
-            .unwrap();
+        let low = calculate_floor_priority_from_bytes(
+            &make_tx_bytes(&mint, bank.last_blockhash(), 1),
+            &bank,
+        )
+        .unwrap();
         let high = calculate_floor_priority_from_bytes(
             &make_tx_bytes(&mint, bank.last_blockhash(), 1_000_000),
             &bank,
