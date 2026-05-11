@@ -6,7 +6,7 @@
 
 use {
     crate::{
-        banking_stage::scheduler_priority::floor_priority_from_bytes,
+        banking_stage::scheduler_priority::calculate_floor_priority_from_bytes,
         banking_trace::BankingPacketSender,
         sigverify::{
             GossipSigVerifier, GossipVerifiedVoteBatch, SigVerifyWorkerPool, SigVerifyWorkerStats,
@@ -231,7 +231,7 @@ pub(crate) fn apply_priority_floor_to_batch(
             any_kept = true;
             continue;
         };
-        match floor_priority_from_bytes(data, bank) {
+        match calculate_floor_priority_from_bytes(data, bank) {
             Some(priority) if priority <= floor => {
                 packet.meta_mut().set_discard(true);
                 dropped = dropped.saturating_add(1);
