@@ -85,9 +85,11 @@ pub(crate) trait StateContainer<Tx: TransactionWithMeta> {
         }
     }
 
-    /// Pushes transaction ids into the priority queue. If the queue if full,
-    /// the lowest priority transactions will be dropped (removed from the
-    /// queue and map) **after** all ids have been pushed.
+    /// Pushes transaction ids into the priority queue. If the buffer is
+    /// full, the lowest-priority transactions are dropped (removed from
+    /// the queue and the map). A newcomer that would be the new
+    /// queue-min is dropped immediately rather than inserted and then
+    /// evicted, which saves the priority-queue insert/pop dance.
     /// To avoid allocating, the caller should not push more than
     /// [`EXTRA_CAPACITY`] ids in a call.
     /// Returns the number of dropped transactions.
@@ -161,24 +163,47 @@ impl<Tx: TransactionWithMeta> StateContainer<Tx> for TransactionStateContainer<T
         &mut self,
         priority_ids: impl Iterator<Item = TransactionPriorityId>,
     ) -> usize {
+        // `BTreeSet::first` is O(log n), so we cache the queue-min across the
+        // loop and refresh it only when an eviction actually changes it. The
+        // "drop below-min newcomer" path becomes 0 BTreeSet operations.
+        let mut queue_min = self.priority_queue.first().copied();
+        let mut num_dropped = 0;
         for id in priority_ids {
-            self.priority_queue.insert(id);
+            // Fast path: buffer has room — just insert.
+            //
+            // The `id_to_transaction_state` map can hold more entries than
+            // `priority_queue` (scheduled/in-flight transactions stay in the
+            // map but are popped from the queue), so capacity is enforced on
+            // the map's length.
+            if self.id_to_transaction_state.len() <= self.capacity {
+                self.priority_queue.insert(id);
+                queue_min = match queue_min {
+                    Some(m) if m < id => Some(m),
+                    _ => Some(id),
+                };
+                continue;
+            }
+            // Buffer is over capacity. Drop either the current queue-min or
+            // the newcomer, whichever has lower priority — this avoids the
+            // wasted insert-then-immediately-evict for newcomers below the
+            // current queue-min.
+            match queue_min {
+                Some(min) if min < id => {
+                    // Existing min is lower priority — evict it, accept newcomer.
+                    self.priority_queue.pop_first();
+                    self.priority_queue.insert(id);
+                    self.id_to_transaction_state.remove(min.id);
+                    // Cache is stale after the swap — refresh once.
+                    queue_min = self.priority_queue.first().copied();
+                }
+                _ => {
+                    // Newcomer is the new min (or queue is empty) — drop it
+                    // without touching priority_queue. queue_min unchanged.
+                    self.id_to_transaction_state.remove(id.id);
+                }
+            }
+            num_dropped += 1;
         }
-
-        // The number of items in the `id_to_transaction_state` map is
-        // greater than or equal to the number of elements in the queue.
-        // To avoid the map going over capacity, we use the length of the
-        // map here instead of the queue.
-        let num_dropped = self
-            .id_to_transaction_state
-            .len()
-            .saturating_sub(self.capacity);
-
-        for _ in 0..num_dropped {
-            let priority_id = self.priority_queue.pop_first().expect("queue is not empty");
-            self.id_to_transaction_state.remove(priority_id.id);
-        }
-
         num_dropped
     }
 
