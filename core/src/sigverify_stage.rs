@@ -87,7 +87,7 @@ struct SigVerifierStats {
 }
 
 impl SigVerifierStats {
-    const REPORT_INTERVAL: Duration = Duration::from_secs(2);
+    const REPORT_INTERVAL: Duration = Duration::from_millis(100);
 
     fn maybe_report_and_reset(&mut self, name: &'static str) {
         // No need to report a datapoint if no batches/packets received
