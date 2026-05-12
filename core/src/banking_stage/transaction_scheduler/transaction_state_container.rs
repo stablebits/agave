@@ -40,6 +40,10 @@ pub(crate) struct TransactionStateContainer<Tx: TransactionWithMeta> {
     priority_queue: BTreeSet<TransactionPriorityId>,
     id_to_transaction_state: Slab<TransactionState<Tx>>,
     held_transactions: Vec<TransactionPriorityId>,
+    /// Cached lowest-priority entry. `None` means "stale, recompute on next
+    /// read". `BTreeSet::first` is O(log n) (leftmost-spine descent), so we
+    /// avoid calling it on every push when the min hasn't changed.
+    queue_min_cache: Option<TransactionPriorityId>,
 }
 
 pub(crate) trait StateContainer<Tx: TransactionWithMeta> {
@@ -127,6 +131,7 @@ impl<Tx: TransactionWithMeta> StateContainer<Tx> for TransactionStateContainer<T
             priority_queue: BTreeSet::new(),
             id_to_transaction_state: Slab::with_capacity(capacity + EXTRA_CAPACITY),
             held_transactions: Vec::with_capacity(capacity),
+            queue_min_cache: None,
         }
     }
 
@@ -143,7 +148,15 @@ impl<Tx: TransactionWithMeta> StateContainer<Tx> for TransactionStateContainer<T
     }
 
     fn pop(&mut self) -> Option<TransactionPriorityId> {
-        self.priority_queue.pop_last()
+        let result = self.priority_queue.pop_last();
+        // `pop_last` removes the max, not the min, so the cached min usually
+        // stays valid. The exception is when this pop empties the queue —
+        // then the cached entry no longer exists; invalidate so a future
+        // read recomputes (and yields `None`).
+        if self.priority_queue.is_empty() {
+            self.queue_min_cache = None;
+        }
+        result
     }
 
     fn get_mut_transaction_state(
@@ -163,10 +176,6 @@ impl<Tx: TransactionWithMeta> StateContainer<Tx> for TransactionStateContainer<T
         &mut self,
         priority_ids: impl Iterator<Item = TransactionPriorityId>,
     ) -> usize {
-        // `BTreeSet::first` is O(log n), so we cache the queue-min across the
-        // loop and refresh it only when an eviction actually changes it. The
-        // "drop below-min newcomer" path becomes 0 BTreeSet operations.
-        let mut queue_min = self.priority_queue.first().copied();
         let mut num_dropped = 0;
         for id in priority_ids {
             // Fast path: buffer has room — just insert.
@@ -177,28 +186,36 @@ impl<Tx: TransactionWithMeta> StateContainer<Tx> for TransactionStateContainer<T
             // the map's length.
             if self.id_to_transaction_state.len() <= self.capacity {
                 self.priority_queue.insert(id);
-                queue_min = match queue_min {
-                    Some(m) if m < id => Some(m),
-                    _ => Some(id),
-                };
+                // Only update cache if we have a fresh value to compare against.
+                // If the cache is None (stale after a prior eviction), leave it
+                // None — `queue_min()` will recompute lazily on the next read.
+                // Setting it to `Some(id)` here without knowing the actual min
+                // would be wrong: `id` may be greater than other queue entries.
+                if let Some(m) = self.queue_min_cache {
+                    if id < m {
+                        self.queue_min_cache = Some(id);
+                    }
+                }
                 continue;
             }
             // Buffer is over capacity. Drop either the current queue-min or
             // the newcomer, whichever has lower priority — this avoids the
             // wasted insert-then-immediately-evict for newcomers below the
             // current queue-min.
-            match queue_min {
+            match self.queue_min() {
                 Some(min) if min < id => {
                     // Existing min is lower priority — evict it, accept newcomer.
                     self.priority_queue.pop_first();
                     self.priority_queue.insert(id);
                     self.id_to_transaction_state.remove(min.id);
-                    // Cache is stale after the swap — refresh once.
-                    queue_min = self.priority_queue.first().copied();
+                    // Cache is stale after the swap. Invalidate so the next
+                    // read recomputes lazily — avoids a `first()` now if we
+                    // never need the min again in this loop.
+                    self.queue_min_cache = None;
                 }
                 _ => {
                     // Newcomer is the new min (or queue is empty) — drop it
-                    // without touching priority_queue. queue_min unchanged.
+                    // without touching priority_queue. Cache unchanged.
                     self.id_to_transaction_state.remove(id.id);
                 }
             }
@@ -213,10 +230,14 @@ impl<Tx: TransactionWithMeta> StateContainer<Tx> for TransactionStateContainer<T
 
     fn remove_by_id(&mut self, id: TransactionId) {
         let state = self.id_to_transaction_state.remove(id);
+        let priority_id = TransactionPriorityId::new(state.priority(), id);
         // Remove from queue if present. May not be present if the transaction was already popped
         // (in-flight/scheduling).
-        self.priority_queue
-            .remove(&TransactionPriorityId::new(state.priority(), id));
+        self.priority_queue.remove(&priority_id);
+        // If we just removed the cached min, invalidate.
+        if self.queue_min_cache == Some(priority_id) {
+            self.queue_min_cache = None;
+        }
     }
 
     fn flush_held_transactions(&mut self) {
@@ -247,6 +268,15 @@ impl<Tx: TransactionWithMeta> StateContainer<Tx> for TransactionStateContainer<T
 }
 
 impl<Tx: TransactionWithMeta> TransactionStateContainer<Tx> {
+    /// Cached lowest-priority entry, recomputed lazily if the cache is stale.
+    /// Returns `None` if the queue is empty.
+    fn queue_min(&mut self) -> Option<TransactionPriorityId> {
+        if self.queue_min_cache.is_none() {
+            self.queue_min_cache = self.priority_queue.first().copied();
+        }
+        self.queue_min_cache
+    }
+
     /// Insert a new transaction into the container's queues and maps.
     /// Returns `true` if a packet was dropped due to capacity limits.
     #[cfg(test)]

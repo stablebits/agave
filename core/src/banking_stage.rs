@@ -512,6 +512,10 @@ impl BankingStage {
             receiver: self.non_vote_receiver.clone(),
             sharable_banks: sharable_banks.clone(),
             filter_keys: self.filter_keys.clone(),
+            // Defaults match the pre-existing const values; SchedulerController
+            // overwrites these per loop iter based on pacing/queue state.
+            intake_timeout: std::time::Duration::from_millis(10),
+            packet_burst_limit: 1000,
         };
 
         // Spawn vote worker.

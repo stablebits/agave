@@ -96,12 +96,24 @@ pub(crate) trait ReceiveAndBuffer {
         container: &mut Self::Container,
         decision: &BufferedPacketsDecision,
     ) -> Result<ReceivingStats, DisconnectedError>;
+
+    /// Set the intake budget for the next `receive_and_buffer_packets` call.
+    /// Implementations may use this to dynamically throttle intake based on
+    /// scheduler state (e.g., remaining pacing budget). Default is a no-op
+    /// for implementations that don't need dynamic budgets.
+    fn set_intake_budget(&mut self, _timeout: Duration, _packet_burst_limit: usize) {}
 }
 
 pub(crate) struct TransactionViewReceiveAndBuffer {
     pub receiver: BankingPacketReceiver,
     pub sharable_banks: SharableBanks,
     pub filter_keys: Arc<HashSet<Pubkey>>,
+    /// Per-call intake budget, set by the scheduler controller before each
+    /// invocation. Dynamic — typically tighter when scheduling has more
+    /// budget to use, looser when scheduling is throttled (early in the
+    /// slot under pacing).
+    pub intake_timeout: Duration,
+    pub packet_burst_limit: usize,
 }
 
 impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
@@ -119,8 +131,8 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
         } = self.sharable_banks.load();
 
         // Receive packet batches.
-        const TIMEOUT: Duration = Duration::from_millis(10);
-        const PACKET_BURST_LIMIT: usize = 1000;
+        let timeout = self.intake_timeout;
+        let packet_burst_limit = self.packet_burst_limit;
         let start = Instant::now();
 
         let mut received_message = false;
@@ -154,7 +166,7 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
             //       overhead for wakers? But then risk not waking up when message
             //       received - as long as sleep is somewhat short, this should be
             //       fine.
-            match self.receiver.recv_timeout(TIMEOUT) {
+            match self.receiver.recv_timeout(timeout) {
                 Ok(packet_batch_message) => {
                     received_message = true;
                     stats.accumulate(self.handle_packet_batch_message(
@@ -175,7 +187,7 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
         }
 
         if !timed_out {
-            while start.elapsed() < TIMEOUT && stats.num_received < PACKET_BURST_LIMIT {
+            while start.elapsed() < timeout && stats.num_received < packet_burst_limit {
                 let receive_start = Instant::now();
                 match self.receiver.try_recv() {
                     Ok(packet_batch_message) => {
@@ -217,6 +229,11 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
             receive_time_us: stats.receive_time_us,
             buffer_time_us: stats.buffer_time_us,
         })
+    }
+
+    fn set_intake_budget(&mut self, timeout: Duration, packet_burst_limit: usize) {
+        self.intake_timeout = timeout;
+        self.packet_burst_limit = packet_burst_limit;
     }
 }
 
@@ -603,6 +620,8 @@ mod tests {
             receiver,
             sharable_banks: bank_forks.read().unwrap().sharable_banks(),
             filter_keys,
+            intake_timeout: Duration::from_millis(10),
+            packet_burst_limit: 1000,
         };
         let container = TransactionViewStateContainer::with_capacity(TEST_CONTAINER_CAPACITY);
         (receive_and_buffer, container)

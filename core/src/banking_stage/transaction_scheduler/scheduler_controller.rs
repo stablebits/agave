@@ -277,6 +277,13 @@ where
                     timing_metrics.clean_time_us += clean_time_us;
                 });
             }
+            // Throttle intake when scheduling has substantial budget waiting
+            // to be used — keeps the scheduler thread responsive to the
+            // budget ramp instead of being dominated by per-packet parse work.
+            let (intake_timeout, packet_burst_limit) =
+                Self::compute_intake_budget(cost_pacer.as_ref(), &now);
+            self.receive_and_buffer
+                .set_intake_budget(intake_timeout, packet_burst_limit);
             let receiving_stats = self.receive_and_buffer_packets(&decision).map_err(|_| {
                 SchedulerError::DisconnectedRecvChannel("receive and buffer disconnected")
             })?;
@@ -346,6 +353,34 @@ where
         };
 
         Ok(scheduled)
+    }
+
+    /// Per-iter intake budget for `receive_and_buffer_packets`. Inversely
+    /// proportional to the pacer's `scheduling_budget`: when scheduling
+    /// has lots of budget waiting to be used, we want the scheduler thread
+    /// to spend less time on intake and more on draining the queue.
+    ///
+    /// - At budget == 0 (start of slot under pacing): timeout=10ms,
+    ///   packet_burst_limit=1000 (matches the pre-existing static defaults).
+    /// - At budget == MAX_BLOCK_UNITS (pacing fully open or disabled):
+    ///   timeout=500µs, packet_burst_limit=100.
+    /// - Linearly interpolated between.
+    fn compute_intake_budget(cost_pacer: Option<&CostPacer>, now: &Instant) -> (Duration, usize) {
+        use solana_cost_model::block_cost_limits::MAX_BLOCK_UNITS;
+        const MAX_TIMEOUT_US: u64 = 10_000;
+        const MIN_TIMEOUT_US: u64 = 500;
+        const MAX_BURST_LIMIT: usize = 1000;
+        const MIN_BURST_LIMIT: usize = 100;
+
+        let budget = cost_pacer.map_or(MAX_BLOCK_UNITS, |pacer| pacer.scheduling_budget(now));
+        let ratio = (budget as f64 / MAX_BLOCK_UNITS as f64).clamp(0.0, 1.0);
+
+        let timeout_us =
+            MAX_TIMEOUT_US - (((MAX_TIMEOUT_US - MIN_TIMEOUT_US) as f64) * ratio) as u64;
+        let burst_limit =
+            MAX_BURST_LIMIT - (((MAX_BURST_LIMIT - MIN_BURST_LIMIT) as f64) * ratio) as usize;
+
+        (Duration::from_micros(timeout_us), burst_limit)
     }
 
     /// Update the scheduler-published pf-floor.
@@ -602,6 +637,8 @@ mod tests {
             receiver,
             sharable_banks: bank_forks.read().unwrap().sharable_banks(),
             filter_keys: Arc::default(),
+            intake_timeout: Duration::from_millis(10),
+            packet_burst_limit: 1000,
         }
     }
 
