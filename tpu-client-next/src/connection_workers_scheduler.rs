@@ -230,7 +230,7 @@ impl ConnectionWorkersScheduler {
             cancel,
             stats,
         } = self;
-        let mut endpoint = setup_endpoint(bind, stake_identity, initial_congestion_window)?;
+        let endpoint = setup_endpoint(bind, stake_identity, initial_congestion_window)?;
 
         debug!("Client endpoint bind address: {:?}", endpoint.local_addr());
         let mut workers = WorkersCache::new(num_connections, cancel.clone());

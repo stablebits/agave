@@ -79,7 +79,7 @@ pub(crate) fn create_client_endpoint(
     bind: BindTarget,
     client_config: ClientConfig,
 ) -> Result<Endpoint, QuicError> {
-    let mut endpoint = match bind {
+    let endpoint = match bind {
         BindTarget::Address(bind_addr) => {
             Endpoint::client(bind_addr).map_err(IoErrorWithPartialEq::from)?
         }

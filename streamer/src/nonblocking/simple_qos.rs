@@ -477,7 +477,7 @@ mod tests {
 
         // Create client endpoint
         let client_socket = bind_to_localhost_unique().expect("should bind - client");
-        let mut client_endpoint = Endpoint::new(
+        let client_endpoint = Endpoint::new(
             quinn::EndpointConfig::default(),
             None,
             client_socket,

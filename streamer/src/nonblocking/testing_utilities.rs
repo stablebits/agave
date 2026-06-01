@@ -203,7 +203,7 @@ pub async fn make_client_endpoint_with_local_addr(
         SocketConfig::default().set_non_blocking(true),
     )
     .expect("should bind client socket with local addr");
-    let mut endpoint = quinn::Endpoint::new(
+    let endpoint = quinn::Endpoint::new(
         EndpointConfig::default(),
         None,
         client_socket,

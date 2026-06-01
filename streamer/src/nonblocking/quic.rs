@@ -198,10 +198,10 @@ where
                 fallback_src_ip,
                 xdp_sender,
             }) => {
-                let socket = Arc::new(
+                let socket = Box::new(
                     QuicXdpTxSocket::new(socket, fallback_src_ip, xdp_sender)
                         .map_err(QuicServerError::EndpointFailed)?,
-                ) as Arc<dyn AsyncUdpSocket>;
+                ) as Box<dyn AsyncUdpSocket>;
                 Endpoint::new_with_abstract_socket(
                     EndpointConfig::default(),
                     Some(config.clone()),
@@ -1510,7 +1510,7 @@ pub mod test {
         );
 
         let client_socket = bind_to_localhost_unique().expect("should bind - client");
-        let mut endpoint = quinn::Endpoint::new(
+        let endpoint = quinn::Endpoint::new(
             EndpointConfig::default(),
             None,
             client_socket,

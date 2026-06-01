@@ -9,7 +9,7 @@ use {
     crossbeam_channel::TrySendError,
     nix::ifaddrs::getifaddrs,
     quinn::{
-        AsyncUdpSocket, Runtime, TokioRuntime, UdpPoller,
+        AsyncUdpSocket, Runtime, TokioRuntime, UdpSender,
         udp::{EcnCodepoint as QuinnEcnCodepoint, RecvMeta, Transmit},
     },
     std::{
@@ -89,9 +89,9 @@ impl Debug for QuicXdpSocketParts {
 /// destinations owned by the local host (routed via `lo`, including loopback and local interface
 /// IPs), it falls back to a kernel `UdpSocket`.
 pub(crate) struct QuicXdpTxSocket {
-    udp_socket: Arc<dyn AsyncUdpSocket>,
-    xdp_sender: QuicXdpSender,
-    local_ips: Vec<Ipv4Addr>,
+    udp_socket: Box<dyn AsyncUdpSocket>,
+    xdp_sender: Arc<QuicXdpSender>,
+    local_ips: Arc<[Ipv4Addr]>,
 }
 
 impl QuicXdpTxSocket {
@@ -121,13 +121,9 @@ impl QuicXdpTxSocket {
 
         Ok(Self {
             udp_socket: TokioRuntime.wrap_udp_socket(socket)?,
-            xdp_sender: QuicXdpSender::new(xdp_sender, src_addr),
-            local_ips,
+            xdp_sender: Arc::new(QuicXdpSender::new(xdp_sender, src_addr)),
+            local_ips: local_ips.into(),
         })
-    }
-
-    fn should_use_kernel_udp(&self, dst: SocketAddr) -> bool {
-        dst.ip().is_loopback() || matches!(dst.ip(), IpAddr::V4(ip) if self.local_ips.contains(&ip))
     }
 }
 
@@ -140,71 +136,19 @@ impl fmt::Debug for QuicXdpTxSocket {
 }
 
 impl AsyncUdpSocket for QuicXdpTxSocket {
-    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        // The kernel UDP socket poller is always returned here, ignoring the XDP sender. This
-        // implementation is correct under the following assumptions:
-        // 1. When egress AF_XDP is enabled, the kernel UDP socket is used rarely and only for local
-        //    destinations, so it should almost always be writable.
-        // 2. `QuicXdpSender` can almost always enqueue.
-        //
-        // A rare mismatch is still possible: if the UDP socket is not writable while
-        // `QuicXdpSender` could enqueue, throughput may be temporarily suboptimal until the UDP
-        // socket becomes writable. The reverse mismatch is also possible: the UDP poller is ready
-        // but the selected `QuicXdpSender` channel is full. In this case `try_send` fails with
-        // `WouldBlock`, and the caller invokes `poll_writable` again, which can select another
-        // channel in the next round.
-        self.udp_socket.clone().create_io_poller()
-    }
-
-    /// Attempts to send the given [`Transmit`].
-    ///
-    /// For non-local destinations uses AF_XDP, otherwise kernel UDP.
-    ///
-    /// If enqueueing fails after some datagrams were already enqueued, this method returns
-    /// `Err(WouldBlock)`. The caller may retry the whole transmit, which can cause duplicate
-    /// datagrams to be sent for the already enqueued chunks. QUIC packet numbers make this
-    /// protocol-safe, but duplicates can still degrade throughput and congestion behavior. This
-    /// implementation therefore assumes the AF_XDP channel is rarely (ideally never) full.
-    fn try_send(&self, t: &Transmit<'_>) -> io::Result<()> {
-        if self.should_use_kernel_udp(t.destination) {
-            return self.udp_socket.try_send(t);
-        }
-        if t.destination.is_ipv6() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "IPv6 destination addresses are not supported for AF_XDP sends",
-            ));
-        }
-        let src_ip = match t.src_ip {
-            Some(IpAddr::V4(ip)) => Some(ip),
-            Some(IpAddr::V6(_)) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "IPv6 source addresses are not supported",
-                ));
-            }
-            None => None,
-        };
-
-        debug_assert!(
-            t.segment_size.is_none(),
-            "GSO segmentation is disabled for AF_XDP sends, but segment_size is {:?}",
-            t.segment_size
-        );
-
-        let payload = Bytes::copy_from_slice(t.contents);
-        match self
-            .xdp_sender
-            .try_send(src_ip, t.destination, t.ecn, payload)
-        {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(io::ErrorKind::WouldBlock.into()),
-            Err(TrySendError::Disconnected(_)) => Err(io::ErrorKind::BrokenPipe.into()),
-        }
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+        // Quinn constructs one sender per task. The kernel sender (used for local destinations) is
+        // derived from the wrapped UDP socket, while the AF_XDP sender is shared so its round-robin
+        // index and underlying channels stay consistent across all senders.
+        Box::pin(QuicXdpUdpSender {
+            kernel_sender: self.udp_socket.create_sender(),
+            xdp_sender: self.xdp_sender.clone(),
+            local_ips: self.local_ips.clone(),
+        })
     }
 
     fn poll_recv(
-        &self,
+        &mut self,
         cx: &mut Context,
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
@@ -216,11 +160,6 @@ impl AsyncUdpSocket for QuicXdpTxSocket {
         self.udp_socket.local_addr()
     }
 
-    fn max_transmit_segments(&self) -> usize {
-        // no GSO batches, so each transmit describes exactly one datagram
-        1
-    }
-
     fn max_receive_segments(&self) -> usize {
         self.udp_socket.max_receive_segments()
     }
@@ -228,6 +167,92 @@ impl AsyncUdpSocket for QuicXdpTxSocket {
     fn may_fragment(&self) -> bool {
         false
     }
+}
+
+/// [`QuicXdpUdpSender`] is the [`UdpSender`] half of [`QuicXdpTxSocket`].
+///
+/// For non-local destinations it uses AF_XDP via a shared [`QuicXdpSender`]; for destinations owned
+/// by the local host (loopback or local interface IPs) it falls back to the kernel UDP sender.
+struct QuicXdpUdpSender {
+    kernel_sender: Pin<Box<dyn UdpSender>>,
+    xdp_sender: Arc<QuicXdpSender>,
+    local_ips: Arc<[Ipv4Addr]>,
+}
+
+impl Debug for QuicXdpUdpSender {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QuicXdpUdpSender").finish_non_exhaustive()
+    }
+}
+
+impl UdpSender for QuicXdpUdpSender {
+    /// Attempts to send the given [`Transmit`].
+    ///
+    /// For non-local destinations uses AF_XDP, otherwise the kernel UDP sender.
+    ///
+    /// When the AF_XDP channel is full this returns [`Poll::Pending`] after scheduling an immediate
+    /// re-poll, mirroring the previous `try_send`/`WouldBlock` retry loop. Returning an error
+    /// instead would be treated by Quinn as a fatal connection error. This therefore assumes the
+    /// AF_XDP channel is rarely (ideally never) full.
+    fn poll_send(
+        self: Pin<&mut Self>,
+        transmit: &Transmit<'_>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let destination = transmit.destination;
+        if is_local_destination(&this.local_ips, destination) {
+            return this.kernel_sender.as_mut().poll_send(transmit, cx);
+        }
+        if destination.is_ipv6() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "IPv6 destination addresses are not supported for AF_XDP sends",
+            )));
+        }
+        let src_ip = match transmit.src_ip {
+            Some(IpAddr::V4(ip)) => Some(ip),
+            Some(IpAddr::V6(_)) => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "IPv6 source addresses are not supported",
+                )));
+            }
+            None => None,
+        };
+
+        debug_assert!(
+            transmit.segment_size.is_none(),
+            "GSO segmentation is disabled for AF_XDP sends, but segment_size is {:?}",
+            transmit.segment_size
+        );
+
+        let payload = Bytes::copy_from_slice(transmit.contents);
+        match this
+            .xdp_sender
+            .try_send(src_ip, destination, transmit.ecn, payload)
+        {
+            Ok(()) => Poll::Ready(Ok(())),
+            Err(TrySendError::Full(_)) => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+            }
+        }
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        // no GSO batches, so each transmit describes exactly one datagram
+        1
+    }
+}
+
+/// Returns true when `dst` is owned by the local host (loopback or a local interface IP) and should
+/// therefore be routed through the kernel UDP sender rather than AF_XDP.
+fn is_local_destination(local_ips: &[Ipv4Addr], dst: SocketAddr) -> bool {
+    dst.ip().is_loopback() || matches!(dst.ip(), IpAddr::V4(ip) if local_ips.contains(&ip))
 }
 
 /// [`QuicXdpSender`] wraps [`XdpSender`] and provides round-robin sender selection.

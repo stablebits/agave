@@ -80,7 +80,7 @@ impl QuicLazyInitializedEndpoint {
     }
 
     fn create_endpoint(&self) -> Endpoint {
-        let mut endpoint = if let Some(endpoint) = &self.client_endpoint {
+        let endpoint = if let Some(endpoint) = &self.client_endpoint {
             endpoint.clone()
         } else {
             // This will bind to random ports, but VALIDATOR_PORT_RANGE is outside
@@ -198,17 +198,13 @@ impl QuicNewConnection {
         let connecting = self.endpoint.connect(addr, &server_name)?;
         stats.total_connections.fetch_add(1, Ordering::Relaxed);
         let connection = match connecting.into_0rtt() {
-            Ok((connection, zero_rtt)) => {
-                if let Ok(zero_rtt) = timeout(QUIC_CONNECTION_HANDSHAKE_TIMEOUT, zero_rtt).await {
-                    if zero_rtt {
-                        stats.zero_rtt_accepts.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        stats.zero_rtt_rejects.fetch_add(1, Ordering::Relaxed);
-                    }
-                    connection
-                } else {
-                    return Err(ConnectionError::TimedOut.into());
-                }
+            // In quinn 0.12 a successful `into_0rtt` yields a connection that can send 0-RTT data
+            // immediately, and there is no longer an accepted/rejected future here: 0-RTT rejection
+            // is instead surfaced later as `ZeroRttRejected` errors on stream I/O. We therefore
+            // count entering the 0-RTT path and use the connection without waiting.
+            Ok(connection) => {
+                stats.zero_rtt_accepts.fetch_add(1, Ordering::Relaxed);
+                connection
             }
             Err(connecting) => {
                 stats.connection_errors.fetch_add(1, Ordering::Relaxed);
