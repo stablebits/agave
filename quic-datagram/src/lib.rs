@@ -11,7 +11,6 @@ pub(crate) mod connection;
 pub(crate) use error::close_codes;
 pub(crate) mod connection_table;
 pub mod endpoint;
-pub mod key_updater;
 pub(crate) mod read_loop;
 pub(crate) mod stats;
 pub(crate) mod subnet_rate_limit;
@@ -20,9 +19,8 @@ pub(crate) mod transport;
 use std::time::Duration;
 pub use {
     allowlist::{Allowlist, StakedNodesAllowlist},
-    endpoint::QuicDatagramEndpoint,
+    endpoint::{KeyUpdater, QuicDatagramEndpoint},
     error::Error,
-    key_updater::KeyUpdater,
     solana_net_utils::banlist::Banlist,
 };
 

@@ -3,7 +3,7 @@
 
 use {
     crate::{
-        ALLOWLIST_CHECK_INTERVAL, BAN_DURATION_SHORT, Banlist,
+        ALLOWLIST_CHECK_INTERVAL, BAN_DURATION_DOS, BAN_DURATION_SHORT, Banlist,
         MAX_DATAGRAMS_PER_SECOND_PER_PEER, PEER_RATE_LIMIT_BURST, PEER_RATE_LIMIT_BURST_DOS,
         allowlist::Allowlist,
         close_codes,

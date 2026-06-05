@@ -69,7 +69,7 @@ We could split the single table into 2 (one for egress, one for ingress) only if
 use each connection in one direction. This does remove some locking, but does not 
 notably simplify the implementation.
 
-## Lex-pubkey tiebreaker
+## Pubkey based connection direction tiebreaker
 
 For every peer pair, the node with the **lower** pubkey is the
 dialer; the higher pubkey listens. The rule is enforced on both sides:
@@ -83,10 +83,10 @@ dialer; the higher pubkey listens. The rule is enforced on both sides:
 
 This partitions connections cleanly: the lex-higher side only ever holds
 inbound (server-accepted) entries; the lex-lower side only
-ever holds outbound (we-dialed) ones. That partition is load-bearing
-for the `PEER_MOVED` logic below.
+ever holds outbound (we-dialed) ones. This avoids races where both peers
+try to connect to each other.
 
-### No buffering during `Dialing`
+### Minimal buffering during `Dialing`
 
 When no connection exists to a peer, the first packet to be sent is
 buffered while dialing is going on. This is critical for standstill to
@@ -117,23 +117,20 @@ A new successful handshake from a pubkey already in `Established`
 closes the prior connection with `HANDOVER` and installs the new one -
 the validator hot-spare handover path. The displaced side observes
 `HANDOVER` in its read loop and soft-bans the evicting peer so it does
-not feed bogus votes while waiting for the gossip notification to kill
+not evict the new node while waiting for the gossip notification to kill
 itself.
 
 ## PEER_MOVED (address-aware eviction)
 
-On the lex-lower (dialer) side, the cached `Established`'s
-`remote_address()` is exactly the addr we dialed. If a later egress
+On the dialer side, we cache peer addresses. If a later egress
 arrives with a different addr for the same pubkey (e.g., gossip
 published a new addr for the peer), the slot is atomically swapped to
 `Dialing`, the displaced connection is closed with `PEER_MOVED`, and a
 fresh dial spawns at the new addr.
 
-The lex-higher side **does not** do this check. Its cached entries are
-inbound; their `remote_address()` is the peer's NAT-mapped source addr,
-which can legitimately differ from the gossip-published one the caller
-hands us. The higher side trusts whatever inbound connection it
-accepted, addr argument ignored on cache hit.
+The server side **does not** do this check. We could enforce incoming 
+connections to be from the gossip ports only, but that requires changes
+to the votor API. 
 
 ## Security posture
 
@@ -148,8 +145,7 @@ accepted, addr argument ignored on cache hit.
    recoverable Solana ed25519 pubkey; client checks the attested pubkey
    matches the targeted one, server checks that client owns a staked
    identity.
-4. **Stake check** (`Allowlist` trait, default impl
-   `StakedNodesAllowlist`). Peer must be in the current staked-set
+4. **Stake check**  Peer must be in the current staked-set
    snapshot.
 5. **External banlist** (`DatagramBanlist`). Application-level bans
    (e.g., BLS sigverify failures) are funneled through here; the
@@ -157,8 +153,9 @@ accepted, addr argument ignored on cache hit.
 6. **Per-connection RX token bucket.** Bursts above
    `BURST_DATAGRAMS_PER_SECOND_PER_PEER` are silently dropped (the
    bucket itself is the throttle). The connection stays alive; the
-   peer is **not** banned (consensus traffic legitimately bursts).
-7. **MAX_PEERS = 2000.** Defensive cap on the connection table.
+   peer is **not** banned (consensus traffic legitimately bursts). 
+   If the peer keeps flooding we will drop connection and ban it.
+7. **MAX_PEERS = 4000.** Defensive cap on the connection table size.
 
 
 ## Identity rotation
@@ -169,24 +166,13 @@ observes the change and:
 
 1. Rebuilds server + client TLS configs.
 2. Swaps them into the quinn endpoint.
-3. Evicts every cached connection with `IDENTITY_ROTATED` close.
-4. Adopts the new pubkey for the lex-tiebreak rule going forward.
+3. Evicts every connection with `IDENTITY_ROTATED` close.
+4. Adopts the new pubkey.
 
-`Dialing` placeholders are dropped too. In-flight dial tasks were
-dispatched with the pre-rotation generation tag; when they finish their
+In-flight dial tasks keep a generation tag, when they finish their
 handshake and try to install the connection, the generation check
 inside `insert_connection` trips, returns `InsertOutcome::Stale`, and
-the new connection is closed with `IDENTITY_ROTATED`. No TLS-level
-failure is needed - the gen counter is the single source of truth for
-"this dial belongs to the previous identity."
-
-## Payload size
-
-A datagram payload is bounded by quinn's negotiated `max_datagram_size`
-(transport-config-driven, currently a fixed 1280). Payloads above that
-bound fail at `send_datagram` with `SendDatagramError::TooLarge` and the
-crate does no fragmentation - callers are expected to keep messages
-under the cap.
+the new connection is closed with `IDENTITY_ROTATED`.
 
 ## Egress / ingress channels
 
@@ -202,17 +188,13 @@ under the cap.
 
 At the end of an epoch, we may experience churn in the allowlist.
 Some peers will no longer be allowed, while some new ones will be
-admitted. We do not proactively break connections to peers which are
-no longer in the allowlist; instead they are evicted when we are
-inserting a new connection while out of room in the connection table.
-This keeps the logic simpler than the explicit notify during epoch change.
+admitted. We will eventually break connections to peers which are
+no longer in the allowlist. This keeps the logic simpler than the 
+explicit notify during epoch change.
 
 ## What this crate is not
 
-- Not a general-purpose datagram transport. The lex-tiebreaker, the
-  drop-on-`Dialing` behavior, the lack of backoff, and the
-  identity-rotation evict-all all assume a votor-style workload (small
-  peer set, predictable cadence, no retransmits). With some effort this
-  could be adapted for e.g. turbine.
-- Not a buffered transport. There is no per-peer queue. Bytes that hit
-  a full channel or a `Dialing` placeholder are gone.
+- Not a general-purpose datagram transport. All decisions assume a 
+  votor workload (small peer set, predictable cadence, no retransmits). 
+- Not a buffered transport. There is no per-peer queue. Bytes that have
+  nowhere to go are gone.

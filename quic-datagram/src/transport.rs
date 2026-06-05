@@ -21,10 +21,10 @@ use {
 
 /// Receive datagram buffer (per endpoint, total across all peers).
 /// Provisions enough room for 1 full slot at max load.
-const DATAGRAM_RECEIVE_BUFFER: usize = MAX_PEERS * 8;
+const DATAGRAM_RECEIVE_BUFFER: usize = MAX_PEERS as usize * 8;
 /// Send datagram buffer (per endpoint). Not too huge since we are
 /// supposed to operate in realtime.
-const DATAGRAM_SEND_BUFFER: usize = MAX_PEERS * 2;
+const DATAGRAM_SEND_BUFFER: usize = MAX_PEERS as usize * 2;
 /// Close connections after this much time without feedback from peer.
 /// This should be more than reasonable max time between PING (or data)
 /// frames arriving from the peer. We also want to keep this rather short

@@ -181,12 +181,10 @@ impl<A: Allowlist> ServerConnection<A> {
             return Err(Error::NotAdmitted(peer));
         }
 
-        match self.table.insert_connection(
-            peer,
-            connection.clone(),
-            gen_at_start,
-            &self.stats,
-        ) {
+        match self
+            .table
+            .insert_connection(peer, connection.clone(), gen_at_start, &self.stats)
+        {
             InsertOutcome::Rejected => {
                 close_codes::TABLE_FULL.close(&connection);
                 return Err(Error::TableFull);
