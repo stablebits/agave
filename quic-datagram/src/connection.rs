@@ -75,13 +75,10 @@ impl<A: Allowlist> ClientConnection<A> {
             }
 
             // On cap-induced Rejected, the table will try to evict a
-            // now-unadmitted peer before giving up - epoch-boundary churn
-            // can momentarily push the staked-set union past `MAX_PEERS`.
-            match self.table.insert_connection_or_evict(
+            match self.table.insert_connection(
                 self.peer,
                 connection.clone(),
                 id_generation,
-                |pk| self.allowlist.allow(pk),
                 &self.stats,
             ) {
                 InsertOutcome::Rejected => {
@@ -112,6 +109,7 @@ impl<A: Allowlist> ClientConnection<A> {
                 self.peer,
                 self.addr,
                 self.ingress,
+                self.allowlist,
                 self.banlist,
                 self.stats,
             )
@@ -183,11 +181,10 @@ impl<A: Allowlist> ServerConnection<A> {
             return Err(Error::NotAdmitted(peer));
         }
 
-        match self.table.insert_connection_or_evict(
+        match self.table.insert_connection(
             peer,
             connection.clone(),
             gen_at_start,
-            |pk| self.allowlist.allow(pk),
             &self.stats,
         ) {
             InsertOutcome::Rejected => {
@@ -211,6 +208,7 @@ impl<A: Allowlist> ServerConnection<A> {
             peer,
             remote_addr,
             self.ingress,
+            self.allowlist,
             self.banlist,
             self.stats,
         )

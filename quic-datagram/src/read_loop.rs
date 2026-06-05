@@ -3,8 +3,10 @@
 
 use {
     crate::{
-        BAN_DURATION_SHORT, Banlist, MAX_DATAGRAMS_PER_SECOND_PER_PEER, PEER_RATE_LIMIT_BURST,
-        PEER_RATE_LIMIT_BURST_DOS, close_codes,
+        ALLOWLIST_CHECK_INTERVAL, BAN_DURATION_SHORT, Banlist,
+        MAX_DATAGRAMS_PER_SECOND_PER_PEER, PEER_RATE_LIMIT_BURST, PEER_RATE_LIMIT_BURST_DOS,
+        allowlist::Allowlist,
+        close_codes,
         endpoint::Datagram,
         error::Error,
         stats::{QuicDatagramStats, record_error},
@@ -23,11 +25,12 @@ use {
 /// Drive the per-connection read loop. Returns when the
 /// connection closes. Caller is responsible for reaping the connection table entry
 /// afterwards.
-pub(crate) async fn read_datagram_loop(
+pub(crate) async fn read_datagram_loop<A: Allowlist>(
     connection: Connection,
     peer: Pubkey,
     remote_addr: SocketAddr,
     ingress: Sender<Datagram>,
+    allowlist: Arc<A>,
     banlist: Arc<Banlist<Pubkey>>,
     stats: Arc<QuicDatagramStats>,
 ) {
@@ -41,64 +44,74 @@ pub(crate) async fn read_datagram_loop(
         PEER_RATE_LIMIT_BURST_DOS,
         MAX_DATAGRAMS_PER_SECOND_PER_PEER,
     );
+    let mut allowlist_check = tokio::time::interval(ALLOWLIST_CHECK_INTERVAL);
+    allowlist_check.tick().await; // skip the immediate first fire
     loop {
-        match connection.read_datagram().await {
-            Ok(bytes) => {
-                // Banlist check happens AFTER the read so a ban that
-                // lands while we're awaiting can't let a follow-up
-                // datagram leak through to ingress.
-                if banlist.is_banned(&peer) {
-                    close_codes::BANNED.close(&connection);
-                    break;
-                }
-                match rate_limit.consume_tokens(1) {
-                    // green corridor - sender is behaving
-                    Ok(remaining) if remaining > RATE_LIMIT_WATERMARK => {}
-                    // red corridor - sender is bursting above normal
-                    Ok(_) => {
-                        drop(bytes);
-                        stats.datagram_rate_limited.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    // we are under attack - kick the sender.
-                    Err(_) => {
-                        drop(bytes);
-                        stats
-                            .connection_evicted_allowlist
-                            .fetch_add(1, Ordering::Relaxed);
-                        banlist.ban(peer, BAN_DURATION_DOS);
-                        close_codes::BANNED.close(&connection);
-                        break;
-                    }
-                }
+        tokio::select! {
+            result = connection.read_datagram() => {
+                match result {
+                    Ok(bytes) => {
+                        // Banlist check happens AFTER the read so a ban that
+                        // lands while we're awaiting can't let a follow-up
+                        // datagram leak through to ingress.
+                        if banlist.is_banned(&peer) {
+                            close_codes::BANNED.close(&connection);
+                            break;
+                        }
+                        match rate_limit.consume_tokens(1) {
+                            // green corridor - sender is behaving
+                            Ok(remaining) if remaining > RATE_LIMIT_WATERMARK => {}
+                            // red corridor - sender is bursting above normal
+                            Ok(_) => {
+                                drop(bytes);
+                                stats.datagram_rate_limited.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            // we are under attack - kick the sender.
+                            Err(_) => {
+                                drop(bytes);
+                                banlist.ban(peer, BAN_DURATION_DOS);
+                                close_codes::BANNED.close(&connection);
+                                break;
+                            }
+                        }
 
-                match ingress.try_send(Datagram {
-                    peer_pubkey: peer,
-                    peer_address: remote_addr,
-                    message: bytes,
-                }) {
-                    Ok(()) => {
-                        stats.datagrams_received.fetch_add(1, Ordering::Relaxed);
+                        match ingress.try_send(Datagram {
+                            peer_pubkey: peer,
+                            peer_address: remote_addr,
+                            message: bytes,
+                        }) {
+                            Ok(()) => {
+                                stats.datagrams_received.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(TrySendError::Full(_)) => {
+                                stats
+                                    .datagram_ingress_dropped_channel_full
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(TrySendError::Disconnected(_)) => {
+                                debug!("ingress disconnected; reader for {peer} exiting");
+                                break;
+                            }
+                        }
                     }
-                    Err(TrySendError::Full(_)) => {
-                        stats
-                            .datagram_ingress_dropped_channel_full
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(TrySendError::Disconnected(_)) => {
-                        debug!("ingress disconnected; reader for {peer} exiting");
+                    Err(e) => {
+                        if matches!(&e, ConnectionError::ApplicationClosed(c) if c.error_code == close_codes::HANDOVER.code)
+                        {
+                            stats.handover_received.fetch_add(1, Ordering::Relaxed);
+                            banlist.ban(peer, BAN_DURATION_SHORT);
+                        }
+                        record_error(&Error::from(e), &stats);
                         break;
                     }
                 }
             }
-            Err(e) => {
-                if matches!(&e, ConnectionError::ApplicationClosed(c) if c.error_code == close_codes::HANDOVER.code)
-                {
-                    stats.handover_received.fetch_add(1, Ordering::Relaxed);
-                    banlist.ban(peer, BAN_DURATION_SHORT);
+            _ = allowlist_check.tick() => {
+                if !allowlist.allow(&peer) {
+                    close_codes::NOT_ADMITTED.close(&connection);
+                    stats.connection_evicted_allowlist.fetch_add(1, Ordering::Relaxed);
+                    break;
                 }
-                record_error(&Error::from(e), &stats);
-                break;
             }
         }
     }

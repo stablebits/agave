@@ -55,3 +55,8 @@ pub const PEER_RATE_LIMIT_BURST_DOS: u64 = 100000;
 
 /// If peer exceeds DOS budget they get banned.
 pub const BAN_DURATION_DOS: Duration = Duration::from_hours(48);
+
+/// How often each connection's read loop re-checks whether the peer is still
+/// in the allowlist. Stale (epoch-evicted) connections are closed within one
+/// interval after the allowlist snapshot is updated.
+pub const ALLOWLIST_CHECK_INTERVAL: Duration = Duration::from_secs(10);

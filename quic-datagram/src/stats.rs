@@ -5,12 +5,6 @@ use {
     std::sync::atomic::{AtomicU64, Ordering},
 };
 
-/// Counters reported every metrics tick (cadence owned by the control loop)
-/// under the `votor_datagram` namespace.
-///
-/// Error variants are collapsed into coarse buckets: the exact variant is
-/// rarely actionable on its own and is still emitted to the log by
-/// `record_error`'s callers.
 #[derive(Default)]
 pub(crate) struct QuicDatagramStats {
     // --- Positive path ---
@@ -140,27 +134,22 @@ pub(crate) fn record_error(err: &Error, stats: &QuicDatagramStats) {
 /// Emit the accumulated counters and reset them. `live_connections` is the
 /// current table occupancy, sampled by the control loop; it is NOT reported on
 /// its own (a single sample of a churning table at the 2s tick is noise), but
-/// is used to re-baseline the peak high-water mark for the next period so a
-/// steady-state population still reports its size.
+/// is used to re-baseline the high-water mark for the next period.
 pub(crate) fn report(stats: &QuicDatagramStats, live_connections: u64) {
     macro_rules! swap {
         ($m:expr) => {
             $m.swap(0, Ordering::Relaxed) as i64
         };
     }
-    // Re-baseline the peak to the current occupancy: the next period's peak
-    // starts from where this one left off, not from zero.
     let peak_connections = stats
         .peak_connections
         .swap(live_connections, Ordering::Relaxed)
         .max(live_connections) as i64;
     datapoint_info!(
         "votor_datagram",
-        // Positive path
         ("connections_peak", peak_connections, i64),
         ("datagrams_received", swap!(stats.datagrams_received), i64),
         ("datagrams_sent", swap!(stats.datagrams_sent), i64),
-        // Error buckets
         ("connect_failed", swap!(stats.connect_failed), i64),
         ("connection_lost", swap!(stats.connection_lost), i64),
         (
@@ -178,7 +167,6 @@ pub(crate) fn report(stats: &QuicDatagramStats, live_connections: u64) {
             swap!(stats.handshake_rejected_overload),
             i64
         ),
-        // Drops
         (
             "datagram_ingress_dropped_channel_full",
             swap!(stats.datagram_ingress_dropped_channel_full),
@@ -199,7 +187,6 @@ pub(crate) fn report(stats: &QuicDatagramStats, live_connections: u64) {
             swap!(stats.egress_dropped_dial_in_progress),
             i64
         ),
-        // Lifecycle
         (
             "handshake_retry_sent",
             swap!(stats.handshake_retry_sent),

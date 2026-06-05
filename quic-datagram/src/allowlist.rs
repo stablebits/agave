@@ -7,9 +7,8 @@ use {
     std::{collections::HashMap, sync::Arc},
 };
 
-/// Called once per inbound handshake (after the peer cert is parsed) and once
-/// per outbound dial-success. A `false` answer closes the connection with the
-/// `NOT_ADMITTED` error code.
+/// Called once per handshake, then periodically during connection lifetime.
+///  A `false` answer closes the connection with the `NOT_ADMITTED` error code.
 ///
 /// Implementations must be cheap - this is on the hot path of every new
 /// connection.
