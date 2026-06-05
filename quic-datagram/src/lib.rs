@@ -27,9 +27,8 @@ pub use {
     solana_net_utils::banlist::Banlist,
 };
 
-/// Ban duration applied by the crate's only internal trigger: HANDOVER
-/// reception in the per-connection read loop. Short window because the
-/// peer may legitimately be retrying a hot-spare promotion.
+/// Ban duration applied HANDOVER trigger.
+/// Not long since peer may legitimately be retrying a hot-spare promotion.
 pub const BAN_DURATION_SHORT: Duration = Duration::from_secs(5);
 
 /// Maximum number of unique peer pubkeys held in the connection table.
@@ -45,12 +44,15 @@ pub const MAX_PEERS: u64 = 2000;
 /// vote rate is ~1 message/slot).
 pub const EGRESS_CHANNEL_CAP: usize = 16384;
 
-/// Per-peer receive-side rate limit. Each connection read loop
-/// enforces RX rate via a token bucket; bucket starts full at
-/// connection open and refills continously. Any datagram arriving
-/// when the bucket has no tokens left is dropped.
+/// Per-peer receive-side rate limit.
 pub const MAX_DATAGRAMS_PER_SECOND_PER_PEER: f64 = 30.0;
 
-/// Per-peer receive side burst limit. Complimentary to
-/// [`MAX_DATAGRAMS_PER_SECOND_PER_PEER`], allows for bursty arrivals
-pub const BURST_DATAGRAMS_PER_SECOND_PER_PEER: u64 = 100;
+/// Per-peer receive side burst limit.
+pub const PEER_RATE_LIMIT_BURST: u64 = 100;
+
+/// Per-peer receive side DOS protection limit.
+/// If peer exhausts this burst size they are considered to be attacking and banned.
+pub const PEER_RATE_LIMIT_BURST_DOS: u64 = 100000;
+
+/// If peer exceeds DOS budget they get banned.
+pub const BAN_DURATION_DOS: Duration = Duration::from_hours(48);

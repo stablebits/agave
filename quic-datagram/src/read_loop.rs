@@ -3,8 +3,8 @@
 
 use {
     crate::{
-        BAN_DURATION_SHORT, BURST_DATAGRAMS_PER_SECOND_PER_PEER, Banlist,
-        MAX_DATAGRAMS_PER_SECOND_PER_PEER, close_codes,
+        BAN_DURATION_SHORT, Banlist, MAX_DATAGRAMS_PER_SECOND_PER_PEER, PEER_RATE_LIMIT_BURST,
+        PEER_RATE_LIMIT_BURST_DOS, close_codes,
         endpoint::Datagram,
         error::Error,
         stats::{QuicDatagramStats, record_error},
@@ -20,9 +20,8 @@ use {
     },
 };
 
-/// Drive the per-connection read loop to completion. Returns when the
-/// connection closes (peer-initiated, banlist-trip, ingress disconnect,
-/// HANDOVER). Caller is responsible for reaping the connection table entry
+/// Drive the per-connection read loop. Returns when the
+/// connection closes. Caller is responsible for reaping the connection table entry
 /// afterwards.
 pub(crate) async fn read_datagram_loop(
     connection: Connection,
@@ -33,11 +32,13 @@ pub(crate) async fn read_datagram_loop(
     stats: Arc<QuicDatagramStats>,
 ) {
     // Per-connection rate limiter. Any datagram arriving with the bucket
-    // empty is dropped. We do NOT close the connection or ban the peer here,
-    // honest peers legitimately burst above the refill rate during catch-up.
+    // empty is below RATE_LIMIT_WATERMARK is dropped, since honest peers
+    // legitimately burst above the refill rate during catch-up.
+    // Any packet arriving when bucket is empty is *closed*.
+    const RATE_LIMIT_WATERMARK: u64 = PEER_RATE_LIMIT_BURST_DOS - PEER_RATE_LIMIT_BURST;
     let rate_limit = TokenBucket::new(
-        BURST_DATAGRAMS_PER_SECOND_PER_PEER,
-        BURST_DATAGRAMS_PER_SECOND_PER_PEER,
+        PEER_RATE_LIMIT_BURST,
+        PEER_RATE_LIMIT_BURST_DOS,
         MAX_DATAGRAMS_PER_SECOND_PER_PEER,
     );
     loop {
@@ -50,11 +51,27 @@ pub(crate) async fn read_datagram_loop(
                     close_codes::BANNED.close(&connection);
                     break;
                 }
-                if rate_limit.consume_tokens(1).is_err() {
-                    drop(bytes);
-                    stats.datagram_rate_limited.fetch_add(1, Ordering::Relaxed);
-                    continue;
+                match rate_limit.consume_tokens(1) {
+                    // green corridor - sender is behaving
+                    Ok(remaining) if remaining > RATE_LIMIT_WATERMARK => {}
+                    // red corridor - sender is bursting above normal
+                    Ok(_) => {
+                        drop(bytes);
+                        stats.datagram_rate_limited.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    // we are under attack - kick the sender.
+                    Err(_) => {
+                        drop(bytes);
+                        stats
+                            .connection_evicted_allowlist
+                            .fetch_add(1, Ordering::Relaxed);
+                        banlist.ban(peer, BAN_DURATION_DOS);
+                        close_codes::BANNED.close(&connection);
+                        break;
+                    }
                 }
+
                 match ingress.try_send(Datagram {
                     peer_pubkey: peer,
                     peer_address: remote_addr,
@@ -77,7 +94,8 @@ pub(crate) async fn read_datagram_loop(
             Err(e) => {
                 if matches!(&e, ConnectionError::ApplicationClosed(c) if c.error_code == close_codes::HANDOVER.code)
                 {
-                    handle_handover(peer, &banlist, &stats);
+                    stats.handover_received.fetch_add(1, Ordering::Relaxed);
+                    banlist.ban(peer, BAN_DURATION_SHORT);
                 }
                 record_error(&Error::from(e), &stats);
                 break;
@@ -86,19 +104,11 @@ pub(crate) async fn read_datagram_loop(
     }
 }
 
-/// Soft-ban the peer on `HANDOVER` close so our client side stops dialing
-/// it — the peer has accepted a different instance of our identity and
-/// re-dialing would risk double-voting.
-fn handle_handover(peer: Pubkey, banlist: &Banlist<Pubkey>, stats: &QuicDatagramStats) {
-    stats.handover_received.fetch_add(1, Ordering::Relaxed);
-    banlist.ban(peer, BAN_DURATION_SHORT);
-}
-
 #[cfg(test)]
 mod tests {
     use {
         crate::{
-            BAN_DURATION_SHORT, BURST_DATAGRAMS_PER_SECOND_PER_PEER,
+            BAN_DURATION_SHORT, PEER_RATE_LIMIT_BURST,
             allowlist::AllowAll,
             endpoint::Datagram,
             testutils::{
@@ -288,7 +298,7 @@ mod tests {
         // Blast a burst far in excess of the bucket capacity. Probe retries
         // have already consumed some tokens; the (capacity)-th additional
         // datagram trips the limiter.
-        let burst = (BURST_DATAGRAMS_PER_SECOND_PER_PEER as usize) * 4;
+        let burst = (PEER_RATE_LIMIT_BURST as usize) * 4;
         rt.block_on(async {
             for i in 0..burst {
                 let payload = Bytes::from(format!("burst-{i:04}").into_bytes());
@@ -324,7 +334,7 @@ mod tests {
         {
             delivered = delivered.saturating_add(1);
         }
-        let cap = BURST_DATAGRAMS_PER_SECOND_PER_PEER as usize;
+        let cap = PEER_RATE_LIMIT_BURST as usize;
         assert!(
             delivered <= cap + 2,
             "delivered {delivered} datagrams post-probe, exceeds bucket capacity {cap} + slop"
