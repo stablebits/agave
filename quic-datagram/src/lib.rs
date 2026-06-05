@@ -28,9 +28,17 @@ pub use {
 /// Not long since peer may legitimately be retrying a hot-spare promotion.
 pub const BAN_DURATION_SHORT: Duration = Duration::from_secs(5);
 
-/// Maximum number of unique peer pubkeys held in the connection table.
-/// Sized for the maximum expected alpenglow staked-node count.
+/// Hard ceiling on total live connections in either direction (the outbound
+/// dialer map and the inbound acceptor each cap at this). Sized for the
+/// maximum expected alpenglow staked-node count.
 pub const MAX_PEERS: u64 = 4000;
+
+/// Maximum simultaneous inbound connections accepted from a single peer
+/// identity. Kept low so that no one allowlisted sender can fill the global
+/// inbound budget ([`MAX_PEERS`]) and starve honest peers; >1 tolerates a
+/// redial racing an idle connection that has not yet timed out. A sender needs
+/// only one inbound connection to deliver to us, so this is generous.
+pub const MAX_CONNECTIONS_PER_PEER: u32 = 2;
 
 /// Capacity of the egress channel held by [`QuicDatagramEndpoint`]. Senders
 /// must `try_send` and accept drop-on-full.

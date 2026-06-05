@@ -1,18 +1,19 @@
 //! Inbound (acceptor) side: accept a handshake, gate by banlist + allowlist,
 //! then run the receive loop.
 //!
-//! Inbound connections are **receive-only** and are deliberately NOT tracked
-//! per-peer. A sender may hold several at once (e.g. a hot spare, or a redial
-//! racing an idle one) and that is harmless: duplicate votes/certs are
-//! idempotent downstream, and a sender that delivers an invalid message is
-//! banned by pubkey at the BLS-sigverify layer - the shared banlist then closes
-//! every connection it holds. The only shared state is a global live-connection
-//! counter, used purely as an anti-DoS cap. The handshake is CPU-heavy, so each
-//! inbound runs on its own task and never blocks the accept loop.
+//! Inbound connections are **receive-only**. A sender may hold more than one at
+//! once (e.g. a redial racing a not-yet-timed-out idle connection) and that is
+//! harmless: duplicate votes/certs are idempotent downstream, and a sender that
+//! delivers an invalid message is banned by pubkey at the BLS-sigverify layer -
+//! the shared banlist then closes every connection it holds. So we keep no
+//! per-peer connection table; the only shared state is the admission limiter
+//! ([`Inbound`]) - a global cap plus a small per-identity cap that stops one
+//! sender from monopolizing inbound capacity and starving others. The handshake
+//! is CPU-heavy, so each inbound runs on its own task and never blocks accept.
 
 use {
     crate::{
-        Banlist, MAX_PEERS,
+        Banlist, MAX_CONNECTIONS_PER_PEER, MAX_PEERS,
         allowlist::Allowlist,
         close_codes,
         endpoint::Datagram,
@@ -21,6 +22,7 @@ use {
         stats::{QuicDatagramStats, record_error},
     },
     crossbeam_channel::Sender,
+    dashmap::{DashMap, mapref::entry::Entry},
     log::debug,
     quinn::Incoming,
     solana_pubkey::Pubkey,
@@ -31,14 +33,96 @@ use {
     },
 };
 
+/// Inbound admission limiter: a hard global cap ([`MAX_PEERS`]) plus a small
+/// per-identity cap ([`MAX_CONNECTIONS_PER_PEER`]). The per-identity cap is the
+/// load-bearing one against abuse - the global counter alone lets a few
+/// allowlisted-but-hostile identities open connections up to the ceiling and
+/// starve honest peers, whereas the per-identity cap bounds any single sender's
+/// footprint, so exhausting the global budget would require controlling a large
+/// fraction of the staked set.
+///
+/// `per_id` holds only a small integer per connected peer (not connection
+/// handles); it is NOT a connection table. Entries are removed when their count
+/// reaches zero, so the map is bounded by the live peer set.
+pub(crate) struct Inbound {
+    total: AtomicU64,
+    per_id: DashMap<Pubkey, u32>,
+}
+
+impl Inbound {
+    pub(crate) fn new() -> Self {
+        Self {
+            total: AtomicU64::new(0),
+            per_id: DashMap::new(),
+        }
+    }
+
+    /// Total live inbound connections (for the metrics gauge).
+    pub(crate) fn len(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    /// Reserve a slot for a connection from `peer`: the per-identity cap first,
+    /// then the global cap. Returns an RAII [`InboundSlot`] that releases both
+    /// counts on drop, or `None` if either cap is hit (caller closes the
+    /// connection). Both checks are racy under concurrent admits - a slight,
+    /// transient overshoot is acceptable.
+    pub(crate) fn admit(self: &Arc<Self>, peer: Pubkey) -> Option<InboundSlot> {
+        // Per-identity cap.
+        {
+            let mut count = self.per_id.entry(peer).or_insert(0);
+            if *count >= MAX_CONNECTIONS_PER_PEER {
+                return None;
+            }
+            *count = count.saturating_add(1);
+        }
+        // Global cap; roll back the per-identity increment if we exceed it.
+        if self.total.fetch_add(1, Ordering::Relaxed) >= MAX_PEERS {
+            self.total.fetch_sub(1, Ordering::Relaxed);
+            self.release_id(&peer);
+            return None;
+        }
+        Some(InboundSlot {
+            inbound: Arc::clone(self),
+            peer,
+        })
+    }
+
+    fn release_id(&self, peer: &Pubkey) {
+        if let Entry::Occupied(mut e) = self.per_id.entry(*peer) {
+            let remaining = e.get().saturating_sub(1);
+            if remaining == 0 {
+                e.remove();
+            } else {
+                *e.get_mut() = remaining;
+            }
+        }
+    }
+}
+
+/// RAII guard for one admitted inbound connection. Releases the global and
+/// per-identity counts when dropped - i.e. when the inbound task's read loop
+/// returns, on every exit path.
+pub(crate) struct InboundSlot {
+    inbound: Arc<Inbound>,
+    peer: Pubkey,
+}
+
+impl Drop for InboundSlot {
+    fn drop(&mut self) {
+        self.inbound.total.fetch_sub(1, Ordering::Relaxed);
+        self.inbound.release_id(&self.peer);
+    }
+}
+
 /// One accepted inbound connection's lifecycle: handshake, gate, receive loop.
 pub(crate) struct InboundConnection {
     pub(crate) incoming: Incoming,
     pub(crate) ingress: Sender<Datagram>,
     pub(crate) allowlist: Arc<dyn Allowlist>,
     pub(crate) banlist: Arc<Banlist<Pubkey>>,
-    /// Global live inbound-connection count, shared across all inbound tasks.
-    pub(crate) live: Arc<AtomicU64>,
+    /// Shared inbound admission limiter (global + per-identity caps).
+    pub(crate) inbound: Arc<Inbound>,
     pub(crate) stats: Arc<QuicDatagramStats>,
 }
 
@@ -72,16 +156,13 @@ impl InboundConnection {
             return Err(Error::NotAdmitted(peer));
         }
 
-        // Global cap (anti-DoS). `fetch_add` returns the prior value; if we
-        // were already at cap, undo and refuse. The count is not per-peer -
-        // multiple connections from one sender are fine (see module docs).
-        if self.live.fetch_add(1, Ordering::Relaxed) >= MAX_PEERS {
-            self.live.fetch_sub(1, Ordering::Relaxed);
+        // Anti-DoS admission: per-identity cap then global cap. The returned
+        // guard releases both counts when it drops at the end of this task.
+        let Some(_slot) = self.inbound.admit(peer) else {
             close_codes::TABLE_FULL.close(&connection);
             return Err(Error::TableFull);
-        }
-        self.stats
-            .record_connection_count(self.live.load(Ordering::Relaxed));
+        };
+        self.stats.record_connection_count(self.inbound.len());
 
         read_datagram_loop(
             connection,
@@ -93,7 +174,6 @@ impl InboundConnection {
             self.stats,
         )
         .await;
-        self.live.fetch_sub(1, Ordering::Relaxed);
         Ok(())
     }
 }

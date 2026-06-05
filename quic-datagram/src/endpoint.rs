@@ -11,7 +11,7 @@ use {
         allowlist::Allowlist,
         close_codes,
         error::Error,
-        inbound::InboundConnection,
+        inbound::{Inbound, InboundConnection},
         outbound::{Dispatch, Outbound, spawn_dial},
         stats::{self, QuicDatagramStats, add},
         subnet_rate_limit::SubnetRateLimiter,
@@ -27,10 +27,7 @@ use {
     solana_tls_utils::{NotifyKeyUpdate, new_dummy_x509_certificate},
     std::{
         net::{SocketAddr, UdpSocket},
-        sync::{
-            Arc,
-            atomic::{AtomicU64, Ordering},
-        },
+        sync::{Arc, atomic::Ordering},
         time::Duration,
     },
     tokio::{
@@ -148,7 +145,7 @@ impl QuicDatagramEndpoint {
         endpoint.set_default_client_config(client_config);
 
         let outbound = Arc::new(Outbound::new());
-        let inbound_live = Arc::new(AtomicU64::new(0));
+        let inbound = Arc::new(Inbound::new());
         let stats = Arc::<QuicDatagramStats>::default();
         let (egress_tx, egress_rx) = mpsc::channel(EGRESS_CHANNEL_CAP);
         let (key_updater, identity_rx) = KeyUpdater::new();
@@ -163,7 +160,7 @@ impl QuicDatagramEndpoint {
             banlist,
             identity_rx,
             outbound,
-            inbound_live,
+            inbound,
             stats,
             alpn: alpn_protocol_id,
         };
@@ -197,11 +194,11 @@ struct EndpointLoop {
     allowlist: Arc<dyn Allowlist>,
     banlist: Arc<Banlist<Pubkey>>,
     identity_rx: watch::Receiver<Option<Arc<IdentitySnapshot>>>,
-    /// Outbound (dialer) connections - the only per-peer table. Inbound
-    /// connections are receive-only and tracked solely by `inbound_live`.
+    /// Outbound (dialer) connections - the only per-peer connection table.
     outbound: Arc<Outbound>,
-    /// Live inbound-connection count, shared with every inbound task (cap).
-    inbound_live: Arc<AtomicU64>,
+    /// Inbound admission limiter (global + per-identity caps), shared with
+    /// every inbound task.
+    inbound: Arc<Inbound>,
     stats: Arc<QuicDatagramStats>,
     /// Held so that an identity rotation can rebuild server + client TLS
     /// configs without revisiting the caller.
@@ -263,10 +260,7 @@ impl EndpointLoop {
                 // it is usually not a problem.
                 _ = prune.tick() => self.banlist.prune(),
                 _ = metrics.tick() => {
-                    let live = self
-                        .outbound
-                        .len()
-                        .saturating_add(self.inbound_live.load(Ordering::Relaxed));
+                    let live = self.outbound.len().saturating_add(self.inbound.len());
                     stats::report(&self.stats, live);
                 }
             }
@@ -363,7 +357,7 @@ impl EndpointLoop {
             ingress: self.ingress.clone(),
             allowlist: self.allowlist.clone(),
             banlist: self.banlist.clone(),
-            live: self.inbound_live.clone(),
+            inbound: self.inbound.clone(),
             stats: self.stats.clone(),
         }
         .spawn();
