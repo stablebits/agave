@@ -22,14 +22,14 @@ use {
         stats::{QuicDatagramStats, record_error},
     },
     crossbeam_channel::Sender,
-    dashmap::{DashMap, mapref::entry::Entry},
     log::debug,
+    parking_lot::Mutex,
     quinn::Incoming,
     solana_pubkey::Pubkey,
     solana_tls_utils::get_remote_pubkey,
-    std::sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+    std::{
+        collections::{HashMap, hash_map::Entry},
+        sync::Arc,
     },
 };
 
@@ -45,51 +45,58 @@ use {
 /// handles); it is NOT a connection table. Entries are removed when their count
 /// reaches zero, so the map is bounded by the live peer set.
 pub(crate) struct Inbound {
-    total: AtomicU64,
-    per_id: DashMap<Pubkey, u32>,
+    inner: Mutex<InboundState>,
+}
+
+/// The two counts under one lock, so the global total and the per-identity map
+/// can never drift apart.
+struct InboundState {
+    total: u64,
+    per_id: HashMap<Pubkey, u32>,
 }
 
 impl Inbound {
     pub(crate) fn new() -> Self {
         Self {
-            total: AtomicU64::new(0),
-            per_id: DashMap::new(),
+            inner: Mutex::new(InboundState {
+                total: 0,
+                per_id: HashMap::new(),
+            }),
         }
     }
 
     /// Total live inbound connections (for the metrics gauge).
     pub(crate) fn len(&self) -> u64 {
-        self.total.load(Ordering::Relaxed)
+        self.inner.lock().total
     }
 
-    /// Reserve a slot for a connection from `peer`: the per-identity cap first,
-    /// then the global cap. Returns an RAII [`InboundSlot`] that releases both
+    /// Reserve a slot for a connection from `peer`: global cap first, then the
+    /// per-identity cap. Returns an RAII [`InboundSlot`] that releases both
     /// counts on drop, or `None` if either cap is hit (caller closes the
-    /// connection). Both checks are racy under concurrent admits - a slight,
-    /// transient overshoot is acceptable.
+    /// connection).
     pub(crate) fn admit(self: &Arc<Self>, peer: Pubkey) -> Option<InboundSlot> {
-        // Per-identity cap.
+        let mut state = self.inner.lock();
+        if state.total >= MAX_PEERS {
+            return None;
+        }
         {
-            let mut count = self.per_id.entry(peer).or_insert(0);
+            let count = state.per_id.entry(peer).or_insert(0);
             if *count >= MAX_CONNECTIONS_PER_PEER {
                 return None;
             }
             *count = count.saturating_add(1);
         }
-        // Global cap; roll back the per-identity increment if we exceed it.
-        if self.total.fetch_add(1, Ordering::Relaxed) >= MAX_PEERS {
-            self.total.fetch_sub(1, Ordering::Relaxed);
-            self.release_id(&peer);
-            return None;
-        }
+        state.total = state.total.saturating_add(1);
         Some(InboundSlot {
             inbound: Arc::clone(self),
             peer,
         })
     }
 
-    fn release_id(&self, peer: &Pubkey) {
-        if let Entry::Occupied(mut e) = self.per_id.entry(*peer) {
+    fn release(&self, peer: &Pubkey) {
+        let mut state = self.inner.lock();
+        state.total = state.total.saturating_sub(1);
+        if let Entry::Occupied(mut e) = state.per_id.entry(*peer) {
             let remaining = e.get().saturating_sub(1);
             if remaining == 0 {
                 e.remove();
@@ -110,8 +117,7 @@ pub(crate) struct InboundSlot {
 
 impl Drop for InboundSlot {
     fn drop(&mut self) {
-        self.inbound.total.fetch_sub(1, Ordering::Relaxed);
-        self.inbound.release_id(&self.peer);
+        self.inbound.release(&self.peer);
     }
 }
 

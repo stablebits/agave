@@ -16,12 +16,13 @@ use {
         stats::{QuicDatagramStats, add, record_error},
     },
     bytes::Bytes,
-    dashmap::{DashMap, mapref::entry::Entry},
     log::{error, info},
+    parking_lot::Mutex,
     quinn::{Connection, Endpoint},
     solana_pubkey::Pubkey,
     solana_tls_utils::{get_remote_pubkey, socket_addr_to_quic_server_name},
     std::{
+        collections::{HashMap, hash_map::Entry},
         net::SocketAddr,
         sync::{
             Arc,
@@ -38,15 +39,16 @@ pub(crate) type IdGeneration = u64;
 
 /// Per-peer outbound connection map. Holds up to [`crate::MAX_PEERS`] entries.
 ///
-/// Backed by [`DashMap`] - the control loop reserves dial slots while dial
-/// tasks install / reap concurrently.
-///
-/// INVARIANT: no method holds a `dashmap` guard across an `.await` (every
-/// method is a plain `fn`), so guards can't deadlock the runtime.
+/// A plain `Mutex<HashMap>`: the control loop (egress) is the dominant
+/// accessor, with dial tasks installing / reaping on connection-lifecycle
+/// events. Every access is brief, synchronous, and never held across an
+/// `.await`, so a single lock neither deadlocks the runtime nor contends
+/// meaningfully at handshake / egress rates. `generation` stays a standalone
+/// atomic: it is read before the map is locked (so a rotation can be detected
+/// without taking the lock) and bumped first in [`Self::clear_for_id_change`].
 pub(crate) struct Outbound {
-    inner: DashMap<Pubkey, OutboundEntry>,
+    inner: Mutex<HashMap<Pubkey, OutboundEntry>>,
     generation: AtomicU64,
-    len: AtomicU64,
 }
 
 enum OutboundEntry {
@@ -83,15 +85,14 @@ enum Install {
 impl Outbound {
     pub(crate) fn new() -> Self {
         Self {
-            inner: DashMap::new(),
+            inner: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(0),
-            len: AtomicU64::new(0),
         }
     }
 
     /// Live entry count (`Dialing` + `Established`).
     pub(crate) fn len(&self) -> u64 {
-        self.len.load(Ordering::Relaxed)
+        self.inner.lock().len() as u64
     }
 
     fn current_generation(&self) -> IdGeneration {
@@ -112,10 +113,9 @@ impl Outbound {
         stats: &QuicDatagramStats,
     ) -> Dispatch {
         let generation = self.current_generation();
-        match self.inner.entry(peer) {
+        match self.inner.lock().entry(peer) {
             Entry::Vacant(slot) => {
                 slot.insert(OutboundEntry::Dialing(generation));
-                self.len.fetch_add(1, Ordering::Relaxed);
                 Dispatch::Dial { generation }
             }
             Entry::Occupied(mut slot) => match slot.get() {
@@ -133,10 +133,8 @@ impl Outbound {
                     Dispatch::Sent
                 }
                 OutboundEntry::Established(_) => {
-                    let old = std::mem::replace(
-                        slot.get_mut(),
-                        OutboundEntry::Dialing(generation),
-                    );
+                    let old =
+                        std::mem::replace(slot.get_mut(), OutboundEntry::Dialing(generation));
                     if let OutboundEntry::Established(old_conn) = old {
                         close_codes::PEER_MOVED.close(&old_conn);
                         stats
@@ -156,21 +154,20 @@ impl Outbound {
         if self.current_generation() != gen_at_start {
             return Install::Stale;
         }
-        let at_cap = self.len() >= MAX_PEERS;
-        match self.inner.entry(peer) {
+        let mut map = self.inner.lock();
+        let at_cap = map.len() as u64 >= MAX_PEERS;
+        match map.entry(peer) {
             Entry::Vacant(slot) => {
                 if at_cap {
                     return Install::Rejected;
                 }
                 slot.insert(OutboundEntry::Established(conn));
-                self.len.fetch_add(1, Ordering::Relaxed);
                 Install::Installed
             }
             Entry::Occupied(mut slot) => {
                 let old = std::mem::replace(slot.get_mut(), OutboundEntry::Established(conn));
                 // Replacing our own `Dialing` placeholder (normal) or a stale
-                // `Established` left at a changed address: either way the slot
-                // was already counted in `len`.
+                // `Established` left at a changed address.
                 if let OutboundEntry::Established(old_conn) = old {
                     close_codes::PEER_MOVED.close(&old_conn);
                 }
@@ -182,22 +179,20 @@ impl Outbound {
     /// Drop the slot for `peer` iff it still holds a `Dialing` placeholder at
     /// the same generation (a dial that failed before installing).
     fn clear_dialing(&self, peer: &Pubkey, generation: IdGeneration) {
-        if let Entry::Occupied(slot) = self.inner.entry(*peer)
+        if let Entry::Occupied(slot) = self.inner.lock().entry(*peer)
             && matches!(slot.get(), OutboundEntry::Dialing(g) if *g == generation)
         {
             slot.remove();
-            self.len.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
     /// Drop the slot for `peer` iff it still holds the `Established` with this
     /// `stable_id` (a later redial may already have taken the slot).
     fn reap(&self, peer: &Pubkey, stable_id: usize) {
-        if let Entry::Occupied(slot) = self.inner.entry(*peer)
+        if let Entry::Occupied(slot) = self.inner.lock().entry(*peer)
             && matches!(slot.get(), OutboundEntry::Established(c) if c.stable_id() == stable_id)
         {
             slot.remove();
-            self.len.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -207,15 +202,14 @@ impl Outbound {
     /// number of entries dropped.
     pub(crate) fn clear_for_id_change(&self) -> u64 {
         self.generation.fetch_add(1, Ordering::SeqCst);
-        let mut evicted: u64 = 0;
-        self.inner.retain(|_, entry| {
+        let mut map = self.inner.lock();
+        let evicted = map.len() as u64;
+        for entry in map.values() {
             if let OutboundEntry::Established(conn) = entry {
                 close_codes::IDENTITY_ROTATED.close(conn);
             }
-            evicted = evicted.saturating_add(1);
-            self.len.fetch_sub(1, Ordering::Relaxed);
-            false
-        });
+        }
+        map.clear();
         evicted
     }
 }
