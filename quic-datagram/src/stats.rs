@@ -21,10 +21,6 @@ pub(crate) struct QuicDatagramStats {
     /// `send_datagram` found the connection already gone. This is normal
     /// churn, not likely to be a fault.
     pub(crate) connection_lost: AtomicU64,
-    /// Egress dropped because local_pubkey >= peer (we are the lex-higher
-    /// side, so we never dial) and no inbound connection from that peer
-    /// has been accepted yet.
-    pub(crate) egress_dropped_higher_pubkey: AtomicU64,
     /// Follower egress dropped because a dial is already in flight for the
     /// peer. The egress that *triggered* the dial is carried into the dial
     /// task and sent the moment the connection lands; only subsequent egress
@@ -41,11 +37,6 @@ pub(crate) struct QuicDatagramStats {
     /// Lex-lower side evicted a cached outbound connection because the caller
     /// supplied a new socket addr for the same pubkey (peer moved).
     pub(crate) connection_evicted_peer_moved: AtomicU64,
-    /// We closed a peer's existing connection with HANDOVER because a new
-    /// handshake from the same pubkey arrived.
-    pub(crate) connection_replaced_handover: AtomicU64,
-    /// A peer closed our connection with HANDOVER - we have been replaced.
-    pub(crate) handover_received: AtomicU64,
 
     // --- Error buckets ---
     /// A connection failed abnormally: dial setup error, protocol-level
@@ -176,11 +167,6 @@ pub(crate) fn report(stats: &QuicDatagramStats, live_connections: u64) {
             i64
         ),
         (
-            "egress_dropped_higher_pubkey",
-            swap!(stats.egress_dropped_higher_pubkey),
-            i64
-        ),
-        (
             "egress_dropped_dial_in_progress",
             swap!(stats.egress_dropped_dial_in_progress),
             i64
@@ -205,11 +191,5 @@ pub(crate) fn report(stats: &QuicDatagramStats, live_connections: u64) {
             swap!(stats.connection_evicted_peer_moved),
             i64
         ),
-        (
-            "connection_replaced_handover",
-            swap!(stats.connection_replaced_handover),
-            i64
-        ),
-        ("handover_received", swap!(stats.handover_received), i64),
     );
 }
