@@ -8,7 +8,7 @@ pub mod error;
 pub mod testutils;
 
 pub(crate) mod client;
-pub(crate) mod close_codes;
+pub(crate) use error::close_codes;
 pub(crate) mod connection_table;
 pub mod endpoint;
 pub mod key_updater;
@@ -34,7 +34,7 @@ pub const BAN_DURATION_SHORT: Duration = Duration::from_secs(5);
 
 /// Maximum number of unique peer pubkeys held in the connection table.
 /// Sized for the maximum expected alpenglow staked-node count.
-pub const MAX_PEERS: usize = 2000;
+pub const MAX_PEERS: u64 = 2000;
 
 /// Capacity of the egress channel held by [`QuicDatagramEndpoint`]. Senders
 /// must `try_send` and accept drop-on-full.

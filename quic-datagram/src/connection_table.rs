@@ -28,7 +28,7 @@ use {
 /// service (e.g. votor).
 ///
 /// Backed by [`DashMap`] - multiple tasks (server-accept, client-egress,
-/// per-connection read loops, banlist evictor) hammer the table concurrently.
+/// per-connection read loops, banlist evictor) access the table concurrently.
 ///
 /// INVARIANT: no code path can hold a `Ref`/`RefMut` from the DashMap across
 /// an `.await` - DashMap entry locks held across yield points will deadlock
@@ -40,6 +40,7 @@ pub(crate) struct ConnectionTable {
     inner: DashMap<Pubkey, ConnectionTableEntry>,
     /// See [`IdGeneration`]. Bumped by [`Self::clear`].
     generation: AtomicU64,
+    len: AtomicU64,
 }
 
 /// State of a peer's entry in the connection table.
@@ -102,24 +103,20 @@ impl ConnectionTable {
         Self {
             inner: DashMap::new(),
             generation: AtomicU64::new(0),
+            len: AtomicU64::new(0),
         }
     }
 
-    /// Current number of entries (both `Dialing` and `Established`). Sampled
-    /// by the control loop for the live-connection gauge and by the
-    /// establishment paths to update the peak high-water mark.
-    ///
-    /// MUST NOT be called while holding a DashMap entry guard - `len()`
-    /// iterates every shard and would deadlock on the pinned shard's lock.
+    /// Current number of active entries.
     pub(crate) fn len(&self) -> u64 {
-        self.inner.len() as u64
+        self.len.load(Ordering::Relaxed)
     }
 
-    /// Snapshot the current [`IdGeneration`]. Server-accept and dial
-    /// paths read this at the start of their handshake and pass it back
+    /// Snapshot the current [`IdGeneration`]. New connections should
+    /// sample this at the start of their handshake and pass it back
     /// into [`Self::insert_connection`] and (on the dial side)
-    /// [`Self::clear_dialing_placeholder`] so a rotation that happens
-    /// mid-operation can be detected.
+    /// [`Self::clear_dialing_placeholder`] so ID rotation that happens
+    /// mid-handshake can be detected.
     pub(crate) fn current_generation(&self) -> IdGeneration {
         // this happens rarely, SeqCst is ok
         self.generation.load(Ordering::SeqCst)
@@ -148,20 +145,16 @@ impl ConnectionTable {
         if self.current_generation() != gen_at_start {
             return InsertOutcome::Stale;
         }
-        // CRITICAL: check `len()` BEFORE acquiring an `Entry`. Holding an
-        // entry pins one of DashMap's internal shard locks; `len()` then
-        // iterates over every shard and would deadlock on its own shard
-        // (std::sync::RwLock is not reentrant).
-        //
-        // The MAX_PEERS check is racy under concurrent inserts to different
+        // The check here is racy under concurrent inserts to different
         // vacant keys - going slightly over is acceptable.
-        let at_cap = self.inner.len() >= MAX_PEERS;
+        let at_cap = self.len() >= MAX_PEERS;
         match self.inner.entry(peer) {
             Entry::Vacant(slot) => {
                 if at_cap {
                     return InsertOutcome::Rejected;
                 }
                 slot.insert(ConnectionTableEntry::Established(conn));
+                self.len.fetch_add(1, Ordering::Relaxed);
                 InsertOutcome::Inserted
             }
             Entry::Occupied(mut slot) => {
@@ -262,6 +255,7 @@ impl ConnectionTable {
         match self.inner.entry(peer) {
             Entry::Vacant(slot) => {
                 slot.insert(ConnectionTableEntry::Dialing(generation));
+                self.len.fetch_add(1, Ordering::Relaxed);
                 // Trigger packet is carried into the dial task and sent
                 // the moment the connection lands - the cold-start /
                 // standstill case needs it. Subsequent followers during
@@ -312,6 +306,7 @@ impl ConnectionTable {
         if let Entry::Occupied(entry) = self.inner.entry(*peer)
             && matches!(entry.get(), ConnectionTableEntry::Established(c) if c.stable_id() == stable_id)
         {
+            self.len.fetch_sub(1, Ordering::Relaxed);
             entry.remove();
         }
     }
@@ -347,6 +342,7 @@ impl ConnectionTable {
             stats
                 .connection_evicted_allowlist
                 .fetch_add(1, Ordering::Relaxed);
+            self.len.fetch_sub(1, Ordering::Relaxed);
             true
         } else {
             // Slot vanished between the scan and the remove. Caller will
@@ -362,12 +358,13 @@ impl ConnectionTable {
     /// dial. Race-safe: silently does nothing if some other path
     /// replaced the slot with an `Established`, or if a later
     /// generation's dialer already swapped its own `Dialing` in (we
-    /// must not clobber a fresher placeholder).
+    /// must not clobber a fresh placeholder).
     pub(crate) fn clear_dialing_placeholder(&self, peer: &Pubkey, generation: IdGeneration) {
         if let Entry::Occupied(slot) = self.inner.entry(*peer)
             && matches!(slot.get(), ConnectionTableEntry::Dialing(g) if *g == generation)
         {
             slot.remove();
+            self.len.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -391,6 +388,7 @@ impl ConnectionTable {
                 close_codes::IDENTITY_ROTATED.close(conn);
             }
             evicted = evicted.saturating_add(1);
+            self.len.fetch_sub(1, Ordering::Relaxed);
             false
         });
         evicted

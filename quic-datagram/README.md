@@ -1,13 +1,12 @@
 # solana-quic-datagram
 
-A QUIC-datagram transport designed for Solana's votor consensus traffic.
+A QUIC-datagram transport designed for Solana's votor consensus traffic. 
 Single [`quinn::Endpoint`] per node bound to one UDP socket, playing both
 client and server roles. Peer identity is the ed25519 pubkey embedded in
-a self-signed TLS cert; connections are gated by an `Allowlist` trait.
-Bidirectional and unidirectional streams are disabled at the transport
-level - only QUIC datagrams flow.
+a self-signed TLS cert; connections are gated to staked only by an `Allowlist` trait.
+Streams are disabled at the transport config level - only QUIC datagrams flow.
 
-## Why this architecture
+# Why datagrams and not streamer?
 
 - **No HoL blocking.** Stream-based transports retransmit every message
   on the same connection when a packet is lost. A vote that didn't arrive
@@ -15,17 +14,20 @@ level - only QUIC datagrams flow.
   losing one shouldn't delay the transmission of the next.
 - **No per-message stream open/close.** Votor sends small (≤1200 byte)
   payloads at ~4/slot/peer. A stream per message is pure overhead.
-- **Fire-and-forget semantics match production.** `VotingService`'s
+- **Fire-and-forget semantics** `VotingService`'s
   `broadcast_consensus_message` already uses `try_send` with
-  drop-on-full; datagrams reflect that on the wire.
+  drop-on-full; datagrams reflect that on the wire. Votor does not 
+  care about packet losses as much as tower did, and has builtin
+  retransmits.
 - **No congestion control.** Votor traffic is not flexible, it has
   fixed bandwidth demands and can not slow down in response to
   congestion.
+- **One connection per peer** unlike existing solutions used for TPU, this 
+  allows each connection to be used in both directions, reducing overheads.
 - **ACKs throttled.** `AckFrequencyConfig` is tuned to minimize the
   amount of ACK packets that we have to carry on the wire.
 
 ## Architecture
-
 One tokio task - `endpoint::EndpointLoop::run` - multiplexes every
 event source via a single `tokio::select!`:
 
@@ -36,9 +38,8 @@ event source via a single `tokio::select!`:
 - banlist-prune timer (hourly)
 - metrics-report timer (every 2 s)
 
-Heavy per-event work (TLS handshake, dial, etc.) is spawned onto its own
-short-lived task so a slow handshake never blocks dispatch.
-
+Heavy per-event work (TLS handshakes) is spawned onto its own task, 
+which then morphs into connection read loop if successful.
 
 ## Connection table
 
@@ -54,8 +55,19 @@ enum ConnectionTableEntry {
 This is needed to avoid having more than one connection to a given peer.
 The server-accept pipeline (TLS, identity validation, allowlist check) lives
 entirely in the spawned per-incoming task and only touches the table at
-the end via `insert_connection`. There's no useful in-flight server-side
-state worth modeling in the table.
+the end via `insert_connection`. 
+
+### Why connection table
+
+Table serves two objectives:
+* Admission control - we do not allow > 1 connection per peer ID, votor has no need
+  to allow more.
+* Dispatch of egress packets - we need to pick a connection to send over irrespective
+  of travel direction.
+
+We could split the single table into 2 (one for egress, one for ingress) only if we 
+use each connection in one direction. This does remove some locking, but does not 
+notably simplify the implementation.
 
 ## Lex-pubkey tiebreaker
 
