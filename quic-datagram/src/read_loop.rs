@@ -5,8 +5,8 @@ use {
     crate::{
         ALLOWLIST_CHECK_INTERVAL, BAN_DURATION_DOS, BAN_DURATION_SHORT, Banlist,
         MAX_DATAGRAMS_PER_SECOND_PER_PEER, PEER_RATE_LIMIT_BURST, PEER_RATE_LIMIT_BURST_DOS,
-        allowlist::Allowlist,
         close_codes,
+        connection_table::ConnectionTable,
         endpoint::Datagram,
         error::Error,
         stats::{QuicDatagramStats, record_error},
@@ -25,12 +25,12 @@ use {
 /// Drive the per-connection read loop. Returns when the
 /// connection closes. Caller is responsible for reaping the connection table entry
 /// afterwards.
-pub(crate) async fn read_datagram_loop<A: Allowlist>(
+pub(crate) async fn read_datagram_loop(
     connection: Connection,
     peer: Pubkey,
     remote_addr: SocketAddr,
     ingress: Sender<Datagram>,
-    allowlist: Arc<A>,
+    table: Arc<ConnectionTable>,
     banlist: Arc<Banlist<Pubkey>>,
     stats: Arc<QuicDatagramStats>,
 ) {
@@ -107,7 +107,7 @@ pub(crate) async fn read_datagram_loop<A: Allowlist>(
                 }
             }
             _ = allowlist_check.tick() => {
-                if !allowlist.allow(&peer) {
+                if !table.is_allowed(&peer) {
                     close_codes::NOT_ADMITTED.close(&connection);
                     stats.connection_evicted_allowlist.fetch_add(1, Ordering::Relaxed);
                     break;

@@ -1,6 +1,6 @@
 use {
     crate::{
-        MAX_PEERS, close_codes,
+        MAX_PEERS, allowlist::Allowlist, close_codes,
         error::Error,
         stats::{QuicDatagramStats, add, record_error},
     },
@@ -11,7 +11,10 @@ use {
     solana_pubkey::Pubkey,
     std::{
         net::SocketAddr,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
     },
 };
 
@@ -41,6 +44,11 @@ pub(crate) struct ConnectionTable {
     /// See [`IdGeneration`]. Bumped by [`Self::clear`].
     generation: AtomicU64,
     len: AtomicU64,
+    /// Policy for which peers may occupy a slot. Consulted by the server
+    /// admission gate ([`Self::is_allowed`]) before insert, and by each
+    /// connection's read loop, which re-checks on an interval and closes a
+    /// connection whose peer is no longer admitted.
+    allowlist: Arc<dyn Allowlist>,
 }
 
 /// State of a peer's entry in the connection table.
@@ -98,13 +106,23 @@ pub(crate) enum EgressDispatch {
 pub(crate) type IdGeneration = u64;
 
 impl ConnectionTable {
-    /// Create a new empty connection table.
-    pub(crate) fn new() -> Self {
+    /// Create a new empty connection table governed by `allowlist`.
+    pub(crate) fn new(allowlist: Arc<dyn Allowlist>) -> Self {
         Self {
             inner: DashMap::new(),
             generation: AtomicU64::new(0),
             len: AtomicU64::new(0),
+            allowlist,
         }
+    }
+
+    /// Whether `peer` is currently admitted by the allowlist. The server
+    /// accept path calls this as a pre-insert gate; each read loop calls it
+    /// on an interval to evict a peer that has since left the allowlist (the
+    /// dialing side never needs the gate - we only dial peers we already
+    /// intend to talk to).
+    pub(crate) fn is_allowed(&self, peer: &Pubkey) -> bool {
+        self.allowlist.allow(peer)
     }
 
     /// Current number of active entries.

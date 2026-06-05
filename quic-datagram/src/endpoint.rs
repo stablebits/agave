@@ -116,13 +116,13 @@ impl QuicDatagramEndpoint {
     /// `allowlist` is consulted once per new connection in either direction.
     /// `banlist` is consulted on every send and at handshake.
     #[allow(clippy::too_many_arguments)]
-    pub fn new<A: Allowlist>(
+    pub fn new(
         runtime: &tokio::runtime::Handle,
         keypair: &Keypair,
         socket: UdpSocket,
         alpn_protocol_id: &'static [u8],
         ingress: Sender<Datagram>,
-        allowlist: Arc<A>,
+        allowlist: Arc<dyn Allowlist>,
         banlist: Arc<Banlist<Pubkey>>,
     ) -> Result<Self, Error> {
         let local_pubkey = keypair.pubkey();
@@ -144,7 +144,7 @@ impl QuicDatagramEndpoint {
         };
         endpoint.set_default_client_config(client_config);
 
-        let table = Arc::new(ConnectionTable::new());
+        let table = Arc::new(ConnectionTable::new(allowlist));
         let stats = Arc::<QuicDatagramStats>::default();
         let (egress_tx, egress_rx) = mpsc::channel(EGRESS_CHANNEL_CAP);
         let (key_updater, identity_rx) = KeyUpdater::new();
@@ -155,7 +155,6 @@ impl QuicDatagramEndpoint {
             local_pubkey,
             egress_rx,
             ingress,
-            allowlist,
             banlist,
             identity_rx,
             connections: table,
@@ -182,12 +181,11 @@ impl QuicDatagramEndpoint {
     }
 }
 
-struct EndpointLoop<A: Allowlist> {
+struct EndpointLoop {
     endpoint: Endpoint,
     local_pubkey: Pubkey,
     egress_rx: mpsc::Receiver<Datagram>,
     ingress: Sender<Datagram>,
-    allowlist: Arc<A>,
     banlist: Arc<Banlist<Pubkey>>,
     identity_rx: watch::Receiver<Option<Arc<IdentitySnapshot>>>,
     connections: Arc<ConnectionTable>,
@@ -197,7 +195,7 @@ struct EndpointLoop<A: Allowlist> {
     alpn: &'static [u8],
 }
 
-impl<A: Allowlist> EndpointLoop<A> {
+impl EndpointLoop {
     async fn run(mut self) {
         let subnet_limit = Arc::new(SubnetRateLimiter::new());
 
@@ -337,7 +335,6 @@ impl<A: Allowlist> EndpointLoop<A> {
             id_generation: generation,
             trigger: bytes,
             ingress: self.ingress.clone(),
-            allowlist: self.allowlist.clone(),
             banlist: self.banlist.clone(),
             table: self.connections.clone(),
             stats: self.stats.clone(),
@@ -376,7 +373,6 @@ impl<A: Allowlist> EndpointLoop<A> {
             incoming,
             local_pubkey: self.local_pubkey,
             ingress: self.ingress.clone(),
-            allowlist: self.allowlist.clone(),
             banlist: self.banlist.clone(),
             table: self.connections.clone(),
             stats: self.stats.clone(),

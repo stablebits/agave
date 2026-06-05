@@ -3,7 +3,6 @@
 use {
     crate::{
         Banlist,
-        allowlist::Allowlist,
         close_codes,
         connection_table::{ConnectionTable, IdGeneration, InsertOutcome},
         endpoint::Datagram,
@@ -23,7 +22,7 @@ use {
 /// A client-side connection's full lifecycle: dial, validate identity,
 /// install in the table, run the read loop, reap on exit. Built by the
 /// control loop and dispatched via [`Self::spawn`].
-pub(crate) struct ClientConnection<A: Allowlist> {
+pub(crate) struct ClientConnection {
     pub(crate) endpoint: Endpoint,
     pub(crate) peer: Pubkey,
     pub(crate) addr: SocketAddr,
@@ -34,13 +33,12 @@ pub(crate) struct ClientConnection<A: Allowlist> {
     /// reach the peer reliably.
     pub(crate) trigger: Bytes,
     pub(crate) ingress: Sender<Datagram>,
-    pub(crate) allowlist: Arc<A>,
     pub(crate) banlist: Arc<Banlist<Pubkey>>,
     pub(crate) table: Arc<ConnectionTable>,
     pub(crate) stats: Arc<QuicDatagramStats>,
 }
 
-impl<A: Allowlist> ClientConnection<A> {
+impl ClientConnection {
     /// Spawn a tokio task that drives this connection to completion.
     /// Returns immediately; the task logs and records any error before
     /// exiting.
@@ -109,7 +107,7 @@ impl<A: Allowlist> ClientConnection<A> {
                 self.peer,
                 self.addr,
                 self.ingress,
-                self.allowlist,
+                self.table.clone(),
                 self.banlist,
                 self.stats,
             )
@@ -128,17 +126,16 @@ impl<A: Allowlist> ClientConnection<A> {
 }
 
 /// A server-side connection representation
-pub(crate) struct ServerConnection<A: Allowlist> {
+pub(crate) struct ServerConnection {
     pub(crate) incoming: Incoming,
     pub(crate) local_pubkey: Pubkey,
     pub(crate) ingress: Sender<Datagram>,
-    pub(crate) allowlist: Arc<A>,
     pub(crate) banlist: Arc<Banlist<Pubkey>>,
     pub(crate) table: Arc<ConnectionTable>,
     pub(crate) stats: Arc<QuicDatagramStats>,
 }
 
-impl<A: Allowlist> ServerConnection<A> {
+impl ServerConnection {
     /// Spawn a tokio task that drives this connection to completion.
     pub(crate) fn spawn(self) {
         let remote_addr = self.incoming.remote_address();
@@ -176,7 +173,7 @@ impl<A: Allowlist> ServerConnection<A> {
             close_codes::BANNED.close(&connection);
             return Err(Error::Banned(peer));
         }
-        if !self.allowlist.allow(&peer) {
+        if !self.table.is_allowed(&peer) {
             close_codes::NOT_ADMITTED.close(&connection);
             return Err(Error::NotAdmitted(peer));
         }
@@ -206,7 +203,7 @@ impl<A: Allowlist> ServerConnection<A> {
             peer,
             remote_addr,
             self.ingress,
-            self.allowlist,
+            self.table.clone(),
             self.banlist,
             self.stats,
         )
