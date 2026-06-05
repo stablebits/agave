@@ -205,12 +205,9 @@ impl ConnectionTable {
         }
     }
 
-    /// Transmit over the cached inbound connection for `peer` (lex-higher side).
+    /// Transmit over the cached inbound connection for `peer`.
     /// Returns `true` iff a cached `Established` was found and the send was
-    /// attempted; `false` if the slot is empty. The lex-higher side never
-    /// installs `Dialing` placeholders, so that arm is impossible by
-    /// construction and trips a `debug_assert` if hit. Successful sends bump
-    /// `datagrams_sent`; send failures are recorded via `record_error`.
+    /// attempted; `false` if the slot is empty.
     pub(crate) fn send_over_inbound_connection(
         &self,
         peer: &Pubkey,
@@ -353,9 +350,9 @@ impl ConnectionTable {
     }
 
     /// Remove the slot for `peer` iff it still holds a `Dialing`
-    /// placeholder tagged with the same generation. Called by the
-    /// dialer task on failure so the next egress can spawn a fresh
-    /// dial. Race-safe: silently does nothing if some other path
+    /// placeholder tagged with the same generation.
+    ///
+    /// Silently does nothing if some other path
     /// replaced the slot with an `Established`, or if a later
     /// generation's dialer already swapped its own `Dialing` in (we
     /// must not clobber a fresh placeholder).

@@ -9,12 +9,11 @@ use {
     crate::{
         Banlist, EGRESS_CHANNEL_CAP,
         allowlist::Allowlist,
-        client::ClientConnection,
         close_codes,
+        connection::{ClientConnection, ServerConnection},
         connection_table::{ConnectionTable, EgressDispatch},
         error::Error,
         key_updater::{IdentitySnapshot, KeyUpdater},
-        server::ServerConnection,
         stats::{self, QuicDatagramStats, add},
         subnet_rate_limit::SubnetRateLimiter,
         transport::{new_client_config, new_server_config},
