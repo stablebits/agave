@@ -1,19 +1,20 @@
-//! Per-connection reader task. Shared by server-accepted and client-dialed
-//! connections - both push received datagrams into the same ingress channel.
+//! Per-connection receive loop for inbound (accepted) connections: push
+//! received datagrams into the ingress channel. Outbound (dialed) connections
+//! are send-only and never run this loop.
 
 use {
     crate::{
-        ALLOWLIST_CHECK_INTERVAL, BAN_DURATION_DOS, BAN_DURATION_SHORT, Banlist,
+        ALLOWLIST_CHECK_INTERVAL, BAN_DURATION_DOS, Banlist,
         MAX_DATAGRAMS_PER_SECOND_PER_PEER, PEER_RATE_LIMIT_BURST, PEER_RATE_LIMIT_BURST_DOS,
+        allowlist::Allowlist,
         close_codes,
-        connection_table::ConnectionTable,
         endpoint::Datagram,
         error::Error,
         stats::{QuicDatagramStats, record_error},
     },
     crossbeam_channel::{Sender, TrySendError},
     log::debug,
-    quinn::{Connection, ConnectionError},
+    quinn::Connection,
     solana_net_utils::token_bucket::TokenBucket,
     solana_pubkey::Pubkey,
     std::{
@@ -22,15 +23,16 @@ use {
     },
 };
 
-/// Drive the per-connection read loop. Returns when the
-/// connection closes. Caller is responsible for reaping the connection table entry
-/// afterwards.
+/// Drive a receive connection's read loop: push datagrams into `ingress`,
+/// enforce the per-connection rate limit and banlist, and close the connection
+/// if `peer` drops out of the allowlist on the periodic re-check. Returns when
+/// the connection closes; the caller updates its live-connection count after.
 pub(crate) async fn read_datagram_loop(
     connection: Connection,
     peer: Pubkey,
     remote_addr: SocketAddr,
     ingress: Sender<Datagram>,
-    table: Arc<ConnectionTable>,
+    allowlist: Arc<dyn Allowlist>,
     banlist: Arc<Banlist<Pubkey>>,
     stats: Arc<QuicDatagramStats>,
 ) {
@@ -96,18 +98,13 @@ pub(crate) async fn read_datagram_loop(
                         }
                     }
                     Err(e) => {
-                        if matches!(&e, ConnectionError::ApplicationClosed(c) if c.error_code == close_codes::HANDOVER.code)
-                        {
-                            stats.handover_received.fetch_add(1, Ordering::Relaxed);
-                            banlist.ban(peer, BAN_DURATION_SHORT);
-                        }
                         record_error(&Error::from(e), &stats);
                         break;
                     }
                 }
             }
             _ = allowlist_check.tick() => {
-                if !table.is_allowed(&peer) {
+                if !allowlist.allow(&peer) {
                     close_codes::NOT_ADMITTED.close(&connection);
                     stats.connection_evicted_allowlist.fetch_add(1, Ordering::Relaxed);
                     break;
@@ -125,12 +122,11 @@ mod tests {
             allowlist::AllowAll,
             endpoint::Datagram,
             testutils::{
-                clone_keypair, drain_matching, keypair_below, make_runtime, recv_until,
-                send_until_received, spawn_node, spawn_node_with,
+                drain_matching, keypair_below, make_runtime, recv_until, send_until_received,
+                spawn_node, spawn_node_with,
             },
         },
         bytes::Bytes,
-        solana_keypair::Signer,
         std::{sync::Arc, time::Duration},
     };
 
@@ -190,90 +186,6 @@ mod tests {
         assert!(
             bad.is_err(),
             "banned client must not deliver datagrams to server; got {bad:?}"
-        );
-    }
-
-    #[test]
-    fn second_connection_with_same_keypair_handovers_first() {
-        let rt = make_runtime();
-        let server = spawn_node(&rt, Arc::new(AllowAll));
-
-        // Lex rule: shared client keypair must be lower than server's.
-        let shared = keypair_below(&server.pubkey());
-        let c_pubkey = shared.pubkey();
-        let c1 = spawn_node_with(&rt, Arc::new(AllowAll), clone_keypair(&shared));
-
-        // C1 establishes a connection by driving send-until-receive.
-        let p1 = Bytes::from_static(b"p1");
-        send_until_received(
-            &rt,
-            &c1.endpoint,
-            server.pubkey(),
-            server.addr,
-            p1.clone(),
-            &server.ingress_rx,
-            Duration::from_secs(5),
-            |d| (d.message == p1).then_some(()),
-            "server did not receive c1's probe",
-        );
-        drain_matching(&server.ingress_rx, Duration::from_millis(200), |d| {
-            d.message == p1
-        });
-
-        // C2 arrives with the same keypair. Its handshake completion at the
-        // server triggers HANDOVER on c1's connection.
-        let c2 = spawn_node_with(&rt, Arc::new(AllowAll), clone_keypair(&shared));
-        let p2 = Bytes::from_static(b"p2");
-        send_until_received(
-            &rt,
-            &c2.endpoint,
-            server.pubkey(),
-            server.addr,
-            p2.clone(),
-            &server.ingress_rx,
-            Duration::from_secs(5),
-            |d| (d.message == p2).then_some(()),
-            "server did not receive c2's probe",
-        );
-        drain_matching(&server.ingress_rx, Duration::from_millis(200), |d| {
-            d.message == p2
-        });
-
-        let server_pk = server.pubkey();
-
-        // C1's read loop observes the HANDOVER close and soft-bans the server.
-        // Give the async read loop a moment to process the close.
-        std::thread::sleep(Duration::from_millis(500));
-        assert!(
-            c1.banlist.is_banned(&server_pk),
-            "c1 must soft-ban the server that handovered it"
-        );
-
-        // After HANDOVER the server's table holds c2 only. Server's egress to
-        // c_pubkey reaches c2; c1 must not see post-handover datagrams.
-        let after = Bytes::from_static(b"post-handover");
-        rt.block_on(async {
-            server
-                .endpoint
-                .egress
-                .send(Datagram {
-                    peer_pubkey: c_pubkey,
-                    peer_address: c1.addr,
-                    message: after.clone(),
-                })
-                .await
-                .unwrap();
-        });
-        recv_until(
-            &c2.ingress_rx,
-            Duration::from_secs(5),
-            |d| (d.message == after).then_some(()),
-            "c2 (post-handover) must receive server's datagram",
-        );
-        let stray = c1.ingress_rx.recv_timeout(Duration::from_millis(800));
-        assert!(
-            stray.is_err(),
-            "c1 was handovered; must not receive post-handover datagrams; got {stray:?}"
         );
     }
 

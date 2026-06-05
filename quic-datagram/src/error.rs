@@ -53,20 +53,6 @@ pub(crate) mod close_codes {
         reason: b"TABLE_FULL",
     };
 
-    pub(crate) const WRONG_DIRECTION: Spec = Spec {
-        code: VarInt::from_u32(9),
-        reason: b"WRONG_DIRECTION",
-    };
-
-    /// A new handshake from a pubkey already in our table replaced the prior
-    /// connection. The receiving side observes this close in its read loop,
-    /// soft-bans the evicting peer, and forwards a handover-event uplevel so
-    /// consensus can decide whether to shut the node down.
-    pub(crate) const HANDOVER: Spec = Spec {
-        code: VarInt::from_u32(10),
-        reason: b"HANDOVER",
-    };
-
     pub(crate) const IDENTITY_ROTATED: Spec = Spec {
         code: VarInt::from_u32(11),
         reason: b"IDENTITY_ROTATED",
@@ -111,14 +97,6 @@ pub enum Error {
     /// and the incoming peer is not among them.
     #[error("connection table full")]
     TableFull,
-
-    /// Inbound handshake from a peer whose pubkey is greater than ours.
-    /// Per the lex-pubkey tiebreaker, the lower pubkey dials and the higher
-    /// listens - so a peer with pubkey >= local must not be dialing us. We
-    /// close the inbound; the surviving connection is the one our own client
-    /// dials in the reverse direction.
-    #[error("inbound from {0} rejected: wrong direction (lex tiebreaker)")]
-    WrongDirection(Pubkey),
 
     #[error(transparent)]
     SendDatagram(#[from] SendDatagramError),

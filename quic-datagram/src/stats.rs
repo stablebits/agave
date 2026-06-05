@@ -117,9 +117,7 @@ pub(crate) fn record_error(err: &Error, stats: &QuicDatagramStats) {
             | SendDatagramError::Disabled,
         ) => add(&stats.connect_failed),
         Error::NotAdmitted(_) | Error::Banned(_) => add(&stats.handshake_rejected_unauthorized),
-        Error::InvalidIdentity(_) | Error::WrongDirection(_) => {
-            add(&stats.handshake_rejected_protocol)
-        }
+        Error::InvalidIdentity(_) => add(&stats.handshake_rejected_protocol),
         Error::TableFull => add(&stats.handshake_rejected_overload),
         Error::IdentityRotated(_) => {
             // The new connection would have been an Established under the

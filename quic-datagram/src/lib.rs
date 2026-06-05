@@ -7,10 +7,10 @@ pub mod error;
 #[cfg(any(test, feature = "dev-context-only-utils"))]
 pub mod testutils;
 
-pub(crate) mod connection;
 pub(crate) use error::close_codes;
-pub(crate) mod connection_table;
 pub mod endpoint;
+pub(crate) mod inbound;
+pub(crate) mod outbound;
 pub(crate) mod read_loop;
 pub(crate) mod stats;
 pub(crate) mod subnet_rate_limit;
