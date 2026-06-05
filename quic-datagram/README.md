@@ -1,6 +1,6 @@
 # solana-quic-datagram
 
-A QUIC-datagram transport designed for Solana's votor consensus traffic. 
+A QUIC-datagram transport designed for Solana's votor consensus traffic.
 Single [`quinn::Endpoint`] per node bound to one UDP socket, playing both
 client and server roles. Peer identity is the ed25519 pubkey embedded in
 a self-signed TLS cert; connections are gated to staked only by an `Allowlist` trait.
@@ -16,13 +16,13 @@ Streams are disabled at the transport config level - only QUIC datagrams flow.
   payloads at ~4/slot/peer. A stream per message is pure overhead.
 - **Fire-and-forget semantics** `VotingService`'s
   `broadcast_consensus_message` already uses `try_send` with
-  drop-on-full; datagrams reflect that on the wire. Votor does not 
+  drop-on-full; datagrams reflect that on the wire. Votor does not
   care about packet losses as much as tower did, and has builtin
   retransmits.
 - **No congestion control.** Votor traffic is not flexible, it has
   fixed bandwidth demands and can not slow down in response to
   congestion.
-- **One connection per peer** unlike existing solutions used for TPU, this 
+- **One connection per peer** unlike existing solutions used for TPU, this
   allows each connection to be used in both directions, reducing overheads.
 - **ACKs throttled.** `AckFrequencyConfig` is tuned to minimize the
   amount of ACK packets that we have to carry on the wire.
@@ -38,7 +38,7 @@ event source via a single `tokio::select!`:
 - banlist-prune timer (hourly)
 - metrics-report timer (every 2 s)
 
-Heavy per-event work (TLS handshakes) is spawned onto its own task, 
+Heavy per-event work (TLS handshakes) is spawned onto its own task,
 which then morphs into connection read loop if successful.
 
 ## Connection table
@@ -55,7 +55,7 @@ enum ConnectionTableEntry {
 This is needed to avoid having more than one connection to a given peer.
 The server-accept pipeline (TLS, identity validation, allowlist check) lives
 entirely in the spawned per-incoming task and only touches the table at
-the end via `insert_connection`. 
+the end via `insert_connection`.
 
 ### Why connection table
 
@@ -65,8 +65,8 @@ Table serves two objectives:
 * Dispatch of egress packets - we need to pick a connection to send over irrespective
   of travel direction.
 
-We could split the single table into 2 (one for egress, one for ingress) only if we 
-use each connection in one direction. This does remove some locking, but does not 
+We could split the single table into 2 (one for egress, one for ingress) only if we
+use each connection in one direction. This does remove some locking, but does not
 notably simplify the implementation.
 
 ## Pubkey based connection direction tiebreaker
@@ -128,9 +128,9 @@ published a new addr for the peer), the slot is atomically swapped to
 `Dialing`, the displaced connection is closed with `PEER_MOVED`, and a
 fresh dial spawns at the new addr.
 
-The server side **does not** do this check. We could enforce incoming 
+The server side **does not** do this check. We could enforce incoming
 connections to be from the gossip ports only, but that requires changes
-to the votor API. 
+to the votor API.
 
 ## Security posture
 
@@ -153,7 +153,7 @@ to the votor API.
 6. **Per-connection RX token bucket.** Bursts above
    `BURST_DATAGRAMS_PER_SECOND_PER_PEER` are silently dropped (the
    bucket itself is the throttle). The connection stays alive; the
-   peer is **not** banned (consensus traffic legitimately bursts). 
+   peer is **not** banned (consensus traffic legitimately bursts).
    If the peer keeps flooding we will drop connection and ban it.
 7. **MAX_PEERS = 4000.** Defensive cap on the connection table size.
 
@@ -189,12 +189,12 @@ the new connection is closed with `IDENTITY_ROTATED`.
 At the end of an epoch, we may experience churn in the allowlist.
 Some peers will no longer be allowed, while some new ones will be
 admitted. We will eventually break connections to peers which are
-no longer in the allowlist. This keeps the logic simpler than the 
+no longer in the allowlist. This keeps the logic simpler than the
 explicit notify during epoch change.
 
 ## What this crate is not
 
-- Not a general-purpose datagram transport. All decisions assume a 
-  votor workload (small peer set, predictable cadence, no retransmits). 
+- Not a general-purpose datagram transport. All decisions assume a
+  votor workload (small peer set, predictable cadence, no retransmits).
 - Not a buffered transport. There is no per-peer queue. Bytes that have
   nowhere to go are gone.
