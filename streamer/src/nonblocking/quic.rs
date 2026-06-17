@@ -82,10 +82,10 @@ const CONNECTION_CLOSE_REASON_INVALID_STREAM: &[u8] = b"invalid_stream";
 /// Total new connection counts per second. Heuristically taken from
 /// the default staked and unstaked connection limits. Might be adjusted
 /// later.
-const TOTAL_CONNECTIONS_PER_SECOND: f64 = 2500.0;
+const TOTAL_CONNECTIONS_PER_SECOND: f64 = 10000.0;
 
 /// Max burst of connections above sustained rate to pass through
-const MAX_CONNECTION_BURST: u64 = 1000;
+const MAX_CONNECTION_BURST: u64 = 10000;
 
 /// Timeout for connection handshake. Timer starts once we get Initial from the
 /// peer, and is canceled when we get a Handshake packet from them.

@@ -39,14 +39,14 @@ use {
 pub const QUIC_MAX_TIMEOUT: Duration = Duration::from_secs(30);
 
 // allow multiple connections for NAT and any open/close overlap
-pub const DEFAULT_MAX_QUIC_CONNECTIONS_PER_UNSTAKED_PEER: usize = 8;
+pub const DEFAULT_MAX_QUIC_CONNECTIONS_PER_UNSTAKED_PEER: usize = 10000; // for test purposes
 
 // allow multiple connections per ID for geo-distributed forwarders
 pub const DEFAULT_MAX_QUIC_CONNECTIONS_PER_STAKED_PEER: usize = 16;
 
 pub const DEFAULT_MAX_STAKED_CONNECTIONS: usize = 2000;
 
-pub const DEFAULT_MAX_UNSTAKED_CONNECTIONS: usize = 2000;
+pub const DEFAULT_MAX_UNSTAKED_CONNECTIONS: usize = 8000;
 
 /// Limit to 500K PPS
 pub const DEFAULT_MAX_STREAMS_PER_MS: u64 = 500;
@@ -54,7 +54,7 @@ pub const DEFAULT_MAX_STREAMS_PER_MS: u64 = 500;
 /// The new connections per minute from a particular IP address.
 /// Heuristically set to the default maximum concurrent connections
 /// per IP address. Might be adjusted later.
-pub const DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE: u64 = 8;
+pub const DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE: u64 = 10000;
 
 // This will be adjusted and parameterized in follow-on PRs.
 pub const DEFAULT_QUIC_ENDPOINTS: usize = 1;
