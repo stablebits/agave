@@ -466,7 +466,11 @@ pub(crate) fn translate_to_runtime_view<D: TransactionData>(
 
     let Ok(view) = RuntimeTransaction::<SanitizedTransactionView<_>>::try_new(
         view,
-        MessageHash::Compute,
+        // TEST ONLY (swqos load testing): skip hash_raw_message() in the scheduler receive
+        // thread — nothing reads message_hash here once the status-cache check is disabled.
+        // NOTE: committed (valid) txs get a constant/fake hash, so status-cache-backed
+        // confirmation (getSignatureStatuses) is unreliable on this build.
+        MessageHash::Precomputed(solana_hash::Hash::default()),
         None,
     ) else {
         return Err(PacketHandlingError::Sanitization);
