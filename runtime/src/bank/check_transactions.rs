@@ -83,12 +83,12 @@ impl Bank {
             strict_nonce_size_check,
             error_counters,
         );
-        self.check_status_cache(
-            sanitized_txs,
-            lock_results,
-            collect_processed_slots,
-            error_counters,
-        )
+        // TEST ONLY (swqos load testing): skip the status-cache / already-processed
+        // (duplicate) check so the load generator can flood the validator with repeated
+        // transactions. WARNING: disables replay protection wherever check_transactions
+        // runs (admission, clean, AND execution) — never run this build on a real cluster.
+        let processed_slots = collect_processed_slots.then(|| vec![None::<Slot>; sanitized_txs.len()]);
+        (lock_results, processed_slots)
     }
 
     fn filter_v1_transactions<Tx: TransactionWithMeta>(
@@ -252,6 +252,7 @@ impl Bank {
         Some((*nonce_address, nonce_data))
     }
 
+    #[allow(dead_code)] // TEST ONLY: no longer called after disabling the status-cache check.
     fn check_status_cache<Tx: TransactionWithMeta>(
         &self,
         sanitized_txs: &[impl core::borrow::Borrow<Tx>],
@@ -291,6 +292,7 @@ impl Bank {
         (check_results, processed_slots)
     }
 
+    #[allow(dead_code)] // TEST ONLY: only used by check_status_cache, which is now bypassed.
     fn get_processed_slot(
         &self,
         sanitized_tx: &impl TransactionWithMeta,
