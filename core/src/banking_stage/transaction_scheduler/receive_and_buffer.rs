@@ -464,13 +464,19 @@ pub(crate) fn translate_to_runtime_view<D: TransactionData>(
         return Err(PacketHandlingError::Sanitization);
     };
 
+    // TEST ONLY (swqos load testing): skip hash_raw_message()'s SHA256 in the scheduler
+    // receive thread. Use the (already-parsed) first signature as a cheap UNIQUE stand-in for
+    // the message hash. A constant here collides every tx in try_lock_accounts_with_results'
+    // batch dedup -> AlreadyProcessed, which tanks block CU. Status-cache-backed confirmation
+    // (getSignatureStatuses) is still unreliable on this build.
+    let fake_message_hash = view
+        .signatures()
+        .first()
+        .map(|sig| solana_hash::Hash::new_from_array(sig.as_array()[..32].try_into().unwrap()))
+        .unwrap_or_default();
     let Ok(view) = RuntimeTransaction::<SanitizedTransactionView<_>>::try_new(
         view,
-        // TEST ONLY (swqos load testing): skip hash_raw_message() in the scheduler receive
-        // thread — nothing reads message_hash here once the status-cache check is disabled.
-        // NOTE: committed (valid) txs get a constant/fake hash, so status-cache-backed
-        // confirmation (getSignatureStatuses) is unreliable on this build.
-        MessageHash::Precomputed(solana_hash::Hash::default()),
+        MessageHash::Precomputed(fake_message_hash),
         None,
     ) else {
         return Err(PacketHandlingError::Sanitization);
