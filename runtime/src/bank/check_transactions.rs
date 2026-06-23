@@ -5,6 +5,7 @@ use {
     solana_clock::{MAX_TRANSACTION_FORWARDING_DELAY, Slot},
     solana_compute_budget::compute_budget::SVMTransactionExecutionBudget,
     solana_fee::{FeeFeatures, calculate_fee_details},
+    solana_hash::Hash,
     solana_nonce::state::{Data as NonceData, DurableNonce},
     solana_nonce_account::{self as nonce_account, SystemAccountKind, get_system_account_kind},
     solana_program_runtime::execution_budget::SVMTransactionExecutionAndFeeBudgetLimits,
@@ -124,6 +125,9 @@ impl Bank {
         let hash_queue = self.blockhash_queue.read().unwrap();
         let last_blockhash = hash_queue.last_hash();
         let next_durable_nonce = DurableNonce::from_blockhash(&last_blockhash);
+        // Batched transactions usually share a recent_blockhash; cache the last age lookup so
+        // we don't re-hash and re-probe the (ahash) blockhash queue for every transaction.
+        let mut recent_blockhash_age_cache: Option<(Hash, bool)> = None;
 
         let feature_set: &FeatureSet = &self.feature_set;
         let feature_snapshot = feature_set.snapshot();
@@ -180,6 +184,7 @@ impl Bank {
                         error_counters,
                         compute_budget_and_limits,
                         strict_nonce_size_check,
+                        &mut recent_blockhash_age_cache,
                     )
                 }
                 Err(e) => Err(e.clone()),
@@ -196,12 +201,22 @@ impl Bank {
         error_counters: &mut TransactionErrorMetrics,
         compute_budget: SVMTransactionExecutionAndFeeBudgetLimits,
         strict_nonce_size_check: bool,
+        recent_blockhash_age_cache: &mut Option<(Hash, bool)>,
     ) -> TransactionCheckResult {
         let recent_blockhash = tx.recent_blockhash();
-        if hash_queue
-            .get_hash_info_if_valid(recent_blockhash, max_age)
-            .is_some()
-        {
+        // Reuse the previous lookup when the blockhash repeats (common in a batch); otherwise
+        // probe the queue and cache the result. max_age and the queue are fixed for this call.
+        let blockhash_in_valid_window = match recent_blockhash_age_cache {
+            Some((cached, valid)) if *cached == *recent_blockhash => *valid,
+            _ => {
+                let valid = hash_queue
+                    .get_hash_info_if_valid(recent_blockhash, max_age)
+                    .is_some();
+                *recent_blockhash_age_cache = Some((*recent_blockhash, valid));
+                valid
+            }
+        };
+        if blockhash_in_valid_window {
             Ok(CheckedTransactionDetails::new(None, compute_budget))
         } else if let Some((nonce_address, _)) =
             self.check_nonce_transaction_validity(tx, next_durable_nonce, strict_nonce_size_check)
