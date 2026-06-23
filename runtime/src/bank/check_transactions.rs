@@ -66,6 +66,29 @@ impl Bank {
         .0
     }
 
+    /// Like [`Bank::check_transactions`] but writes the per-transaction results into a
+    /// caller-owned buffer (cleared first) so hot callers can reuse the allocation across calls
+    /// instead of allocating a fresh Vec each time. Equivalent to `check_transactions` (it never
+    /// collects processed slots).
+    pub fn check_transactions_into<Tx: TransactionWithMeta>(
+        &self,
+        sanitized_txs: &[impl core::borrow::Borrow<Tx>],
+        lock_results: &[TransactionResult<()>],
+        max_age: usize,
+        strict_nonce_size_check: bool,
+        error_counters: &mut TransactionErrorMetrics,
+        out: &mut Vec<TransactionCheckResult>,
+    ) {
+        self.check_age_and_compute_budget_limits_into(
+            sanitized_txs,
+            lock_results,
+            max_age,
+            strict_nonce_size_check,
+            error_counters,
+            out,
+        );
+    }
+
     pub fn check_transactions_with_processed_slots<Tx: TransactionWithMeta>(
         &self,
         sanitized_txs: &[impl core::borrow::Borrow<Tx>],
@@ -75,29 +98,32 @@ impl Bank {
         strict_nonce_size_check: bool,
         error_counters: &mut TransactionErrorMetrics,
     ) -> (Vec<TransactionCheckResult>, Option<Vec<Option<Slot>>>) {
-        let lock_results = self.check_age_and_compute_budget_limits(
+        let mut checked = Vec::new();
+        self.check_age_and_compute_budget_limits_into(
             sanitized_txs,
             lock_results,
             max_age,
             strict_nonce_size_check,
             error_counters,
+            &mut checked,
         );
         // TEST ONLY (swqos load testing): skip the status-cache / already-processed
         // (duplicate) check so the load generator can flood the validator with repeated
         // transactions. WARNING: disables replay protection wherever check_transactions
         // runs (admission, clean, AND execution) — never run this build on a real cluster.
         let processed_slots = collect_processed_slots.then(|| vec![None::<Slot>; sanitized_txs.len()]);
-        (lock_results, processed_slots)
+        (checked, processed_slots)
     }
 
-    fn check_age_and_compute_budget_limits<Tx: TransactionWithMeta>(
+    fn check_age_and_compute_budget_limits_into<Tx: TransactionWithMeta>(
         &self,
         sanitized_txs: &[impl core::borrow::Borrow<Tx>],
         lock_results: &[TransactionResult<()>],
         max_age: usize,
         strict_nonce_size_check: bool,
         error_counters: &mut TransactionErrorMetrics,
-    ) -> Vec<TransactionCheckResult> {
+        out: &mut Vec<TransactionCheckResult>,
+    ) {
         let hash_queue = self.blockhash_queue.read().unwrap();
         let last_blockhash = hash_queue.last_hash();
         let next_durable_nonce = DurableNonce::from_blockhash(&last_blockhash);
@@ -112,7 +138,10 @@ impl Bank {
         let raise_cpi_limit = feature_snapshot.raise_cpi_nesting_limit_to_8;
         let enable_tx_v1 = feature_snapshot.enable_tx_v1;
 
-        sanitized_txs
+        // Reuse the caller's buffer instead of allocating a fresh result Vec per call.
+        out.clear();
+        out.reserve(sanitized_txs.len());
+        let checked = sanitized_txs
             .iter()
             .zip(lock_results)
             .map(|(tx, lock_res)| match lock_res {
@@ -170,8 +199,8 @@ impl Bank {
                     )
                 }
                 Err(e) => Err(e.clone()),
-            })
-            .collect()
+            });
+        out.extend(checked);
     }
 
     fn check_transaction_age(

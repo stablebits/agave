@@ -35,7 +35,9 @@ use {
         runtime_transaction::RuntimeTransaction, sanitize_config::sanitize_config,
         transaction_meta::TransactionMeta, transaction_with_meta::TransactionWithMeta,
     },
-    solana_svm::transaction_error_metrics::TransactionErrorMetrics,
+    solana_svm::{
+        account_loader::TransactionCheckResult, transaction_error_metrics::TransactionErrorMetrics,
+    },
     solana_svm_transaction::svm_message::SVMMessage,
     solana_transaction::sanitized::MessageHash,
     solana_transaction_error::TransactionError,
@@ -272,26 +274,30 @@ impl TransactionViewReceiveAndBuffer {
         let mut num_dropped_on_capacity = 0;
         let mut num_buffered = 0;
 
+        // Reused across check_and_push_to_queue calls so each batch reuses one allocation
+        // instead of letting check_transactions allocate a fresh result Vec every time.
+        let mut check_results: Vec<TransactionCheckResult> = Vec::with_capacity(EXTRA_CAPACITY);
         let mut check_and_push_to_queue =
             |container: &mut TransactionViewStateContainer,
              transaction_priority_ids: &mut ArrayVec<TransactionPriorityId, 64>| {
                 // Temporary scope so that transaction references are immediately
                 // dropped and transactions not passing
-                let mut check_results = {
+                {
                     let mut transactions = ArrayVec::<_, EXTRA_CAPACITY>::new();
                     transactions.extend(transaction_priority_ids.iter().map(|priority_id| {
                         container
                             .get_transaction(priority_id.id)
                             .expect("transaction must exist")
                     }));
-                    working_bank.check_transactions::<RuntimeTransaction<_>>(
+                    working_bank.check_transactions_into::<RuntimeTransaction<_>>(
                         &transactions,
                         &lock_results[..transactions.len()],
                         working_bank.max_processing_age(),
                         true,
                         &mut error_counters,
-                    )
-                };
+                        &mut check_results,
+                    );
+                }
 
                 // Remove errored transactions
                 for (result, priority_id) in check_results
@@ -330,7 +336,7 @@ impl TransactionViewReceiveAndBuffer {
                 // Push non-errored transaction into queue.
                 num_dropped_on_capacity += container.push_ids_into_queue(
                     check_results
-                        .into_iter()
+                        .drain(..)
                         .zip(transaction_priority_ids.drain(..))
                         .filter(|(r, _)| r.is_ok())
                         .map(|(_, id)| id),

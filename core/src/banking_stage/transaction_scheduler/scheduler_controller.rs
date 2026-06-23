@@ -25,7 +25,9 @@ use {
     solana_cost_model::cost_tracker::SharedBlockCost,
     solana_measure::measure_us,
     solana_runtime::bank_forks::SharableBanks,
-    solana_svm::transaction_error_metrics::TransactionErrorMetrics,
+    solana_svm::{
+        account_loader::TransactionCheckResult, transaction_error_metrics::TransactionErrorMetrics,
+    },
     std::{
         num::{NonZeroU64, Saturating},
         sync::{
@@ -146,6 +148,9 @@ where
     recheck_cursor: Option<TransactionPriorityId>,
     /// Recheck IDs scratch space.
     recheck_chunk: Vec<TransactionPriorityId>,
+    /// Reusable buffer for recheck results, so the recheck sweep doesn't allocate a fresh
+    /// result Vec on every pass.
+    recheck_results: Vec<TransactionCheckResult>,
     /// Saturation detection and priority floor publication.
     saturation_state: SaturationState,
 }
@@ -182,6 +187,7 @@ where
             scheduling_details: SchedulingDetails::default(),
             recheck_cursor: None,
             recheck_chunk: Vec::with_capacity(CHECK_CHUNK),
+            recheck_results: Vec::with_capacity(CHECK_CHUNK),
             saturation_state,
         }
     }
@@ -411,16 +417,17 @@ where
         };
         let lock_results = vec![Ok(()); txs.len()];
         let mut error_counters = TransactionErrorMetrics::default();
-        let results = bank.check_transactions::<R::Transaction>(
+        bank.check_transactions_into::<R::Transaction>(
             &txs,
             &lock_results,
             bank.max_processing_age(),
             true,
             &mut error_counters,
+            &mut self.recheck_results,
         );
 
         let mut num_dropped = Saturating(0usize);
-        for (result, pid) in results.iter().zip(self.recheck_chunk.iter()) {
+        for (result, pid) in self.recheck_results.iter().zip(self.recheck_chunk.iter()) {
             if result.is_err() {
                 num_dropped += 1;
                 self.container.remove_by_id(pid.id);
