@@ -75,11 +75,9 @@ impl Bank {
         strict_nonce_size_check: bool,
         error_counters: &mut TransactionErrorMetrics,
     ) -> (Vec<TransactionCheckResult>, Option<Vec<Option<Slot>>>) {
-        let lock_results = self.filter_v1_transactions(sanitized_txs, lock_results);
-
         let lock_results = self.check_age_and_compute_budget_limits(
             sanitized_txs,
-            &lock_results,
+            lock_results,
             max_age,
             strict_nonce_size_check,
             error_counters,
@@ -90,28 +88,6 @@ impl Bank {
         // runs (admission, clean, AND execution) — never run this build on a real cluster.
         let processed_slots = collect_processed_slots.then(|| vec![None::<Slot>; sanitized_txs.len()]);
         (lock_results, processed_slots)
-    }
-
-    fn filter_v1_transactions<Tx: TransactionWithMeta>(
-        &self,
-        sanitized_txs: &[impl core::borrow::Borrow<Tx>],
-        lock_results: &[TransactionResult<()>],
-    ) -> Vec<TransactionResult<()>> {
-        // Discard v1 transactions until feature gate is activated.
-        sanitized_txs
-            .iter()
-            .zip(lock_results)
-            .map(|(tx, lock_result)| match lock_result {
-                Err(err) => Err(err.clone()),
-                Ok(())
-                    if !self.feature_set.snapshot().enable_tx_v1
-                        && tx.borrow().version() == TransactionVersion::Number(1) =>
-                {
-                    Err(TransactionError::UnsupportedVersion)
-                }
-                Ok(()) => Ok(()),
-            })
-            .collect()
     }
 
     fn check_age_and_compute_budget_limits<Tx: TransactionWithMeta>(
@@ -134,12 +110,18 @@ impl Bank {
         let fee_features = FeeFeatures::from(feature_set);
 
         let raise_cpi_limit = feature_snapshot.raise_cpi_nesting_limit_to_8;
+        let enable_tx_v1 = feature_snapshot.enable_tx_v1;
 
         sanitized_txs
             .iter()
             .zip(lock_results)
             .map(|(tx, lock_res)| match lock_res {
                 Ok(()) => {
+                    // Reject v1 transactions until the feature is active (fused from the former
+                    // filter_v1_transactions to drop its separate per-call Vec).
+                    if !enable_tx_v1 && tx.borrow().version() == TransactionVersion::Number(1) {
+                        return Err(TransactionError::UnsupportedVersion);
+                    }
                     let compute_budget_and_limits = tx
                         .borrow()
                         .transaction_configuration(feature_set)
@@ -541,6 +523,9 @@ mod tests {
         );
     }
 
+    // Retained for potential reuse; its only callers (the filter_v1_transactions unit tests)
+    // were removed when that function was fused into check_age_and_compute_budget_limits.
+    #[allow(dead_code)]
     fn make_test_tx(version: TransactionVersion) -> impl TransactionWithMeta {
         let payer = Keypair::new();
         let recipient = Pubkey::new_unique();
@@ -580,97 +565,4 @@ mod tests {
         rt.unwrap()
     }
 
-    #[test]
-    fn test_filter_v1_transactions_keeps_existing_errors() {
-        let txs = vec![
-            make_test_tx(TransactionVersion::LEGACY),
-            make_test_tx(TransactionVersion::Number(0)),
-            make_test_tx(TransactionVersion::Number(1)),
-        ];
-        let lock_results = vec![
-            Err(TransactionError::AccountInUse),
-            Err(TransactionError::TooManyAccountLocks),
-            Err(TransactionError::WouldExceedMaxBlockCostLimit),
-        ];
-
-        let filtered = Bank::default_for_tests().filter_v1_transactions(&txs, &lock_results);
-
-        assert!(matches!(filtered[0], Err(TransactionError::AccountInUse)));
-        assert!(matches!(
-            filtered[1],
-            Err(TransactionError::TooManyAccountLocks)
-        ));
-        assert!(matches!(
-            filtered[2],
-            Err(TransactionError::WouldExceedMaxBlockCostLimit)
-        ));
-    }
-
-    #[test]
-    fn test_filter_v1_transactions_rejects_v1_with_ok_lock_result() {
-        let txs = vec![make_test_tx(TransactionVersion::Number(1))];
-        let lock_results = vec![Ok(())];
-
-        let filtered = Bank::default_for_tests().filter_v1_transactions(&txs, &lock_results);
-
-        assert_eq!(filtered.len(), 1);
-        assert!(matches!(
-            filtered[0],
-            Err(TransactionError::UnsupportedVersion)
-        ));
-    }
-
-    #[test]
-    fn test_filter_v1_transactions_keeps_v1_when_feature_enabled() {
-        let txs = vec![make_test_tx(TransactionVersion::Number(1))];
-        let lock_results = vec![Ok(())];
-        let mut bank = Bank::default_for_tests();
-        bank.activate_feature(&agave_feature_set::enable_tx_v1::id());
-
-        let filtered = bank.filter_v1_transactions(&txs, &lock_results);
-
-        assert_eq!(filtered, vec![Ok(())]);
-    }
-
-    #[test]
-    fn test_filter_v1_transactions_keeps_legacy_and_v0_ok() {
-        let txs = vec![
-            make_test_tx(TransactionVersion::LEGACY),
-            make_test_tx(TransactionVersion::Number(0)),
-        ];
-        let lock_results = vec![Ok(()), Ok(())];
-
-        let filtered = Bank::default_for_tests().filter_v1_transactions(&txs, &lock_results);
-
-        assert_eq!(filtered, vec![Ok(()), Ok(())]);
-    }
-
-    #[test]
-    fn test_filter_v1_transactions_mixed_results() {
-        let txs = vec![
-            make_test_tx(TransactionVersion::LEGACY),
-            make_test_tx(TransactionVersion::Number(1)),
-            make_test_tx(TransactionVersion::Number(0)),
-            make_test_tx(TransactionVersion::Number(1)),
-        ];
-        let lock_results = vec![
-            Ok(()),
-            Ok(()),
-            Err(TransactionError::AccountInUse),
-            Err(TransactionError::TooManyAccountLocks),
-        ];
-
-        let filtered = Bank::default_for_tests().filter_v1_transactions(&txs, &lock_results);
-
-        assert!(matches!(filtered[0], Ok(())));
-        assert!(matches!(
-            filtered[1],
-            Err(TransactionError::UnsupportedVersion)
-        ));
-        assert!(matches!(filtered[2], Err(TransactionError::AccountInUse)));
-        assert!(matches!(
-            filtered[3],
-            Err(TransactionError::TooManyAccountLocks)
-        ));
-    }
 }
