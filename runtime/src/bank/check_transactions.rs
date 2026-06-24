@@ -107,12 +107,13 @@ impl Bank {
             error_counters,
             &mut checked,
         );
-        // TEST ONLY (swqos load testing): skip the status-cache / already-processed
-        // (duplicate) check so the load generator can flood the validator with repeated
-        // transactions. WARNING: disables replay protection wherever check_transactions
-        // runs (admission, clean, AND execution) — never run this build on a real cluster.
-        let processed_slots = collect_processed_slots.then(|| vec![None::<Slot>; sanitized_txs.len()]);
-        (checked, processed_slots)
+        // Replay protection (already-processed / duplicate rejection). The scheduler-thread
+        // admission and recheck paths deliberately skip this — they call `check_transactions_into`,
+        // which runs only the age/budget check — because the status cache is enforced downstream on
+        // the worker/execution path (see `Consumer::process_and_record*` -> `check_transactions`)
+        // and at commit. Every non-scheduler caller (execution, simulation, replay) goes through
+        // here and gets the check.
+        self.check_status_cache(sanitized_txs, checked, collect_processed_slots, error_counters)
     }
 
     fn check_age_and_compute_budget_limits_into<Tx: TransactionWithMeta>(
@@ -278,7 +279,6 @@ impl Bank {
         Some((*nonce_address, nonce_data))
     }
 
-    #[allow(dead_code)] // TEST ONLY: no longer called after disabling the status-cache check.
     fn check_status_cache<Tx: TransactionWithMeta>(
         &self,
         sanitized_txs: &[impl core::borrow::Borrow<Tx>],
@@ -318,7 +318,6 @@ impl Bank {
         (check_results, processed_slots)
     }
 
-    #[allow(dead_code)] // TEST ONLY: only used by check_status_cache, which is now bypassed.
     fn get_processed_slot(
         &self,
         sanitized_tx: &impl TransactionWithMeta,
