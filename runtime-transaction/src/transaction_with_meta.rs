@@ -18,4 +18,13 @@ pub trait TransactionWithMeta: TransactionMeta + SVMTransaction {
     /// Returns the serialized transaction size in bytes.
     /// Runtime metadata is not included.
     fn serialized_size(&self) -> usize;
+
+    /// Recompute and cache the transaction's message hash.
+    ///
+    /// Most transaction types compute their message hash at construction, so the default is a
+    /// no-op. The scheduler's transaction-view receive path may defer this (storing a cheap
+    /// placeholder) to keep the message-hash SHA256 off the hot receive thread; the consume
+    /// worker calls this before the status-cache check / execution / commit, all of which key on
+    /// `message_hash()`. Idempotent.
+    fn recompute_message_hash(&mut self) {}
 }

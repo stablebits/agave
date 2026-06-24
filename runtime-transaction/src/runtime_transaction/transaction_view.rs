@@ -143,6 +143,14 @@ impl<D: TransactionData> RuntimeTransaction<ResolvedTransactionView<D>> {
 }
 
 impl<D: TransactionData> TransactionWithMeta for RuntimeTransaction<ResolvedTransactionView<D>> {
+    fn recompute_message_hash(&mut self) {
+        // Same computation the `MessageHash::Compute` construction path performs (hashing the
+        // already-serialized message bytes, no reserialization). The receive thread defers it to
+        // a cheap placeholder; this runs on the worker once per scheduled transaction.
+        self.meta.message_hash =
+            VersionedMessage::hash_raw_message(self.transaction.message_data());
+    }
+
     fn as_sanitized_transaction(&self) -> Cow<'_, SanitizedTransaction> {
         let VersionedTransaction {
             signatures,

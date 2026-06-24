@@ -104,7 +104,7 @@ impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
 
     fn consume(
         &self,
-        work: ConsumeWork<Tx>,
+        mut work: ConsumeWork<Tx>,
     ) -> Result<ProcessingStatus<Tx>, ConsumeWorkerError<Tx>> {
         let Some(leader_state) = active_leader_state(&self.shared_leader_state) else {
             return Ok(ProcessingStatus::CouldNotProcess(work));
@@ -116,6 +116,13 @@ impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
             .count_metrics
             .num_messages_processed
             .fetch_add(1, Ordering::Relaxed);
+
+        // The scheduler receive thread defers message-hash computation (storing a cheap
+        // placeholder) to keep SHA256 off that hot path. Compute the real hash here, on the
+        // worker, before the status-cache check / execution / commit — all of which key on it.
+        for transaction in work.transactions.iter_mut() {
+            transaction.recompute_message_hash();
+        }
 
         let output = self.consumer.process_and_record_aged_transactions(
             bank,
