@@ -25,6 +25,7 @@ use {
     solana_accounts_db::account_locks::validate_account_locks,
     solana_address_lookup_table_interface::state::estimate_last_valid_slot,
     solana_clock::{Epoch, Slot},
+    solana_hash::Hash,
     solana_message::v0::LoadedAddresses,
     solana_pubkey::Pubkey,
     solana_runtime::{
@@ -243,6 +244,9 @@ pub(crate) enum PacketHandlingError {
     ComputeBudget,
     ALTResolution,
     FilterKey,
+    /// The transaction's blockhash had already aged out at receive time. Rejected on the
+    /// statically-sanitized view, before metadata build / ALT resolution / container insertion.
+    Age,
 }
 
 impl TransactionViewReceiveAndBuffer {
@@ -348,6 +352,10 @@ impl TransactionViewReceiveAndBuffer {
         let mut num_dropped_on_parsing_and_sanitization = 0;
         let mut num_dropped_on_lock_validation = 0;
         let mut num_dropped_on_compute_budget = 0;
+        let mut num_dropped_on_age_early = 0;
+        // Memoizes the last (blockhash, valid) age lookup across packets in this receive cycle, so
+        // a flood sharing one stale blockhash costs a single blockhash-queue probe.
+        let mut recent_blockhash_age_cache: Option<(Hash, bool)> = None;
 
         for packet_batch in packet_batch_message.iter() {
             for packet in packet_batch.iter() {
@@ -371,6 +379,7 @@ impl TransactionViewReceiveAndBuffer {
                             transaction_account_lock_limit,
                             &sanitize_config,
                             &self.filter_keys,
+                            &mut recent_blockhash_age_cache,
                         ) {
                             Ok(state) => Ok(state),
                             Err(
@@ -390,6 +399,10 @@ impl TransactionViewReceiveAndBuffer {
                             }
                             Err(PacketHandlingError::FilterKey) => {
                                 num_dropped_on_filter_key += 1;
+                                Err(())
+                            }
+                            Err(PacketHandlingError::Age) => {
+                                num_dropped_on_age_early += 1;
                                 Err(())
                             }
                         }
@@ -419,7 +432,8 @@ impl TransactionViewReceiveAndBuffer {
             num_dropped_on_parsing_and_sanitization,
             num_dropped_on_lock_validation,
             num_dropped_on_compute_budget,
-            num_dropped_on_age,
+            // Fold early (pre-translation) age rejects in with the batched ones.
+            num_dropped_on_age: num_dropped_on_age + num_dropped_on_age_early,
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_filter_key,
@@ -437,12 +451,37 @@ impl TransactionViewReceiveAndBuffer {
         transaction_account_lock_limit: usize,
         sanitize_config: &SanitizeConfig,
         filter_keys: &HashSet<Pubkey>,
+        recent_blockhash_age_cache: &mut Option<(Hash, bool)>,
     ) -> Result<TransactionViewState, PacketHandlingError> {
-        let (view, deactivation_slot) = translate_to_runtime_view(
+        let max_age = working_bank.max_processing_age();
+        let (view, deactivation_slot) = translate_to_runtime_view_with_precheck(
             bytes,
             root_bank,
             transaction_account_lock_limit,
             sanitize_config,
+            |static_view| {
+                // Early age reject: drop transactions whose blockhash has already aged out, before
+                // paying for metadata construction, ALT resolution, and container insertion. The
+                // lookup is memoized since a flood typically shares one (stale) blockhash. Durable-
+                // nonce transactions carry an out-of-window blockhash but must NOT be dropped, so
+                // skip the reject when the first instruction is a System AdvanceNonceAccount; those
+                // fall through to the authoritative batched check in check_and_push_to_queue (which
+                // also re-checks anything this conservative fast-path lets through).
+                let recent_blockhash = static_view.recent_blockhash();
+                let blockhash_valid = match recent_blockhash_age_cache {
+                    Some((hash, valid)) if *hash == *recent_blockhash => *valid,
+                    _ => {
+                        let valid =
+                            working_bank.is_hash_valid_for_age(recent_blockhash, max_age);
+                        *recent_blockhash_age_cache = Some((*recent_blockhash, valid));
+                        valid
+                    }
+                };
+                if !blockhash_valid && !is_durable_nonce_advance(static_view) {
+                    return Err(PacketHandlingError::Age);
+                }
+                Ok(())
+            },
         )?;
 
         if !filter_keys.is_empty()
@@ -468,6 +507,24 @@ impl TransactionViewReceiveAndBuffer {
     }
 }
 
+/// Mirrors the runtime's durable-nonce requirement: a durable-nonce transaction's first
+/// instruction must be a System program `AdvanceNonceAccount`. The receive-time early age reject
+/// uses this to avoid dropping durable-nonce transactions, whose `recent_blockhash` is
+/// intentionally outside the recent window. A top-level instruction's program id is always a
+/// static account key, so this resolves on the statically-sanitized view (no ALT needed).
+fn is_durable_nonce_advance<D: TransactionData>(view: &SanitizedTransactionView<D>) -> bool {
+    // `SystemInstruction::AdvanceNonceAccount` is bincode variant 4 (u32, little-endian).
+    const ADVANCE_NONCE_ACCOUNT_DISCRIMINATOR: [u8; 4] = [4, 0, 0, 0];
+    view.program_instructions_iter()
+        .next()
+        .is_some_and(|(program_id, instruction)| {
+            program_id == &solana_system_interface::program::id()
+                && instruction
+                    .data
+                    .starts_with(&ADVANCE_NONCE_ACCOUNT_DISCRIMINATOR)
+        })
+}
+
 /// Perform sanitization checks and transition from data to an executable
 /// [`RuntimeTransaction`]. This additionally returns the minimum slot for
 /// ALT deactivation, if any. If no minimum slot, Slot::MAX is returned.
@@ -477,10 +534,33 @@ pub(crate) fn translate_to_runtime_view<D: TransactionData>(
     transaction_account_lock_limit: usize,
     sanitize_config: &SanitizeConfig,
 ) -> Result<(RuntimeTransaction<ResolvedTransactionView<D>>, u64), PacketHandlingError> {
+    translate_to_runtime_view_with_precheck(
+        data,
+        bank,
+        transaction_account_lock_limit,
+        sanitize_config,
+        |_| Ok(()),
+    )
+}
+
+/// Like [`translate_to_runtime_view`], but runs `precheck` on the statically-sanitized view
+/// before the (more expensive) metadata build and address-lookup-table resolution. The receive
+/// path uses this to reject already-expired transactions early (see `try_handle_packet`), so the
+/// flood of obsolete transactions doesn't pay for full translation + container insertion.
+pub(crate) fn translate_to_runtime_view_with_precheck<D: TransactionData>(
+    data: D,
+    bank: &Bank,
+    transaction_account_lock_limit: usize,
+    sanitize_config: &SanitizeConfig,
+    precheck: impl FnOnce(&SanitizedTransactionView<D>) -> Result<(), PacketHandlingError>,
+) -> Result<(RuntimeTransaction<ResolvedTransactionView<D>>, u64), PacketHandlingError> {
     // Parsing and basic sanitization checks
     let Ok(view) = SanitizedTransactionView::try_new_sanitized(data, sanitize_config) else {
         return Err(PacketHandlingError::Sanitization);
     };
+
+    // Caller-supplied early reject on the statically-sanitized view, before the expensive work.
+    precheck(&view)?;
 
     // TEST ONLY (swqos load testing): skip hash_raw_message()'s SHA256 in the scheduler
     // receive thread. Use the (already-parsed) first signature as a cheap UNIQUE stand-in for
@@ -1190,7 +1270,11 @@ mod tests {
 
     #[test]
     fn test_receive_and_buffer_too_many_keys() {
-        fn create_tx_with_n_keys(payer: &Keypair, n: usize) -> VersionedTransaction {
+        fn create_tx_with_n_keys(
+            payer: &Keypair,
+            n: usize,
+            recent_blockhash: Hash,
+        ) -> VersionedTransaction {
             let alt_keys = (0..n - 2).map(|_| Pubkey::new_unique()).collect::<Vec<_>>();
             VersionedTransaction::try_new(
                 VersionedMessage::V0(
@@ -1208,7 +1292,7 @@ mod tests {
                             key: Pubkey::new_unique(),
                             addresses: alt_keys,
                         }],
-                        Hash::new_unique(),
+                        recent_blockhash,
                     )
                     .unwrap(),
                 ),
@@ -1229,8 +1313,14 @@ mod tests {
             .get_transaction_account_lock_limit();
 
         // ALTs do not actually exist in the bank for this transaction - sanitization would cause failure if
-        // lock validation was not done first.
-        let bad_tx = create_tx_with_n_keys(&mint_keypair, transaction_account_lock_limit + 1);
+        // lock validation was not done first. Use a valid blockhash so the transaction passes the
+        // receive-time early age check and actually reaches the lock-validation step under test.
+        let recent_blockhash = bank_forks.read().unwrap().root_bank().last_blockhash();
+        let bad_tx = create_tx_with_n_keys(
+            &mint_keypair,
+            transaction_account_lock_limit + 1,
+            recent_blockhash,
+        );
         let transactions = [bad_tx];
 
         let packet_batches = Arc::new(to_packet_batches(&transactions, 17));
