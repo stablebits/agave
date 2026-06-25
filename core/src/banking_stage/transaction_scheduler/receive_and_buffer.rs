@@ -259,7 +259,6 @@ impl TransactionViewReceiveAndBuffer {
         working_bank: &Bank,
         packet_batch_message: BankingPacketBatch,
     ) -> ReceivingStats {
-        let start = Instant::now();
         // If outside holding window, do not parse.
         let should_parse = !matches!(decision, BufferedPacketsDecision::Forward);
 
@@ -430,7 +429,10 @@ impl TransactionViewReceiveAndBuffer {
             num_dropped_on_capacity,
             num_buffered,
             receive_time_us: 0, // receive is outside this function
-            buffer_time_us: start.elapsed().as_micros() as u64,
+            // Per-batch buffer timing dropped: it read the clock twice per batch (~several percent
+            // of the scheduler thread under load). The whole receive+buffer drain is timed once via
+            // receive_time_us in receive_and_buffer_packets.
+            buffer_time_us: 0,
         }
     }
 
