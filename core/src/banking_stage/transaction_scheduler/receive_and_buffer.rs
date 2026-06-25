@@ -9,7 +9,7 @@ use {
     },
     crate::{
         banking_stage::{
-            consumer::Consumer, decision_maker::BufferedPacketsDecision, scheduler_messages::MaxAge,
+            decision_maker::BufferedPacketsDecision, scheduler_messages::MaxAge,
         },
         transaction_priority::calculate_priority_and_cost,
     },
@@ -273,7 +273,8 @@ impl TransactionViewReceiveAndBuffer {
         let mut error_counters = TransactionErrorMetrics::default();
         let mut num_dropped_on_age = 0;
         let mut num_dropped_on_already_processed = 0;
-        let mut num_dropped_on_fee_payer = 0;
+        // Deferred to the worker (see check_and_push_to_queue); kept for the stats struct.
+        let num_dropped_on_fee_payer = 0;
         let mut num_dropped_on_filter_key = 0;
         let mut num_dropped_on_capacity = 0;
         let mut num_buffered = 0;
@@ -303,10 +304,13 @@ impl TransactionViewReceiveAndBuffer {
                     );
                 }
 
-                // Remove errored transactions
-                for (result, priority_id) in check_results
-                    .iter_mut()
-                    .zip(transaction_priority_ids.iter())
+                // Remove errored (aged-out / already-processed) transactions.
+                //
+                // TEST ONLY: the receive-time fee-payer check is deferred to the worker, which
+                // re-validates fees at execution. This drops an AccountsDb fee-payer load per
+                // buffered transaction off the hot scheduler thread. On a real cluster this check is
+                // an early spam-drop for unfunded payers, so never run this build on a real cluster.
+                for (result, priority_id) in check_results.iter().zip(transaction_priority_ids.iter())
                 {
                     if let Err(err) = result {
                         match err {
@@ -321,20 +325,6 @@ impl TransactionViewReceiveAndBuffer {
                         container.remove_by_id(priority_id.id);
                         continue;
                     }
-                    let transaction = container
-                        .get_transaction(priority_id.id)
-                        .expect("transaction must exist");
-                    if let Err(err) = Consumer::check_fee_payer_unlocked(
-                        working_bank,
-                        transaction,
-                        &mut error_counters,
-                    ) {
-                        *result = Err(err);
-                        num_dropped_on_fee_payer += 1;
-                        container.remove_by_id(priority_id.id);
-                        continue;
-                    }
-
                     num_buffered += 1;
                 }
                 // Push non-errored transaction into queue.
@@ -1007,11 +997,14 @@ mod tests {
         assert_eq!(num_dropped_on_compute_budget, 0);
         assert_eq!(num_dropped_on_age, 0);
         assert_eq!(num_dropped_on_already_processed, 0);
-        assert_eq!(num_dropped_on_fee_payer, 1);
+        // TEST ONLY: the receive-time fee-payer check is deferred to the worker, so the unfunded
+        // transaction is buffered here rather than dropped; the worker rejects it at execution.
+        assert_eq!(num_dropped_on_fee_payer, 0);
         assert_eq!(num_dropped_on_capacity, 0);
-        assert_eq!(num_buffered, 0);
+        assert_eq!(num_buffered, 1);
 
-        verify_container(&mut container, 0);
+        // The unfunded transaction is now buffered (fee-payer check deferred to the worker).
+        verify_container(&mut container, 1);
     }
 
     #[test]
