@@ -189,6 +189,7 @@ where
     pub fn run(&mut self) -> Result<(), SchedulerError> {
         let mut most_recent_leader_slot = None;
         let mut cost_pacer = None;
+        let mut last_aux_metrics_report = Instant::now();
 
         while !self.exit.load(Ordering::Relaxed) {
             let now = Instant::now();
@@ -274,10 +275,17 @@ where
                 .maybe_report_and_reset_interval(should_report);
             self.timing_metrics
                 .maybe_report_and_reset_interval(should_report);
-            self.worker_metrics
-                .iter()
-                .for_each(|metrics| metrics.maybe_report_and_reset());
-            self.scheduling_details.maybe_report();
+            // maybe_report_and_reset reads the clock per worker (AtomicInterval::should_update), so
+            // calling it every loop iteration burns several percent of the hot scheduler thread.
+            // Throttle this block to the report interval using the loop's already-read `now`.
+            const AUX_METRICS_REPORT_INTERVAL: Duration = Duration::from_millis(20);
+            if now.duration_since(last_aux_metrics_report) >= AUX_METRICS_REPORT_INTERVAL {
+                last_aux_metrics_report = now;
+                self.worker_metrics
+                    .iter()
+                    .for_each(|metrics| metrics.maybe_report_and_reset());
+                self.scheduling_details.maybe_report();
+            }
         }
 
         Ok(())

@@ -180,12 +180,21 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
         }
 
         if !timed_out {
-            while start.elapsed() < PACKET_BURST_TIMEOUT && stats.num_received < PACKET_BURST_LIMIT
-            {
-                let receive_start = Instant::now();
+            // Hot path under load: reading the clock per batch (loop bound + per-batch receive
+            // timing) costs several percent of the scheduler thread. PACKET_BURST_LIMIT is the
+            // primary cap, so check the wall-clock PACKET_BURST_TIMEOUT only every 64 batches, and
+            // measure the whole drain once instead of per batch. (receive_time_us therefore now
+            // covers the full receive+handle drain rather than just try_recv.)
+            const TIMEOUT_CHECK_MASK: usize = 63;
+            let drain_start = Instant::now();
+            let mut iters: usize = 0;
+            while stats.num_received < PACKET_BURST_LIMIT {
+                if (iters & TIMEOUT_CHECK_MASK) == 0 && start.elapsed() >= PACKET_BURST_TIMEOUT {
+                    break;
+                }
+                iters = iters.saturating_add(1);
                 match self.receiver.try_recv() {
                     Ok(packet_batch_message) => {
-                        stats.receive_time_us += receive_start.elapsed().as_micros() as u64;
                         received_message = true;
                         let batch_stats = self.handle_packet_batch_message(
                             container,
@@ -203,9 +212,11 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
                         if !received_message {
                             return Err(DisconnectedError);
                         }
+                        break;
                     }
                 }
             }
+            stats.receive_time_us += drain_start.elapsed().as_micros() as u64;
         }
 
         Ok(ReceivingStats {
@@ -244,7 +255,6 @@ impl TransactionViewReceiveAndBuffer {
         working_bank: &Bank,
         packet_batch_message: BankingPacketBatch,
     ) -> ReceivingStats {
-        let start = Instant::now();
         // If outside holding window, do not parse.
         let should_parse = !matches!(decision, BufferedPacketsDecision::Forward);
 
@@ -411,7 +421,10 @@ impl TransactionViewReceiveAndBuffer {
             num_dropped_on_capacity,
             num_buffered,
             receive_time_us: 0, // receive is outside this function
-            buffer_time_us: start.elapsed().as_micros() as u64,
+            // Per-batch buffer timing dropped: it read the clock twice per batch (~several percent
+            // of the scheduler thread under load). The whole receive+buffer drain is timed once via
+            // receive_time_us in receive_and_buffer_packets.
+            buffer_time_us: 0,
         }
     }
 
