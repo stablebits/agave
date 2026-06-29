@@ -548,7 +548,9 @@ mod tests {
         solana_poh::poh_recorder::{LeaderState, SharedLeaderState},
         solana_pubkey::Pubkey,
         solana_runtime::{bank::Bank, bank_forks::BankForks},
-        solana_runtime_transaction::transaction_meta::TransactionMeta,
+        solana_runtime_transaction::{
+            transaction_meta::TransactionMeta, transaction_with_meta::TransactionWithMeta,
+        },
         solana_signer::Signer,
         solana_system_interface::instruction as system_instruction,
         solana_transaction::Transaction,
@@ -791,9 +793,15 @@ mod tests {
             .unwrap();
 
         test_receive_then_schedule(&mut scheduler_controller);
-        let consume_work = consume_work_receivers[0].try_recv().unwrap();
+        let mut consume_work = consume_work_receivers[0].try_recv().unwrap();
         assert_eq!(consume_work.ids.len(), 2);
         assert_eq!(consume_work.transactions.len(), 2);
+        // The receive thread stores a placeholder message hash; the consume worker recomputes the
+        // real one before use. Simulate that here so the assertion sees the real hash.
+        consume_work
+            .transactions
+            .iter_mut()
+            .for_each(|tx| tx.recompute_message_hash());
         let message_hashes = consume_work
             .transactions
             .iter()
@@ -851,10 +859,16 @@ mod tests {
 
         // We expect 2 batches to be scheduled
         test_receive_then_schedule(&mut scheduler_controller);
-        let consume_work = consume_work_receivers[0].try_recv().unwrap();
+        let mut consume_work = consume_work_receivers[0].try_recv().unwrap();
         assert!(consume_work_receivers[0].try_recv().is_err());
 
         let num_txs_per_batch = consume_work.ids.len();
+        // See note in test_schedule_consume_single_threaded_no_conflicts: recompute the worker-side
+        // message hash before asserting.
+        consume_work
+            .transactions
+            .iter_mut()
+            .for_each(|tx| tx.recompute_message_hash());
         let message_hashes = consume_work
             .transactions
             .iter()
@@ -984,16 +998,24 @@ mod tests {
             .collect_vec();
 
         test_receive_then_schedule(&mut scheduler_controller);
-        let t0_actual = consume_work_receivers[0]
-            .try_recv()
-            .unwrap()
+        let mut t0_work = consume_work_receivers[0].try_recv().unwrap();
+        let mut t1_work = consume_work_receivers[1].try_recv().unwrap();
+        // The receive thread stores a placeholder message hash; the consume worker recomputes the
+        // real one before use. Simulate that here so the assertions see the real hash.
+        t0_work
+            .transactions
+            .iter_mut()
+            .for_each(|tx| tx.recompute_message_hash());
+        t1_work
+            .transactions
+            .iter_mut()
+            .for_each(|tx| tx.recompute_message_hash());
+        let t0_actual = t0_work
             .transactions
             .iter()
             .map(|tx| *tx.message_hash())
             .collect_vec();
-        let t1_actual = consume_work_receivers[1]
-            .try_recv()
-            .unwrap()
+        let t1_actual = t1_work
             .transactions
             .iter()
             .map(|tx| *tx.message_hash())
@@ -1052,9 +1074,15 @@ mod tests {
             .unwrap();
 
         test_receive_then_schedule(&mut scheduler_controller);
-        let consume_work = consume_work_receivers[0].try_recv().unwrap();
+        let mut consume_work = consume_work_receivers[0].try_recv().unwrap();
         assert_eq!(consume_work.ids.len(), 2);
         assert_eq!(consume_work.transactions.len(), 2);
+        // See note in test_schedule_consume_single_threaded_no_conflicts: recompute the worker-side
+        // message hash before asserting.
+        consume_work
+            .transactions
+            .iter_mut()
+            .for_each(|tx| tx.recompute_message_hash());
         let message_hashes = consume_work
             .transactions
             .iter()

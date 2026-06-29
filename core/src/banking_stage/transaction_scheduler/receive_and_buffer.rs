@@ -25,6 +25,7 @@ use {
     solana_accounts_db::account_locks::validate_account_locks,
     solana_address_lookup_table_interface::state::estimate_last_valid_slot,
     solana_clock::{Epoch, Slot},
+    solana_hash::Hash,
     solana_message::v0::LoadedAddresses,
     solana_pubkey::Pubkey,
     solana_runtime::{
@@ -466,9 +467,17 @@ pub(crate) fn translate_to_runtime_view<D: TransactionData>(
         return Err(PacketHandlingError::Sanitization);
     };
 
+    // TEST ONLY (swqos load testing): skip hash_raw_message()'s SHA256 on the hot scheduler
+    // receive thread by storing a placeholder message hash. This value is never read on the
+    // scheduler thread -- the status-cache check has been removed from this path, and scheduling
+    // keys on TransactionId and account locks, not message_hash().
+    //
+    // The consume worker MUST recompute the real hash (recompute_message_hash) before execution:
+    // the status-cache lookup, the batch dedup in try_lock_accounts_with_results, and the
+    // commit-time status-cache write all key on message_hash(). See consume_worker::consume.
     let Ok(view) = RuntimeTransaction::<SanitizedTransactionView<_>>::try_new(
         view,
-        MessageHash::Compute,
+        MessageHash::Precomputed(Hash::default()),
         None,
     ) else {
         return Err(PacketHandlingError::Sanitization);
