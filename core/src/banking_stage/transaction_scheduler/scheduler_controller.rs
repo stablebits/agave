@@ -418,7 +418,14 @@ where
         };
         let lock_results = vec![Ok(()); txs.len()];
         let mut error_counters = TransactionErrorMetrics::default();
-        let results = bank.check_transactions::<R::Transaction>(
+        // Age + compute-budget only; deliberately skip the status-cache check here. It keys on
+        // message_hash(), but buffered transactions still carry the Hash::default() placeholder
+        // from the receive path (the real hash is recomputed worker-side, see
+        // consume_worker::consume), so the lookup would always miss -- evicting no duplicates while
+        // paying the status_cache.read() lock that contends with the workers' commit-time writes.
+        // Duplicate rejection and replay protection are enforced authoritatively at the worker on
+        // the recomputed hash (batch dedup + status cache).
+        let results = bank.check_transactions_without_status_cache::<R::Transaction>(
             &txs,
             &lock_results,
             bank.max_processing_age(),
