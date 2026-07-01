@@ -6,6 +6,7 @@ use {
     solana_clock::{MAX_TRANSACTION_FORWARDING_DELAY, Slot},
     solana_compute_budget::compute_budget::SVMTransactionExecutionBudget,
     solana_fee::{FeeFeatures, calculate_fee_details},
+    solana_hash::Hash,
     solana_nonce::state::{Data as NonceData, DurableNonce, State as NonceState},
     solana_nonce_account as nonce_account,
     solana_program_runtime::execution_budget::SVMTransactionExecutionAndFeeBudgetLimits,
@@ -18,6 +19,7 @@ use {
     solana_svm_transaction::svm_message::SVMMessage,
     solana_transaction::versioned::TransactionVersion,
     solana_transaction_error::{TransactionError, TransactionResult},
+    std::cell::OnceCell,
 };
 
 impl Bank {
@@ -144,7 +146,10 @@ impl Bank {
     ) -> Vec<TransactionCheckResult> {
         let hash_queue = self.blockhash_queue.read().unwrap();
         let last_blockhash = hash_queue.last_hash();
-        let next_durable_nonce = DurableNonce::from_blockhash(&last_blockhash);
+        // Computed (SHA-256) lazily, and only if some transaction's blockhash misses the queue and
+        // we fall back to the durable-nonce check. In the common case (all blockhashes in-window)
+        // it is never computed. Its input, last_blockhash, is constant for this batch.
+        let next_durable_nonce = OnceCell::new();
 
         let feature_set: &FeatureSet = &self.feature_set;
         let feature_snapshot = feature_set.snapshot();
@@ -196,6 +201,7 @@ impl Bank {
                     self.check_transaction_age(
                         tx.borrow(),
                         max_age,
+                        &last_blockhash,
                         &next_durable_nonce,
                         &hash_queue,
                         error_counters,
@@ -212,7 +218,8 @@ impl Bank {
         &self,
         tx: &impl SVMMessage,
         max_age: usize,
-        next_durable_nonce: &DurableNonce,
+        last_blockhash: &Hash,
+        next_durable_nonce: &OnceCell<DurableNonce>,
         hash_queue: &BlockhashQueue,
         error_counters: &mut TransactionErrorMetrics,
         compute_budget: SVMTransactionExecutionAndFeeBudgetLimits,
@@ -224,9 +231,13 @@ impl Bank {
             .is_some()
         {
             Ok(CheckedTransactionDetails::new(None, compute_budget))
-        } else if let Some((nonce_address, _)) =
-            self.check_nonce_transaction_validity(tx, next_durable_nonce, strict_nonce_size_check)
-        {
+        } else if let Some((nonce_address, _)) = self.check_nonce_transaction_validity(
+            tx,
+            // Blockhash missed the queue: only now do we need the durable nonce. Compute it at
+            // most once per batch (shared across transactions via the OnceCell).
+            next_durable_nonce.get_or_init(|| DurableNonce::from_blockhash(last_blockhash)),
+            strict_nonce_size_check,
+        ) {
             Ok(CheckedTransactionDetails::new(
                 Some(nonce_address),
                 compute_budget,
