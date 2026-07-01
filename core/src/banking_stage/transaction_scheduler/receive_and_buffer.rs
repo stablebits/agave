@@ -282,7 +282,7 @@ impl TransactionViewReceiveAndBuffer {
              transaction_priority_ids: &mut ArrayVec<TransactionPriorityId, 64>| {
                 // Temporary scope so that transaction references are immediately
                 // dropped and transactions not passing
-                let mut check_results = {
+                let check_results = {
                     let mut transactions = ArrayVec::<_, EXTRA_CAPACITY>::new();
                     transactions.extend(transaction_priority_ids.iter().map(|priority_id| {
                         container
@@ -337,9 +337,11 @@ impl TransactionViewReceiveAndBuffer {
         let mut num_dropped_on_lock_validation = 0;
         let mut num_dropped_on_compute_budget = 0;
         let mut num_dropped_on_age_early = 0;
-        // Memoizes the last (blockhash, valid) age lookup across packets in this receive cycle, so
-        // a flood sharing one stale blockhash costs a single blockhash-queue probe.
-        let mut recent_blockhash_age_cache: Option<(Hash, bool)> = None;
+        // Memoizes the last (blockhash, expiry-index) age lookup across packets in this receive
+        // cycle, so a flood sharing one stale blockhash costs a single blockhash-queue probe. The
+        // cached value is `Some(expiry)` when the blockhash is valid, `None` when it has aged out
+        // (or is absent, e.g. a durable-nonce blockhash).
+        let mut recent_blockhash_age_cache: Option<(Hash, Option<u64>)> = None;
 
         for packet_batch in packet_batch_message.iter() {
             for packet in packet_batch.iter() {
@@ -438,9 +440,13 @@ impl TransactionViewReceiveAndBuffer {
         transaction_account_lock_limit: usize,
         sanitize_config: &SanitizeConfig,
         filter_keys: &HashSet<Pubkey>,
-        recent_blockhash_age_cache: &mut Option<(Hash, bool)>,
+        recent_blockhash_age_cache: &mut Option<(Hash, Option<u64>)>,
     ) -> Result<TransactionViewState, PacketHandlingError> {
         let max_age = working_bank.max_processing_age();
+        // Blockhash-queue index past which this transaction ages out, recorded so incremental_recheck
+        // can re-check age without re-probing the queue. Defaults to the durable-nonce sentinel
+        // (u64::MAX = never aged out on the fast path); the worker validates those authoritatively.
+        let mut blockhash_expiry_index = u64::MAX;
         let (view, deactivation_slot) = translate_to_runtime_view_with_precheck(
             bytes,
             root_bank,
@@ -449,23 +455,29 @@ impl TransactionViewReceiveAndBuffer {
             |static_view| {
                 // Early age reject: drop transactions whose blockhash has already aged out, before
                 // paying for metadata construction, ALT resolution, and container insertion. The
-                // lookup is memoized since a flood typically shares one (stale) blockhash. Durable-
-                // nonce transactions carry an out-of-window blockhash but must NOT be dropped, so
-                // skip the reject when the first instruction is a System AdvanceNonceAccount; those
-                // fall through to the authoritative batched check in check_and_push_to_queue (which
-                // also re-checks anything this conservative fast-path lets through).
+                // lookup is memoized since a flood typically shares one (stale) blockhash, and it
+                // captures the blockhash's expiry index (hash_index + max_age) for later reuse in
+                // incremental_recheck. Durable-nonce transactions carry an out-of-window blockhash
+                // but must NOT be dropped, so skip the reject when the first instruction is a System
+                // AdvanceNonceAccount; those fall through to the authoritative batched check in
+                // check_and_push_to_queue (which also re-checks anything this fast-path lets through).
                 let recent_blockhash = static_view.recent_blockhash();
-                let blockhash_valid = match recent_blockhash_age_cache {
-                    Some((hash, valid)) if *hash == *recent_blockhash => *valid,
+                let expiry = match recent_blockhash_age_cache {
+                    Some((hash, expiry)) if *hash == *recent_blockhash => *expiry,
                     _ => {
-                        let valid =
-                            working_bank.is_hash_valid_for_age(recent_blockhash, max_age);
-                        *recent_blockhash_age_cache = Some((*recent_blockhash, valid));
-                        valid
+                        let expiry =
+                            working_bank.get_blockhash_expiry_index(recent_blockhash, max_age);
+                        *recent_blockhash_age_cache = Some((*recent_blockhash, expiry));
+                        expiry
                     }
                 };
-                if !blockhash_valid && !is_durable_nonce_advance(static_view) {
-                    return Err(PacketHandlingError::Age);
+                match expiry {
+                    Some(expiry) => blockhash_expiry_index = expiry,
+                    None if !is_durable_nonce_advance(static_view) => {
+                        return Err(PacketHandlingError::Age);
+                    }
+                    // Durable nonce: keep the u64::MAX sentinel set above.
+                    None => {}
                 }
                 Ok(())
             },
@@ -490,7 +502,13 @@ impl TransactionViewReceiveAndBuffer {
         let (priority, cost) =
             calculate_priority_and_cost(working_bank, &view, &transaction_configuration);
 
-        Ok(TransactionState::new(view, max_age, priority, cost))
+        Ok(TransactionState::new(
+            view,
+            max_age,
+            priority,
+            cost,
+            blockhash_expiry_index,
+        ))
     }
 }
 

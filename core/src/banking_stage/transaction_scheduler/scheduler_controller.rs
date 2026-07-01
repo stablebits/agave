@@ -25,7 +25,6 @@ use {
     solana_cost_model::cost_tracker::SharedBlockCost,
     solana_measure::measure_us,
     solana_runtime::bank_forks::SharableBanks,
-    solana_svm::transaction_error_metrics::TransactionErrorMetrics,
     std::{
         num::{NonZeroU64, Saturating},
         sync::{
@@ -404,40 +403,31 @@ where
             return;
         }
 
-        // Build our recheck batch & feed it through bank.
-        let txs = {
-            // NB: Always allocate a the same size chunk to help jemalloc predict us.
-            let mut txs = Vec::with_capacity(CHECK_CHUNK);
-            txs.extend(self.recheck_chunk.iter().map(|pid| {
-                self.container
-                    .get_transaction(pid.id)
-                    .expect("transaction must exist")
-            }));
-
-            txs
-        };
-        let lock_results = vec![Ok(()); txs.len()];
-        let mut error_counters = TransactionErrorMetrics::default();
-        // Age + compute-budget only; deliberately skip the status-cache check here. It keys on
-        // message_hash(), but buffered transactions still carry the Hash::default() placeholder
-        // from the receive path (the real hash is recomputed worker-side, see
-        // consume_worker::consume), so the lookup would always miss -- evicting no duplicates while
-        // paying the status_cache.read() lock that contends with the workers' commit-time writes.
+        // Re-validate age only, via a single integer compare per transaction. A buffered
+        // transaction's blockhash age is a fixed function of elapsed slots: it is stale once
+        // last_hash_index passes the expiry index we recorded at receive time (hash_index +
+        // max_age). So we avoid re-probing the blockhash queue (and re-parsing compute budget) for
+        // every buffered transaction each cycle. Durable-nonce transactions carry a u64::MAX
+        // sentinel and are never dropped here; the worker performs the authoritative age/nonce
+        // check at execution.
+        //
+        // We also deliberately skip the status-cache check: it keys on message_hash(), but buffered
+        // transactions carry the Hash::default() placeholder from the receive path (the real hash is
+        // recomputed worker-side, see consume_worker::consume), so the lookup would always miss.
         // Duplicate rejection and replay protection are enforced authoritatively at the worker on
         // the recomputed hash (batch dedup + status cache).
-        let results = bank.check_transactions_without_status_cache::<R::Transaction>(
-            &txs,
-            &lock_results,
-            bank.max_processing_age(),
-            true,
-            &mut error_counters,
-        );
-
+        let last_hash_index = bank.last_hash_index();
         let mut num_dropped = Saturating(0usize);
-        for (result, pid) in results.iter().zip(self.recheck_chunk.iter()) {
-            if result.is_err() {
+        for i in 0..self.recheck_chunk.len() {
+            let id = self.recheck_chunk[i].id;
+            let expiry_index = self
+                .container
+                .get_mut_transaction_state(id)
+                .expect("transaction must exist")
+                .blockhash_expiry_index();
+            if last_hash_index > expiry_index {
                 num_dropped += 1;
-                self.container.remove_by_id(pid.id);
+                self.container.remove_by_id(id);
             }
         }
 

@@ -20,16 +20,29 @@ pub(crate) struct TransactionState<Tx> {
     priority: u64,
     /// Estimated cost of the transaction.
     cost: u64,
+    /// Absolute blockhash-queue index past which this transaction's `recent_blockhash` is too
+    /// old (`hash_index + max_age`), captured at receive time. `incremental_recheck` compares it
+    /// against the bank's current `last_hash_index` to evict aged-out transactions without
+    /// re-probing the blockhash queue. `u64::MAX` for durable-nonce transactions, whose age is
+    /// validated authoritatively by the worker.
+    blockhash_expiry_index: u64,
 }
 
 impl<Tx> TransactionState<Tx> {
     /// Creates a new `TransactionState` in the `Unprocessed` state.
-    pub(crate) fn new(transaction: Tx, max_age: MaxAge, priority: u64, cost: u64) -> Self {
+    pub(crate) fn new(
+        transaction: Tx,
+        max_age: MaxAge,
+        priority: u64,
+        cost: u64,
+        blockhash_expiry_index: u64,
+    ) -> Self {
         Self {
             transaction: Some(transaction),
             max_age,
             priority,
             cost,
+            blockhash_expiry_index,
         }
     }
 
@@ -43,6 +56,12 @@ impl<Tx> TransactionState<Tx> {
     /// Return the cost of the transaction.
     pub(crate) fn cost(&self) -> u64 {
         self.cost
+    }
+
+    /// Absolute blockhash-queue index past which this transaction's blockhash expires (see the
+    /// field docs). `u64::MAX` for durable-nonce transactions.
+    pub(crate) fn blockhash_expiry_index(&self) -> u64 {
+        self.blockhash_expiry_index
     }
 
     /// Intended to be called when a transaction is scheduled. This method
@@ -112,6 +131,7 @@ mod tests {
             MaxAge::MAX,
             compute_unit_price,
             TEST_TRANSACTION_COST,
+            u64::MAX,
         )
     }
 

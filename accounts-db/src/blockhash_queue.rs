@@ -124,6 +124,13 @@ impl BlockhashQueue {
         self.last_hash.expect("no hash has been set")
     }
 
+    /// Index of the most recently registered hash. Combined with an expiry index from
+    /// [`Self::get_hash_expiry_index`], a caller can re-check a hash's age with a single
+    /// comparison rather than another map probe.
+    pub fn last_hash_index(&self) -> u64 {
+        self.last_hash_index
+    }
+
     pub fn get_lamports_per_signature(&self, hash: &Hash) -> Option<u64> {
         self.hashes
             .get(hash)
@@ -141,6 +148,15 @@ impl BlockhashQueue {
         self.hashes.get(hash).filter(|info| {
             Self::is_hash_index_valid(self.last_hash_index, max_age, info.hash_index)
         })
+    }
+
+    /// If `hash` is in the queue and currently within `max_age`, return the absolute hash index
+    /// past which it expires (`hash_index + max_age`). A caller can cache this and later
+    /// re-validate age with a single `last_hash_index() <= expiry` comparison, avoiding a repeated
+    /// map probe for a transaction whose `recent_blockhash` never changes.
+    pub fn get_hash_expiry_index(&self, hash: &Hash, max_age: usize) -> Option<u64> {
+        self.get_hash_info_if_valid(hash, max_age)
+            .map(|info| info.hash_index.saturating_add(max_age as u64))
     }
 
     pub fn get_hash_age(&self, hash: &Hash) -> Option<u64> {

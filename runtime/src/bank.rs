@@ -3965,6 +3965,22 @@ impl Bank {
             .is_hash_valid_for_age(hash, max_age)
     }
 
+    /// Index of the most recently registered blockhash. Pair with
+    /// [`Self::get_blockhash_expiry_index`] to re-check age via a single comparison.
+    pub fn last_hash_index(&self) -> u64 {
+        self.blockhash_queue.read().unwrap().last_hash_index()
+    }
+
+    /// Absolute hash index past which `hash` expires (`hash_index + max_age`), if it is currently
+    /// valid. Lets a caller cache the expiry once and later re-validate age with a comparison
+    /// against [`Self::last_hash_index`] instead of another blockhash-queue probe.
+    pub fn get_blockhash_expiry_index(&self, hash: &Hash, max_age: usize) -> Option<u64> {
+        self.blockhash_queue
+            .read()
+            .unwrap()
+            .get_hash_expiry_index(hash, max_age)
+    }
+
     pub fn collect_balances(
         &self,
         batch: &TransactionBatch<impl SVMMessage>,
