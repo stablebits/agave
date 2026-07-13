@@ -92,6 +92,10 @@ pub(crate) trait ReceiveAndBuffer {
     type Transaction: TransactionWithMeta + Send + Sync;
     type Container: StateContainer<Self::Transaction> + Send + Sync;
 
+    /// Returns the number of occupied and total slots in the input channel.
+    /// Unbounded channels have no occupancy limit and return `None`.
+    fn channel_occupancy(&self) -> Option<(usize, usize)>;
+
     /// Return Err if the receiver is disconnected AND no packets were
     /// received. Otherwise return Ok(num_received).
     fn receive_and_buffer_packets(
@@ -110,6 +114,12 @@ pub(crate) struct TransactionViewReceiveAndBuffer {
 impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
     type Transaction = RuntimeTransaction<ResolvedTransactionView<SharedBytes>>;
     type Container = TransactionViewStateContainer;
+
+    fn channel_occupancy(&self) -> Option<(usize, usize)> {
+        self.receiver
+            .capacity()
+            .map(|capacity| (self.receiver.len(), capacity))
+    }
 
     fn receive_and_buffer_packets(
         &mut self,

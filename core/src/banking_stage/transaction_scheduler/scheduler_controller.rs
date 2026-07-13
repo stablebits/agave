@@ -44,6 +44,11 @@ const CHECK_CHUNK: usize = 128;
 const SATURATION_BUFFER_PCT: u8 = 99;
 /// Clear the priority floor once the retained buffer drains below this watermark.
 const DESATURATION_BUFFER_PCT: u8 = 95;
+/// Publish the priority floor before the bounded sigverify-to-scheduler channel
+/// fills and begins evicting packet batches without regard to priority.
+const SATURATION_CHANNEL_PCT: u8 = 50;
+/// Keep the floor published until the input channel has substantially drained.
+const DESATURATION_CHANNEL_PCT: u8 = 25;
 
 #[derive(Clone)]
 pub struct SchedulerConfig {
@@ -68,35 +73,61 @@ pub(crate) const DEFAULT_SCHEDULER_PACING_FILL_TIME_MILLIS: NonZeroU64 =
 struct SaturationState {
     priority_floor: Arc<SchedulerPriorityFloor>,
     saturated: bool,
-    saturation_watermark: usize,
-    desaturation_watermark: usize,
+    buffer_saturation_watermark: usize,
+    buffer_desaturation_watermark: usize,
 }
 
 impl SaturationState {
     fn new(priority_floor: Arc<SchedulerPriorityFloor>, container_capacity: usize) -> Self {
-        let saturation_watermark =
+        let buffer_saturation_watermark =
             container_capacity.saturating_mul(SATURATION_BUFFER_PCT as usize) / 100;
-        let desaturation_watermark =
+        let buffer_desaturation_watermark =
             container_capacity.saturating_mul(DESATURATION_BUFFER_PCT as usize) / 100;
         Self {
             priority_floor,
             saturated: false,
-            saturation_watermark,
-            desaturation_watermark,
+            buffer_saturation_watermark,
+            buffer_desaturation_watermark,
         }
     }
 
     /// Update the saturation state.
-    fn update(&mut self, buffer_size: usize, num_dropped_on_capacity: usize) -> bool {
+    fn update(
+        &mut self,
+        buffer_size: usize,
+        num_dropped_on_capacity: usize,
+        channel_occupancy: Option<(usize, usize)>,
+    ) -> bool {
+        let channel_saturated =
+            Self::channel_reaches_watermark(channel_occupancy, SATURATION_CHANNEL_PCT);
+        let channel_above_desaturation =
+            Self::channel_reaches_watermark(channel_occupancy, DESATURATION_CHANNEL_PCT);
+
         if self.saturated {
-            if buffer_size < self.desaturation_watermark && num_dropped_on_capacity == 0 {
+            if buffer_size < self.buffer_desaturation_watermark
+                && !channel_above_desaturation
+                && num_dropped_on_capacity == 0
+            {
                 self.saturated = false;
             }
-        } else if buffer_size >= self.saturation_watermark || num_dropped_on_capacity > 0 {
+        } else if buffer_size >= self.buffer_saturation_watermark
+            || channel_saturated
+            || num_dropped_on_capacity > 0
+        {
             self.saturated = true;
         }
 
         self.saturated
+    }
+
+    fn channel_reaches_watermark(
+        channel_occupancy: Option<(usize, usize)>,
+        watermark_pct: u8,
+    ) -> bool {
+        channel_occupancy.is_some_and(|(len, capacity)| {
+            capacity > 0
+                && len.saturating_mul(100) >= capacity.saturating_mul(watermark_pct as usize)
+        })
     }
 
     /// Publish the priority floor.
@@ -269,7 +300,11 @@ where
             self.count_metrics.update(|count_metrics| {
                 count_metrics.update_priority_stats(priority_min_max);
             });
-            self.update_scheduler_priority_floor(receiving_stats.num_dropped_on_capacity);
+            let channel_occupancy = self.receive_and_buffer.channel_occupancy();
+            self.update_scheduler_priority_floor(
+                receiving_stats.num_dropped_on_capacity,
+                channel_occupancy,
+            );
             self.count_metrics
                 .maybe_report_and_reset_interval(should_report);
             self.timing_metrics
@@ -332,23 +367,51 @@ where
 
     /// Update the scheduler priority floor.
     ///
-    /// Semantics: when the retained scheduler buffer is nearly full, drop
-    /// arrivals that are at-or-below the current queue-min priority, i.e. no
-    /// better than what the bounded scheduler candidate set would evict.
-    fn update_scheduler_priority_floor(&mut self, num_dropped_on_capacity: usize) {
+    /// Semantics: when the retained scheduler buffer is nearly full or its
+    /// input channel is backing up, drop arrivals that are at-or-below the
+    /// current queue-min priority, i.e. no better than what the bounded
+    /// scheduler candidate set would evict.
+    fn update_scheduler_priority_floor(
+        &mut self,
+        num_dropped_on_capacity: usize,
+        channel_occupancy: Option<(usize, usize)>,
+    ) {
         let buffer_size = self.container.buffer_size();
-        let saturated = self
-            .saturation_state
-            .update(buffer_size, num_dropped_on_capacity);
+        let was_saturated = self.saturation_state.saturated;
+        let saturated =
+            self.saturation_state
+                .update(buffer_size, num_dropped_on_capacity, channel_occupancy);
         let priority_floor = if saturated {
-            self.container
-                .get_min_max_priority()
-                .map_or(0, |(min, _)| min)
+            self.container.get_min_max_priority().map(|(min, _)| min)
         } else {
-            0
+            Some(0)
         };
 
-        self.saturation_state.publish_floor(priority_floor);
+        // A scheduled-but-not-yet-finished transaction still occupies the
+        // retained buffer, while the priority queue itself can briefly be
+        // empty. Keep the last useful floor until saturation clears instead
+        // of publishing zero during that gap.
+        if let Some(priority_floor) = priority_floor {
+            self.saturation_state.publish_floor(priority_floor);
+        }
+
+        if saturated != was_saturated {
+            let (channel_len, channel_capacity) = channel_occupancy.unwrap_or_default();
+            datapoint_info!(
+                "banking_stage_scheduler_priority_floor_transition",
+                ("saturated", saturated, bool),
+                ("buffer_size", buffer_size, i64),
+                ("queue_size", self.container.queue_size(), i64),
+                ("channel_len", channel_len, i64),
+                ("channel_capacity", channel_capacity, i64),
+                ("num_dropped_on_capacity", num_dropped_on_capacity, i64),
+                (
+                    "priority_floor",
+                    self.saturation_state.priority_floor.get(),
+                    i64
+                ),
+            );
+        }
     }
 
     /// Clears the transaction state container.
@@ -1088,12 +1151,22 @@ mod tests {
 mod saturation_state_tests {
     use super::*;
 
+    const CHANNEL_CAPACITY: usize = 100;
+
     fn saturation_watermark() -> usize {
         TOTAL_BUFFERED_PACKETS.saturating_mul(SATURATION_BUFFER_PCT as usize) / 100
     }
 
     fn desaturation_watermark() -> usize {
         TOTAL_BUFFERED_PACKETS.saturating_mul(DESATURATION_BUFFER_PCT as usize) / 100
+    }
+
+    fn channel_saturation_watermark() -> usize {
+        CHANNEL_CAPACITY.saturating_mul(SATURATION_CHANNEL_PCT as usize) / 100
+    }
+
+    fn channel_desaturation_watermark() -> usize {
+        CHANNEL_CAPACITY.saturating_mul(DESATURATION_CHANNEL_PCT as usize) / 100
     }
 
     fn make_state() -> (SaturationState, Arc<SchedulerPriorityFloor>) {
@@ -1105,21 +1178,41 @@ mod saturation_state_tests {
     #[test]
     fn starts_unsaturated() {
         let (mut state, floor) = make_state();
-        assert!(!state.update(0, 0));
+        assert!(!state.update(0, 0, None));
         assert_eq!(floor.get(), 0);
     }
 
     #[test]
     fn does_not_enter_when_buffer_below_saturation_watermark() {
         let (mut state, floor) = make_state();
-        assert!(!state.update(saturation_watermark() - 1, 0));
+        assert!(!state.update(saturation_watermark() - 1, 0, None));
         assert_eq!(floor.get(), 0);
     }
 
     #[test]
     fn enters_when_buffer_reaches_saturation_watermark() {
         let (mut state, _floor) = make_state();
-        assert!(state.update(saturation_watermark(), 0));
+        assert!(state.update(saturation_watermark(), 0, None));
+    }
+
+    #[test]
+    fn enters_when_channel_reaches_saturation_watermark() {
+        let (mut state, _floor) = make_state();
+        assert!(state.update(
+            0,
+            0,
+            Some((channel_saturation_watermark(), CHANNEL_CAPACITY)),
+        ));
+    }
+
+    #[test]
+    fn does_not_enter_when_channel_is_below_saturation_watermark() {
+        let (mut state, _floor) = make_state();
+        assert!(!state.update(
+            0,
+            0,
+            Some((channel_saturation_watermark() - 1, CHANNEL_CAPACITY)),
+        ));
     }
 
     #[test]
@@ -1127,7 +1220,7 @@ mod saturation_state_tests {
         // Direct trigger: any on-capacity drop saturates regardless of
         // buffer-watermark — invariant to future changes in the trim policy.
         let (mut state, _floor) = make_state();
-        assert!(state.update(0, 1));
+        assert!(state.update(0, 1, None));
     }
 
     #[test]
@@ -1140,15 +1233,35 @@ mod saturation_state_tests {
     #[test]
     fn stays_saturated_at_desaturation_watermark() {
         let (mut state, _floor) = make_state();
-        assert!(state.update(saturation_watermark(), 0));
-        assert!(state.update(desaturation_watermark(), 0));
+        assert!(state.update(saturation_watermark(), 0, None));
+        assert!(state.update(desaturation_watermark(), 0, None));
     }
 
     #[test]
     fn exits_when_buffer_drops_below_desaturation_watermark() {
         let (mut state, _floor) = make_state();
-        assert!(state.update(saturation_watermark(), 0));
-        assert!(!state.update(desaturation_watermark() - 1, 0));
+        assert!(state.update(saturation_watermark(), 0, None));
+        assert!(!state.update(desaturation_watermark() - 1, 0, None));
+    }
+
+    #[test]
+    fn channel_pressure_uses_desaturation_hysteresis() {
+        let (mut state, _floor) = make_state();
+        assert!(state.update(
+            0,
+            0,
+            Some((channel_saturation_watermark(), CHANNEL_CAPACITY)),
+        ));
+        assert!(state.update(
+            0,
+            0,
+            Some((channel_desaturation_watermark(), CHANNEL_CAPACITY)),
+        ));
+        assert!(!state.update(
+            0,
+            0,
+            Some((channel_desaturation_watermark() - 1, CHANNEL_CAPACITY)),
+        ));
     }
 
     #[test]
@@ -1156,8 +1269,8 @@ mod saturation_state_tests {
         // Direct trigger keeps us saturated even if the buffer has drained,
         // because drops in the same tick mean we still need backpressure.
         let (mut state, _floor) = make_state();
-        assert!(state.update(saturation_watermark(), 0));
-        assert!(state.update(desaturation_watermark() - 1, 1));
+        assert!(state.update(saturation_watermark(), 0, None));
+        assert!(state.update(desaturation_watermark() - 1, 1, None));
     }
 
     #[test]
