@@ -63,7 +63,7 @@ struct SigVerifierStats {
     total_verify_time_us: Arc<AtomicUsize>,
     /// Max occupancy of the banking_stage output channel since last report.
     max_pre_send_len: Arc<AtomicUsize>,
-    /// Count of sends in which the EvictingSender had to drop a batch.
+    /// Number of packets evicted from the banking-stage output channel.
     eviction_drops: Arc<AtomicUsize>,
     total_dropped_below_priority_floor: Arc<AtomicUsize>,
     total_priority_floor_time_us: Arc<AtomicUsize>,
@@ -76,7 +76,7 @@ struct ServicerState {
 }
 
 impl SigVerifierStats {
-    const REPORT_INTERVAL: Duration = Duration::from_secs(2);
+    const REPORT_INTERVAL: Duration = Duration::from_millis(100);
 
     fn maybe_report_and_reset(&mut self, name: &'static str) {
         // No need to report a datapoint if no batches/packets received
