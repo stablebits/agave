@@ -49,6 +49,10 @@ const DESATURATION_BUFFER_PCT: u8 = 95;
 const SATURATION_CHANNEL_PCT: u8 = 50;
 /// Keep the floor published until the input channel has substantially drained.
 const DESATURATION_CHANNEL_PCT: u8 = 25;
+/// Under channel pressure, move the floor this far from the queue minimum
+/// toward its maximum. This interpolates the numeric priority range; it is
+/// not an empirical queue percentile.
+const CHANNEL_PRIORITY_FLOOR_RANGE_PCT: u8 = 25;
 
 #[derive(Clone)]
 pub struct SchedulerConfig {
@@ -130,9 +134,26 @@ impl SaturationState {
         })
     }
 
+    fn priority_floor_candidate(min: u64, max: u64, channel_saturated: bool) -> u64 {
+        if !channel_saturated {
+            return min;
+        }
+
+        let range = max.saturating_sub(min);
+        let offset =
+            u64::try_from(u128::from(range) * u128::from(CHANNEL_PRIORITY_FLOOR_RANGE_PCT) / 100)
+                .expect("priority floor offset fits in u64");
+        min.saturating_add(offset)
+    }
+
     /// Publish the priority floor.
     fn publish_floor(&self, floor: u64) {
         self.priority_floor.set(floor);
+    }
+
+    /// Raise, but never lower, the floor during one saturated period.
+    fn raise_floor(&self, floor: u64) {
+        self.publish_floor(self.priority_floor.get().max(floor));
     }
 }
 
@@ -367,10 +388,10 @@ where
 
     /// Update the scheduler priority floor.
     ///
-    /// Semantics: when the retained scheduler buffer is nearly full or its
-    /// input channel is backing up, drop arrivals that are at-or-below the
-    /// current queue-min priority, i.e. no better than what the bounded
-    /// scheduler candidate set would evict.
+    /// Semantics: when the retained scheduler buffer is nearly full, drop
+    /// arrivals at-or-below the current queue-min priority. When the input
+    /// channel itself is saturated, use a stronger floor interpolated between
+    /// the queue's minimum and maximum priorities.
     fn update_scheduler_priority_floor(
         &mut self,
         num_dropped_on_capacity: usize,
@@ -378,25 +399,30 @@ where
     ) {
         let buffer_size = self.container.buffer_size();
         let was_saturated = self.saturation_state.saturated;
+        let channel_saturated =
+            SaturationState::channel_reaches_watermark(channel_occupancy, SATURATION_CHANNEL_PCT);
         let saturated =
             self.saturation_state
                 .update(buffer_size, num_dropped_on_capacity, channel_occupancy);
-        let priority_floor = if saturated {
-            self.container.get_min_max_priority().map(|(min, _)| min)
-        } else {
-            Some(0)
-        };
+        let priority_min_max = self.container.get_min_max_priority();
 
         // A scheduled-but-not-yet-finished transaction still occupies the
         // retained buffer, while the priority queue itself can briefly be
         // empty. Keep the last useful floor until saturation clears instead
         // of publishing zero during that gap.
-        if let Some(priority_floor) = priority_floor {
-            self.saturation_state.publish_floor(priority_floor);
+        if saturated {
+            if let Some((min, max)) = priority_min_max {
+                let priority_floor =
+                    SaturationState::priority_floor_candidate(min, max, channel_saturated);
+                self.saturation_state.raise_floor(priority_floor);
+            }
+        } else {
+            self.saturation_state.publish_floor(0);
         }
 
         if saturated != was_saturated {
             let (channel_len, channel_capacity) = channel_occupancy.unwrap_or_default();
+            let (min_priority, max_priority) = priority_min_max.unwrap_or_default();
             datapoint_info!(
                 "banking_stage_scheduler_priority_floor_transition",
                 ("saturated", saturated, bool),
@@ -404,7 +430,10 @@ where
                 ("queue_size", self.container.queue_size(), i64),
                 ("channel_len", channel_len, i64),
                 ("channel_capacity", channel_capacity, i64),
+                ("channel_saturated", channel_saturated, bool),
                 ("num_dropped_on_capacity", num_dropped_on_capacity, i64),
+                ("min_priority", min_priority, i64),
+                ("max_priority", max_priority, i64),
                 (
                     "priority_floor",
                     self.saturation_state.priority_floor.get(),
@@ -1228,6 +1257,32 @@ mod saturation_state_tests {
         let (state, floor) = make_state();
         state.publish_floor(42);
         assert_eq!(floor.get(), 42);
+    }
+
+    #[test]
+    fn channel_pressure_uses_stronger_priority_floor_candidate() {
+        assert_eq!(
+            SaturationState::priority_floor_candidate(100, 500, false),
+            100
+        );
+        assert_eq!(
+            SaturationState::priority_floor_candidate(100, 500, true),
+            200
+        );
+        assert_eq!(
+            SaturationState::priority_floor_candidate(100, 100, true),
+            100
+        );
+    }
+
+    #[test]
+    fn raise_floor_is_monotonic() {
+        let (state, floor) = make_state();
+        state.raise_floor(42);
+        state.raise_floor(21);
+        assert_eq!(floor.get(), 42);
+        state.raise_floor(84);
+        assert_eq!(floor.get(), 84);
     }
 
     #[test]
