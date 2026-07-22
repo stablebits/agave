@@ -64,7 +64,9 @@ dependencies = [
 name = "agave-banking-stage-ingress-types"
 version = "4.3.0-alpha.2"
 dependencies = [
+ "criterion",
  "crossbeam-channel",
+ "min-max-heap",
  "solana-perf",
  "wincode",
 ]

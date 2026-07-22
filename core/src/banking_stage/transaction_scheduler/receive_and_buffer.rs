@@ -12,7 +12,7 @@ use {
         },
         transaction_priority::calculate_priority_and_cost,
     },
-    agave_banking_stage_ingress_types::{BankingPacketBatch, BankingPacketReceiver},
+    agave_banking_stage_ingress_types::{BankingPacketBatch, PriorityBankingPacketReceiver},
     agave_transaction_view::{
         resolved_transaction_view::ResolvedTransactionView, sanitize::SanitizeConfig,
         transaction_data::TransactionData, transaction_version::TransactionVersion,
@@ -134,7 +134,7 @@ pub(crate) trait ReceiveAndBuffer {
 }
 
 pub(crate) struct TransactionViewReceiveAndBuffer {
-    pub receiver: BankingPacketReceiver,
+    pub receiver: PriorityBankingPacketReceiver,
     pub sharable_banks: SharableBanks,
     pub filter_keys: Arc<HashSet<Pubkey>>,
 }
@@ -157,6 +157,7 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
         const RECV_TIMEOUT: Duration = Duration::from_millis(10);
         const PACKET_BURST_TIMEOUT: Duration = Duration::from_millis(1);
         const PACKET_BURST_LIMIT: usize = 1000;
+        const CHANNEL_RECEIVE_BATCH_SIZE: usize = 64;
         let start = Instant::now();
 
         let mut received_message = false;
@@ -176,16 +177,21 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
             //       overhead for wakers? But then risk not waking up when message
             //       received - as long as sleep is somewhat short, this should be
             //       fine.
-            match self.receiver.recv_timeout(RECV_TIMEOUT) {
-                Ok(packet_batch_message) => {
-                    received_message = true;
-                    stats.accumulate(self.handle_packet_batch_message(
-                        container,
-                        decision,
-                        &root_bank,
-                        &working_bank,
-                        packet_batch_message,
-                    ));
+            match self
+                .receiver
+                .recv_batch_timeout(RECV_TIMEOUT, CHANNEL_RECEIVE_BATCH_SIZE)
+            {
+                Ok(packet_batch_messages) => {
+                    for (_priority, packet_batch_message) in packet_batch_messages {
+                        received_message = true;
+                        stats.accumulate(self.handle_packet_batch_message(
+                            container,
+                            decision,
+                            &root_bank,
+                            &working_bank,
+                            packet_batch_message,
+                        ));
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => timed_out = true,
                 Err(RecvTimeoutError::Disconnected) => {
@@ -200,18 +206,23 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
             while start.elapsed() < PACKET_BURST_TIMEOUT && stats.num_received < PACKET_BURST_LIMIT
             {
                 let receive_start = Instant::now();
-                match self.receiver.try_recv() {
-                    Ok(packet_batch_message) => {
+                let remaining = PACKET_BURST_LIMIT
+                    .saturating_sub(stats.num_received)
+                    .clamp(1, CHANNEL_RECEIVE_BATCH_SIZE);
+                match self.receiver.try_recv_batch(remaining) {
+                    Ok(packet_batch_messages) => {
                         stats.receive_time_us += receive_start.elapsed().as_micros() as u64;
-                        received_message = true;
-                        let batch_stats = self.handle_packet_batch_message(
-                            container,
-                            decision,
-                            &root_bank,
-                            &working_bank,
-                            packet_batch_message,
-                        );
-                        stats.accumulate(batch_stats);
+                        for (_priority, packet_batch_message) in packet_batch_messages {
+                            received_message = true;
+                            let batch_stats = self.handle_packet_batch_message(
+                                container,
+                                decision,
+                                &root_bank,
+                                &working_bank,
+                                packet_batch_message,
+                            );
+                            stats.accumulate(batch_stats);
+                        }
                     }
                     Err(TryRecvError::Empty) => {
                         break;
@@ -220,6 +231,7 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
                         if !received_message {
                             return Err(DisconnectedError);
                         }
+                        break;
                     }
                 }
             }
@@ -519,9 +531,9 @@ mod tests {
         super::*,
         crate::banking_stage::tests::create_slow_genesis_config,
         agave_banking_stage_ingress_types::{
-            BankingPacketBatch, to_banking_packet_batch, to_single_banking_packet_batch,
+            PriorityBankingPacketReceiver, PriorityBankingPacketSender,
+            priority_channel as bounded, to_banking_packet_batch, to_single_banking_packet_batch,
         },
-        crossbeam_channel::{Receiver, Sender, bounded},
         solana_account::AccountSharedData,
         solana_compute_budget_interface::ComputeBudgetInstruction,
         solana_fee_calculator::FeeRateGovernor,
@@ -568,7 +580,7 @@ mod tests {
     const TEST_CONTAINER_CAPACITY: usize = 100;
 
     fn setup_transaction_view_receive_and_buffer(
-        receiver: Receiver<BankingPacketBatch>,
+        receiver: PriorityBankingPacketReceiver,
         bank_forks: Arc<RwLock<BankForks>>,
     ) -> (
         TransactionViewReceiveAndBuffer,
@@ -582,7 +594,7 @@ mod tests {
     }
 
     fn setup_transaction_view_receive_and_buffer_with_filter_keys(
-        receiver: Receiver<BankingPacketBatch>,
+        receiver: PriorityBankingPacketReceiver,
         bank_forks: Arc<RwLock<BankForks>>,
         filter_keys: Arc<HashSet<Pubkey>>,
     ) -> (
@@ -628,7 +640,7 @@ mod tests {
         assert_eq!(actual_length, expected_length);
     }
 
-    fn send_transactions(sender: &Sender<BankingPacketBatch>, transactions: &[Transaction]) {
+    fn send_transactions(sender: &PriorityBankingPacketSender, transactions: &[Transaction]) {
         sender.send(to_banking_packet_batch(transactions)).unwrap();
     }
 

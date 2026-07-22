@@ -1,5 +1,8 @@
 use {
-    agave_banking_stage_ingress_types::{BankingPacketBatch, BankingPacketReceiver},
+    agave_banking_stage_ingress_types::{
+        BankingPacketBatch, BankingPacketReceiver, PriorityBankingPacketReceiver,
+        PriorityBankingPacketSender, PrioritySendOutcome, priority_channel,
+    },
     bincode::serialize_into,
     chrono::{DateTime, Local},
     crossbeam_channel::{Receiver, SendError, TryRecvError, TrySendError, bounded},
@@ -203,7 +206,7 @@ pub fn receiving_loop_with_minimized_sender_overhead<T, E, const SLEEP_MS: u64>(
 /// different source labels for the banking stage setup.
 pub struct Channels {
     pub non_vote_sender: BankingPacketSender,
-    pub non_vote_receiver: BankingPacketReceiver,
+    pub non_vote_receiver: PriorityBankingPacketReceiver,
     pub tpu_vote_sender: BankingPacketSender,
     pub tpu_vote_receiver: BankingPacketReceiver,
     pub gossip_vote_sender: BankingPacketSender,
@@ -296,11 +299,15 @@ impl BankingTracer {
         }
     }
 
-    pub fn create_channel_non_vote(&self) -> (BankingPacketSender, BankingPacketReceiver) {
-        Self::channel(
-            ChannelLabel::NonVote,
-            NON_VOTE_CHANNEL_CAPACITY,
-            self.active_tracer.as_ref().cloned(),
+    pub fn create_channel_non_vote(&self) -> (BankingPacketSender, PriorityBankingPacketReceiver) {
+        let (sender, receiver) = priority_channel(NON_VOTE_CHANNEL_CAPACITY);
+        (
+            TracedSender::new_priority(
+                ChannelLabel::NonVote,
+                sender,
+                self.active_tracer.as_ref().cloned(),
+            ),
+            receiver,
         )
     }
 
@@ -390,8 +397,14 @@ impl BankingTracer {
 #[derive(Clone)]
 pub struct TracedSender {
     label: ChannelLabel,
-    sender: EvictingSender<BankingPacketBatch>,
+    sender: TracedSenderInner,
     active_tracer: Option<ActiveTracer>,
+}
+
+#[derive(Clone)]
+enum TracedSenderInner {
+    Fifo(EvictingSender<BankingPacketBatch>),
+    Priority(PriorityBankingPacketSender),
 }
 
 impl TracedSender {
@@ -402,7 +415,19 @@ impl TracedSender {
     ) -> Self {
         Self {
             label,
-            sender,
+            sender: TracedSenderInner::Fifo(sender),
+            active_tracer,
+        }
+    }
+
+    fn new_priority(
+        label: ChannelLabel,
+        sender: PriorityBankingPacketSender,
+        active_tracer: Option<ActiveTracer>,
+    ) -> Self {
+        Self {
+            label,
+            sender: TracedSenderInner::Priority(sender),
             active_tracer,
         }
     }
@@ -411,6 +436,16 @@ impl TracedSender {
     /// room; in that case `Ok(n)` is returned where `n` is the number of
     /// evicted packets. On channel disconnect returns `Err(SendError)`.
     pub fn send(&self, batch: BankingPacketBatch) -> Result<usize, SendError<BankingPacketBatch>> {
+        // Callers without a computed priority are trusted internal sources
+        // (for example sad-leader reinjection). Preserve them under overload.
+        self.send_with_priority(batch, u64::MAX)
+    }
+
+    pub fn send_with_priority(
+        &self,
+        batch: BankingPacketBatch,
+        priority: u64,
+    ) -> Result<usize, SendError<BankingPacketBatch>> {
         if let Some(ActiveTracer { trace_sender, exit }) = &self.active_tracer
             && !exit.load(Ordering::Relaxed)
         {
@@ -420,19 +455,41 @@ impl TracedSender {
                 TracedEvent::PacketBatch(self.label, BankingPacketBatch::clone(&batch)),
             ));
         }
-        match self.sender.try_send(batch) {
-            Ok(()) => Ok(0),
-            Err(TrySendError::Full(b)) => Ok(b.len()),
-            Err(TrySendError::Disconnected(b)) => Err(SendError(b)),
+        match &self.sender {
+            TracedSenderInner::Fifo(sender) => match sender.try_send(batch) {
+                Ok(()) => Ok(0),
+                Err(TrySendError::Full(b)) => Ok(b.len()),
+                Err(TrySendError::Disconnected(b)) => Err(SendError(b)),
+            },
+            TracedSenderInner::Priority(sender) => match sender.try_send(priority, batch)? {
+                PrioritySendOutcome::Inserted => Ok(0),
+                PrioritySendOutcome::Replaced(batch) | PrioritySendOutcome::Rejected(batch) => {
+                    Ok(batch.len())
+                }
+            },
         }
     }
 
     pub fn len(&self) -> usize {
-        self.sender.len()
+        match &self.sender {
+            TracedSenderInner::Fifo(sender) => sender.len(),
+            TracedSenderInner::Priority(sender) => sender.len(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn admission_floor(&self) -> u64 {
+        match &self.sender {
+            TracedSenderInner::Fifo(_) => 0,
+            TracedSenderInner::Priority(sender) => sender.admission_floor(),
+        }
+    }
+
+    pub fn is_priority_channel(&self) -> bool {
+        matches!(self.sender, TracedSenderInner::Priority(_))
     }
 }
 
@@ -477,6 +534,7 @@ mod tests {
     use {
         super::*,
         bincode::ErrorKind::Io as BincodeIoError,
+        crossbeam_channel::RecvTimeoutError,
         solana_perf::packet::BytesPacketBatch,
         std::{
             fs::File,
@@ -486,6 +544,19 @@ mod tests {
         tempfile::TempDir,
     };
 
+    fn drain_priority_receiver(
+        exit: Arc<AtomicBool>,
+        receiver: PriorityBankingPacketReceiver,
+    ) -> Result<(), TraceError> {
+        while !exit.load(Ordering::Relaxed) {
+            match receiver.recv_timeout(Duration::from_millis(1)) {
+                Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_new_disabled() {
         let exit = Arc::<AtomicBool>::default();
@@ -493,13 +564,8 @@ mod tests {
         let tracer = BankingTracer::new_disabled();
         let (non_vote_sender, non_vote_receiver) = tracer.create_channel_non_vote();
 
-        let dummy_main_thread = thread::spawn(move || {
-            receiving_loop_with_minimized_sender_overhead::<_, TraceError, 0>(
-                exit,
-                non_vote_receiver,
-                |_packet_batch| Ok(()),
-            )
-        });
+        let dummy_main_thread =
+            thread::spawn(move || drain_priority_receiver(exit, non_vote_receiver));
 
         non_vote_sender
             .send(BankingPacketBatch::new(
@@ -507,6 +573,35 @@ mod tests {
             ))
             .unwrap();
         for_test::terminate_tracer(tracer, None, dummy_main_thread, non_vote_sender, None);
+    }
+
+    #[test]
+    fn test_non_vote_channel_delivers_highest_priority_first() {
+        let tracer = BankingTracer::new_disabled();
+        let (sender, receiver) = tracer.create_channel_non_vote();
+        let low = BankingPacketBatch::new(solana_perf::packet::PacketBatch::Bytes(
+            BytesPacketBatch::new(),
+        ));
+        let high = BankingPacketBatch::new(solana_perf::packet::PacketBatch::Bytes(
+            BytesPacketBatch::new(),
+        ));
+        let middle = BankingPacketBatch::new(solana_perf::packet::PacketBatch::Bytes(
+            BytesPacketBatch::new(),
+        ));
+
+        assert_eq!(sender.send_with_priority(low.clone(), 10), Ok(0));
+        assert_eq!(sender.send_with_priority(high.clone(), 30), Ok(0));
+        assert_eq!(sender.send_with_priority(middle.clone(), 20), Ok(0));
+
+        let (priority, batch) = receiver.try_recv().unwrap();
+        assert_eq!(priority, 30);
+        assert!(Arc::ptr_eq(&batch, &high));
+        let (priority, batch) = receiver.try_recv().unwrap();
+        assert_eq!(priority, 20);
+        assert!(Arc::ptr_eq(&batch, &middle));
+        let (priority, batch) = receiver.try_recv().unwrap();
+        assert_eq!(priority, 10);
+        assert!(Arc::ptr_eq(&batch, &low));
     }
 
     #[test]
@@ -521,11 +616,7 @@ mod tests {
         let exit_for_dummy_thread = Arc::<AtomicBool>::default();
         let exit_for_dummy_thread2 = exit_for_dummy_thread.clone();
         let dummy_main_thread = thread::spawn(move || {
-            receiving_loop_with_minimized_sender_overhead::<_, TraceError, 0>(
-                exit_for_dummy_thread,
-                non_vote_receiver,
-                |_packet_batch| Ok(()),
-            )
+            drain_priority_receiver(exit_for_dummy_thread, non_vote_receiver)
         });
 
         // kill and join the tracer thread
@@ -559,13 +650,8 @@ mod tests {
             BankingTracer::new(Some((&path, exit.clone(), DirByteLimit::MAX))).unwrap();
         let (non_vote_sender, non_vote_receiver) = tracer.create_channel_non_vote();
 
-        let dummy_main_thread = thread::spawn(move || {
-            receiving_loop_with_minimized_sender_overhead::<_, TraceError, 0>(
-                exit,
-                non_vote_receiver,
-                |_packet_batch| Ok(()),
-            )
-        });
+        let dummy_main_thread =
+            thread::spawn(move || drain_priority_receiver(exit, non_vote_receiver));
 
         non_vote_sender
             .send(for_test::sample_packet_batch())

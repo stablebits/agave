@@ -540,7 +540,8 @@ mod tests {
             transaction_scheduler::greedy_scheduler::{GreedyScheduler, GreedySchedulerConfig},
         },
         agave_banking_stage_ingress_types::{
-            BankingPacketBatch, BankingPacketReceiver, to_banking_packet_batch,
+            PriorityBankingPacketReceiver, PriorityBankingPacketSender, priority_channel,
+            to_banking_packet_batch,
         },
         crossbeam_channel::{Receiver, Sender, bounded},
         itertools::Itertools,
@@ -574,14 +575,14 @@ mod tests {
         #[allow(dead_code)]
         bank_forks: Arc<RwLock<BankForks>>,
         mint_keypair: Keypair,
-        banking_packet_sender: Sender<BankingPacketBatch>,
+        banking_packet_sender: PriorityBankingPacketSender,
         shared_leader_state: SharedLeaderState,
         consume_work_receivers: Vec<Receiver<ConsumeWork<Tx>>>,
         finished_consume_work_sender: Sender<FinishedConsumeWork<Tx>>,
     }
 
     fn test_create_transaction_view_receive_and_buffer(
-        receiver: BankingPacketReceiver,
+        receiver: PriorityBankingPacketReceiver,
         bank_forks: Arc<RwLock<BankForks>>,
     ) -> TransactionViewReceiveAndBuffer {
         TransactionViewReceiveAndBuffer {
@@ -594,7 +595,10 @@ mod tests {
     #[allow(clippy::type_complexity)]
     fn create_test_frame<R: ReceiveAndBuffer>(
         num_threads: usize,
-        create_receive_and_buffer: impl FnOnce(BankingPacketReceiver, Arc<RwLock<BankForks>>) -> R,
+        create_receive_and_buffer: impl FnOnce(
+            PriorityBankingPacketReceiver,
+            Arc<RwLock<BankForks>>,
+        ) -> R,
     ) -> (
         TestFrame<R::Transaction>,
         SchedulerController<R, GreedyScheduler<R::Transaction>>,
@@ -611,7 +615,7 @@ mod tests {
 
         let decision_maker = DecisionMaker::new(shared_leader_state.clone());
 
-        let (banking_packet_sender, banking_packet_receiver) = bounded(1024);
+        let (banking_packet_sender, banking_packet_receiver) = priority_channel(1024);
         let receive_and_buffer =
             create_receive_and_buffer(banking_packet_receiver, bank_forks.clone());
 

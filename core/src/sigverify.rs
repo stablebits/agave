@@ -15,7 +15,7 @@ use {
         packet::PacketBatch,
         sigverify::{self},
     },
-    solana_runtime::{bank::Bank, bank_forks::SharableBanks},
+    solana_runtime::bank_forks::SharableBanks,
     solana_transaction::Transaction,
     std::{
         num::NonZeroUsize,
@@ -299,29 +299,35 @@ impl SigVerifyWorkerPool {
 
         let working_bank = sharable_banks.working();
 
-        if let Some(floor) = state.priority_floor.as_ref() {
-            let floor = floor.get();
-            if floor > 0 {
-                let ((dropped, all_below), priority_floor_time_us) = measure_us!(
-                    apply_priority_floor_to_batch(&mut batch, floor, &working_bank)
-                );
+        // The PoC assumes one transaction per PacketBatch. Priority is
+        // calculated once here, used for pre-sigverify admission, and carried
+        // into the priority channel after verification.
+        let packet_priority = if state.banking_stage_sender.is_priority_channel() {
+            let (priority, priority_time_us) = measure_us!(
+                batch
+                    .get(0)
+                    .and_then(|packet| packet.data(..))
+                    .and_then(|data| calculate_priority_from_bytes(&working_bank, data))
+            );
+            state
+                .stats
+                .total_priority_floor_time_us
+                .fetch_add(priority_time_us as usize, Ordering::Relaxed);
+
+            let scheduler_floor = state.priority_floor.as_ref().map_or(0, |floor| floor.get());
+            let channel_floor = state.banking_stage_sender.admission_floor();
+            let effective_floor = scheduler_floor.max(channel_floor);
+            if priority.is_some_and(|priority| effective_floor > 0 && priority <= effective_floor) {
                 state
                     .stats
-                    .total_priority_floor_time_us
-                    .fetch_add(priority_floor_time_us as usize, Ordering::Relaxed);
-                if dropped > 0 {
-                    state
-                        .stats
-                        .total_dropped_below_priority_floor
-                        .fetch_add(dropped, Ordering::Relaxed);
-                }
-                if all_below {
-                    // Entire batch went below-floor: nothing left to verify or
-                    // forward.
-                    return true;
-                }
+                    .total_dropped_below_priority_floor
+                    .fetch_add(1, Ordering::Relaxed);
+                return true;
             }
-        }
+            priority.unwrap_or(0)
+        } else {
+            0
+        };
 
         let enable_tx_v1 = working_bank.feature_set.snapshot().enable_tx_v1;
         let (_, verify_time_us) = measure_us!(sigverify::ed25519_verify_serial(
@@ -352,7 +358,7 @@ impl SigVerifyWorkerPool {
             .fetch_max(state.banking_stage_sender.len(), Ordering::Relaxed);
         match state
             .banking_stage_sender
-            .send(banking_packet_batch.clone())
+            .send_with_priority(banking_packet_batch.clone(), packet_priority)
         {
             Ok(0) => {} // avoid poking atomics if nothing was evicted (typical case)
             Ok(evicted) => {
@@ -402,39 +408,4 @@ impl SigVerifyWorkerPool {
             warn!("forwarding stage channel is full, dropping packets.");
         }
     }
-}
-
-/// Apply the scheduler-published priority floor to a single batch in place.
-///
-/// Below-floor packets are marked `discard`. Returns `(dropped, all_below)`,
-/// where `dropped` is the number of packets newly marked and `all_below` is
-/// true iff no useful packets remain in the batch (so the caller can skip
-/// downstream work for this batch entirely).
-fn apply_priority_floor_to_batch(
-    batch: &mut PacketBatch,
-    floor: u64,
-    bank: &Bank,
-) -> (usize, bool) {
-    let mut dropped: usize = 0;
-    let mut any_kept = false;
-    for mut packet in batch.iter_mut() {
-        if packet.meta().discard() {
-            continue;
-        }
-        let Some(data) = packet.data(..) else {
-            // Zero-length or otherwise unreadable: leave to downstream
-            // stages to reject.
-            any_kept = true;
-            continue;
-        };
-        // Unparseable packets are kept and left for downstream rejection.
-        match calculate_priority_from_bytes(bank, data) {
-            Some(priority) if priority <= floor => {
-                packet.meta_mut().set_discard(true);
-                dropped = dropped.saturating_add(1);
-            }
-            _ => any_kept = true,
-        }
-    }
-    (dropped, !any_kept)
 }

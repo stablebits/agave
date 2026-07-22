@@ -20,8 +20,17 @@ dev-context-only-utils = ["dep:wincode"]
 
 [dependencies]
 crossbeam-channel = { workspace = true }
+min-max-heap = { workspace = true }
 solana-perf = { workspace = true }
 wincode = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "priority_channel"
+harness = false
+required-features = ["agave-unstable-api"]
 
 [lints]
 workspace = true

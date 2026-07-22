@@ -2,12 +2,15 @@
 //!
 
 use {
-    agave_banking_stage_ingress_types::{BankingPacketBatch, BankingPacketReceiver},
+    agave_banking_stage_ingress_types::{
+        BankingPacketBatch, BankingPacketReceiver, PriorityBankingPacketReceiver,
+    },
     agave_scheduler_bindings::{SharableTransactionRegion, TpuToPackMessage, tpu_message_flags},
     agave_scheduling_utils::handshake::AgaveTpuToPackSession,
     rts_alloc::Allocator,
     solana_packet::PacketFlags,
     std::{
+        collections::VecDeque,
         net::IpAddr,
         ptr::NonNull,
         sync::{
@@ -21,7 +24,7 @@ use {
 };
 
 pub struct BankingPacketReceivers {
-    pub non_vote_receiver: BankingPacketReceiver,
+    pub non_vote_receiver: PriorityBankingPacketReceiver,
     pub gossip_vote_receiver: Option<BankingPacketReceiver>,
     pub tpu_vote_receiver: Option<BankingPacketReceiver>,
 }
@@ -51,6 +54,8 @@ fn tpu_to_pack(
     allocator: Allocator,
     mut producer: shaq::spsc::Producer<TpuToPackMessage>,
 ) {
+    const PRIORITY_RECEIVE_BATCH_SIZE: usize = 64;
+
     // select! requires actual receivers, so in the case of None for vote receivers,
     // we create a dummy channel that can never receive.
     let non_vote_receiver = receivers.non_vote_receiver;
@@ -60,20 +65,36 @@ fn tpu_to_pack(
     let tpu_vote_receiver = receivers
         .tpu_vote_receiver
         .unwrap_or_else(crossbeam_channel::never);
+    let mut pending_non_votes = VecDeque::new();
 
     while !exit.load(Ordering::Relaxed) {
-        let packet_batch = match crossbeam_channel::select! {
-            recv(non_vote_receiver) -> msg => msg,
-            recv(gossip_vote_receiver) -> msg => msg,
-            recv(tpu_vote_receiver) -> msg => msg,
-            default(Duration::from_secs(1)) => continue,
-        } {
-            Ok(packet_batch) => packet_batch,
-            Err(crossbeam_channel::RecvError) => {
-                // Senders have been dropped, signal shutdown and exit.
-                shutdown_signal.cancel();
+        let packet_batch = if let Some(packet_batch) = pending_non_votes.pop_front() {
+            packet_batch
+        } else {
+            match crossbeam_channel::select! {
+                recv(non_vote_receiver.ready_receiver()) -> msg => {
+                    msg.and_then(|()| {
+                        non_vote_receiver
+                            .pop_ready_batch(PRIORITY_RECEIVE_BATCH_SIZE)
+                            .map(|batch| {
+                                pending_non_votes.extend(
+                                    batch.into_iter().map(|(_priority, packet_batch)| packet_batch)
+                                );
+                                pending_non_votes.pop_front().unwrap()
+                            })
+                    })
+                },
+                recv(gossip_vote_receiver) -> msg => msg,
+                recv(tpu_vote_receiver) -> msg => msg,
+                default(Duration::from_secs(1)) => continue,
+            } {
+                Ok(packet_batch) => packet_batch,
+                Err(crossbeam_channel::RecvError) => {
+                    // Senders have been dropped, signal shutdown and exit.
+                    shutdown_signal.cancel();
 
-                break;
+                    break;
+                }
             }
         };
         handle_packet_batch(&allocator, &mut producer, packet_batch);
