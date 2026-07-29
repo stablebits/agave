@@ -53,6 +53,22 @@ pub struct GossipSigVerifyHandle {
     verified_vote_receiver: Receiver<GossipVerifiedVoteBatch>,
 }
 
+#[derive(Clone, Default)]
+pub struct TpuPriorityChannelStats {
+    pub(crate) total_priority_calculation_time_us: Arc<AtomicUsize>,
+    pub(crate) inserted: Arc<AtomicUsize>,
+    pub(crate) replaced: Arc<AtomicUsize>,
+    pub(crate) rejected: Arc<AtomicUsize>,
+}
+
+impl TpuPriorityChannelStats {
+    fn has_activity(&self) -> bool {
+        self.inserted.load(Ordering::Relaxed) != 0
+            || self.replaced.load(Ordering::Relaxed) != 0
+            || self.rejected.load(Ordering::Relaxed) != 0
+    }
+}
+
 #[derive(Default)]
 struct SigVerifierStats {
     num_deduper_saturations: usize,
@@ -67,7 +83,7 @@ struct SigVerifierStats {
     /// Count of sends in which the EvictingSender had to drop a batch.
     eviction_drops: Arc<AtomicUsize>,
     total_dropped_below_priority_floor: Arc<AtomicUsize>,
-    total_priority_calculation_time_us: Arc<AtomicUsize>,
+    tpu_priority_channel: TpuPriorityChannelStats,
     total_priority_floor_time_us: Arc<AtomicUsize>,
 }
 
@@ -81,8 +97,11 @@ impl SigVerifierStats {
     const REPORT_INTERVAL: Duration = Duration::from_secs(2);
 
     fn maybe_report_and_reset(&mut self, name: &'static str) {
-        // No need to report a datapoint if no batches/packets received
-        if self.total_batches.load(Ordering::Relaxed) == 0 {
+        // No need to report a datapoint if no batches/packets were received
+        // and there was no TPU priority-channel activity.
+        if self.total_batches.load(Ordering::Relaxed) == 0
+            && !self.tpu_priority_channel.has_activity()
+        {
             return;
         }
 
@@ -121,7 +140,29 @@ impl SigVerifierStats {
             ),
             (
                 "total_priority_calculation_time_us",
-                self.total_priority_calculation_time_us
+                self.tpu_priority_channel
+                    .total_priority_calculation_time_us
+                    .swap(0, Ordering::Relaxed),
+                i64
+            ),
+            (
+                "tpu_priority_channel_inserted",
+                self.tpu_priority_channel
+                    .inserted
+                    .swap(0, Ordering::Relaxed),
+                i64
+            ),
+            (
+                "tpu_priority_channel_replaced",
+                self.tpu_priority_channel
+                    .replaced
+                    .swap(0, Ordering::Relaxed),
+                i64
+            ),
+            (
+                "tpu_priority_channel_rejected",
+                self.tpu_priority_channel
+                    .rejected
                     .swap(0, Ordering::Relaxed),
                 i64
             ),
@@ -165,11 +206,11 @@ impl SigVerifyStage {
         forward_non_votes: bool,
         sharable_banks: SharableBanks,
         scheduler_priority_floor: Option<Arc<SchedulerPriorityFloor>>,
-        total_priority_calculation_time_us: Arc<AtomicUsize>,
+        tpu_priority_channel: TpuPriorityChannelStats,
     ) -> (Self, GossipSigVerifyHandle) {
         let (gossip_verified_vote_sender, verified_vote_receiver) = unbounded();
         let non_vote_stats = SigVerifierStats {
-            total_priority_calculation_time_us,
+            tpu_priority_channel,
             ..SigVerifierStats::default()
         };
         let tpu_vote_stats = SigVerifierStats::default();
@@ -437,7 +478,7 @@ mod tests {
             false,
             sharable_banks,
             None,
-            Arc::default(),
+            TpuPriorityChannelStats::default(),
         );
 
         const INGRESS_PRIORITY: u64 = 42;
@@ -477,7 +518,7 @@ mod tests {
             false,
             sharable_banks,
             None,
-            Arc::default(),
+            TpuPriorityChannelStats::default(),
         );
 
         let now = Instant::now();
@@ -550,7 +591,7 @@ mod tests {
             false,
             sharable_banks,
             None,
-            Arc::default(),
+            TpuPriorityChannelStats::default(),
         );
 
         let tx_v1_bytes = wincode::serialize(&test_tx_v1()).unwrap();

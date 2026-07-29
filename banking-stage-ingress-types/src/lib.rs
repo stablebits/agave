@@ -229,8 +229,25 @@ impl<T> PriorityReceiver<T> {
     }
 
     pub fn pop_ready(&self) -> Result<(u64, T), RecvError> {
-        let mut batch = self.pop_ready_batch(1)?;
-        Ok(batch.pop().unwrap())
+        let mut queue = self.shared.queue.lock().unwrap();
+        assert!(
+            queue.notification_armed,
+            "readiness token must correspond to an armed notification"
+        );
+        queue.notification_armed = false;
+
+        let Some(entry) = queue.heap.pop_max() else {
+            debug_assert_eq!(queue.sender_count, 0);
+            arm_notification(&mut queue, &self.ready_sender);
+            return Err(RecvError);
+        };
+
+        self.shared.len.fetch_sub(1, Ordering::Relaxed);
+        publish_admission_floor(&self.shared, &queue);
+        if !queue.heap.is_empty() || queue.sender_count == 0 {
+            arm_notification(&mut queue, &self.ready_sender);
+        }
+        Ok((entry.priority, entry.value))
     }
 
     /// Pops up to `max_items` after receiving one readiness notification.

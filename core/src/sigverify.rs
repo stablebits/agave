@@ -128,6 +128,7 @@ impl GossipSigVerifier {
 
 /// Gossip votes use a bounded queue into the worker pool.
 const SIGVERIFY_GOSSIP_VOTE_WORK_CHANNEL_SIZE: usize = 50_000;
+const NON_VOTE_RECEIVE_BATCH_SIZE: usize = 64;
 
 pub(crate) struct SigVerifyWorkerSenders {
     pub(crate) gossip_verified_vote_sender: Sender<GossipVerifiedVoteBatch>,
@@ -223,17 +224,22 @@ impl SigVerifyWorkerPool {
         crossbeam_channel::select! {
             recv(channels.non_vote_receiver.ready_receiver()) -> ready => {
                 match ready {
-                    Ok(()) => match channels.non_vote_receiver.pop_ready() {
-                        Ok((priority, batch)) => Self::run_transaction_task(
-                            batch,
-                            priority,
-                            false,
-                            &channels.forward_stage_sender,
-                            forward_non_votes,
-                            false,
-                            &channels.sharable_banks,
-                            &channels.non_vote_state,
-                        ),
+                    Ok(()) => match channels
+                        .non_vote_receiver
+                        .pop_ready_batch(NON_VOTE_RECEIVE_BATCH_SIZE)
+                    {
+                        Ok(batches) => batches.into_iter().all(|(priority, batch)| {
+                            Self::run_transaction_task(
+                                batch,
+                                priority,
+                                false,
+                                &channels.forward_stage_sender,
+                                forward_non_votes,
+                                false,
+                                &channels.sharable_banks,
+                                &channels.non_vote_state,
+                            )
+                        }),
                         Err(_) => false,
                     },
                     Err(_) => false,

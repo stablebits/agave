@@ -18,7 +18,7 @@ fn items_per_producer(producers: usize) -> usize {
     TOTAL_ITEMS / producers
 }
 
-fn priority_mpsc(producers: usize) -> Duration {
+fn priority_mpsc(producers: usize, receive_batch_size: usize) -> Duration {
     let items_per_producer = items_per_producer(producers);
     let (sender, receiver) = priority_channel(TOTAL_ITEMS);
     // Rendezvous once to ensure every worker is ready, then again to release
@@ -28,11 +28,17 @@ fn priority_mpsc(producers: usize) -> Duration {
     let consumer = thread::spawn(move || {
         consumer_barrier.wait();
         consumer_barrier.wait();
-        let mut received = 0;
-        while received < TOTAL_ITEMS {
-            let batch = receiver.recv_batch(RECEIVE_BATCH_SIZE).unwrap();
-            received += batch.len();
-            black_box(batch);
+        if receive_batch_size == 1 {
+            for _ in 0..TOTAL_ITEMS {
+                black_box(receiver.recv().unwrap());
+            }
+        } else {
+            let mut received = 0;
+            while received < TOTAL_ITEMS {
+                let batch = receiver.recv_batch(receive_batch_size).unwrap();
+                received += batch.len();
+                black_box(batch);
+            }
         }
     });
     let producer_threads: Vec<_> = (0..producers)
@@ -142,7 +148,20 @@ fn bench_priority_channel(c: &mut Criterion) {
             BenchmarkId::new("priority_mpsc", producers),
             &producers,
             |b, &producers| {
-                b.iter_custom(|iterations| (0..iterations).map(|_| priority_mpsc(producers)).sum())
+                b.iter_custom(|iterations| {
+                    (0..iterations)
+                        .map(|_| priority_mpsc(producers, RECEIVE_BATCH_SIZE))
+                        .sum()
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("priority_mpsc_single", producers),
+            &producers,
+            |b, &producers| {
+                b.iter_custom(|iterations| {
+                    (0..iterations).map(|_| priority_mpsc(producers, 1)).sum()
+                })
             },
         );
         group.bench_with_input(

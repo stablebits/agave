@@ -18,7 +18,7 @@ use {
             ForwardAddressGetter, ForwardingClientConfig, SpawnForwardingStageResult,
             spawn_forwarding_stage,
         },
-        sigverify_stage::SigVerifyStage,
+        sigverify_stage::{SigVerifyStage, TpuPriorityChannelStats},
         staked_nodes_updater_service::StakedNodesUpdaterService,
         tpu_entry_notifier::TpuEntryNotifier,
         transaction_priority::calculate_priority_from_bytes,
@@ -72,7 +72,7 @@ use {
         path::PathBuf,
         sync::{
             Arc, RwLock,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            atomic::{AtomicBool, Ordering},
         },
         thread::{self, JoinHandle},
     },
@@ -110,7 +110,7 @@ const TPU_FORWARD_CHANNEL_SIZE: usize = 50_000;
 struct TpuPriorityPacketSender {
     sender: PrioritySender<PacketBatch>,
     sharable_banks: SharableBanks,
-    total_priority_calculation_time_us: Arc<AtomicUsize>,
+    stats: TpuPriorityChannelStats,
 }
 
 impl ChannelSend<PacketBatch> for TpuPriorityPacketSender {
@@ -125,13 +125,21 @@ impl ChannelSend<PacketBatch> for TpuPriorityPacketSender {
                 .and_then(|packet| packet.data(..))
                 .and_then(|data| calculate_priority_from_bytes(&working_bank, data))
         );
-        self.total_priority_calculation_time_us
+        self.stats
+            .total_priority_calculation_time_us
             .fetch_add(priority_time_us as usize, Ordering::Relaxed);
 
         match self.sender.try_send(priority.unwrap_or(0), packet_batch) {
-            Ok(PrioritySendOutcome::Inserted) => Ok(()),
-            Ok(PrioritySendOutcome::Replaced(packet_batch))
-            | Ok(PrioritySendOutcome::Rejected(packet_batch)) => {
+            Ok(PrioritySendOutcome::Inserted) => {
+                self.stats.inserted.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Ok(PrioritySendOutcome::Replaced(packet_batch)) => {
+                self.stats.replaced.fetch_add(1, Ordering::Relaxed);
+                Err(TrySendError::Full(packet_batch))
+            }
+            Ok(PrioritySendOutcome::Rejected(packet_batch)) => {
+                self.stats.rejected.fetch_add(1, Ordering::Relaxed);
                 Err(TrySendError::Full(packet_batch))
             }
             Err(SendError(packet_batch)) => Err(TrySendError::Disconnected(packet_batch)),
@@ -223,12 +231,12 @@ impl Tpu {
         } = sockets;
 
         let sharable_banks = bank_forks.read().unwrap().sharable_banks();
-        let total_priority_calculation_time_us = Arc::new(AtomicUsize::default());
+        let tpu_priority_channel_stats = TpuPriorityChannelStats::default();
         let (packet_sender, packet_receiver) = priority_channel(TPU_CHANNEL_SIZE);
         let packet_sender = TpuPriorityPacketSender {
             sender: packet_sender,
             sharable_banks: sharable_banks.clone(),
-            total_priority_calculation_time_us: total_priority_calculation_time_us.clone(),
+            stats: tpu_priority_channel_stats.clone(),
         };
         let (vote_packet_sender, vote_packet_receiver) = bounded(TPU_VOTE_CHANNEL_SIZE);
         let evicting_vote_sender =
@@ -345,7 +353,7 @@ impl Tpu {
             enable_block_production_forwarding,
             sharable_banks,
             Some(scheduler_priority_floor.clone()),
-            total_priority_calculation_time_us,
+            tpu_priority_channel_stats,
         );
 
         let cluster_info_vote_listener = ClusterInfoVoteListener::new(
@@ -550,21 +558,30 @@ mod tests {
 
         let low = packet_batch(&mint_keypair, recent_blockhash, 1);
         let high = packet_batch(&mint_keypair, recent_blockhash, 1_000_000);
+        let lower = packet_batch(&mint_keypair, recent_blockhash, 0);
         let low_priority = packet_priority(&sharable_banks, &low);
         let high_priority = packet_priority(&sharable_banks, &high);
         assert!(high_priority > low_priority);
 
         let (sender, receiver) = priority_channel(1);
+        let stats = TpuPriorityChannelStats::default();
         let sender = TpuPriorityPacketSender {
             sender,
             sharable_banks,
-            total_priority_calculation_time_us: Arc::default(),
+            stats: stats.clone(),
         };
 
         sender.try_send(low).unwrap();
         assert_matches!(sender.try_send(high), Err(TrySendError::Full(_evicted_low)));
+        assert_matches!(
+            sender.try_send(lower),
+            Err(TrySendError::Full(_rejected_lower))
+        );
 
         let (priority, _high) = receiver.recv().unwrap();
         assert_eq!(priority, high_priority);
+        assert_eq!(stats.inserted.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.replaced.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.rejected.load(Ordering::Relaxed), 1);
     }
 }
