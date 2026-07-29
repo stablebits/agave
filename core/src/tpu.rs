@@ -21,17 +21,22 @@ use {
         sigverify_stage::SigVerifyStage,
         staked_nodes_updater_service::StakedNodesUpdaterService,
         tpu_entry_notifier::TpuEntryNotifier,
+        transaction_priority::calculate_priority_from_bytes,
         validator::{BlockProductionMethod, GeneratorConfig},
     },
-    agave_banking_stage_ingress_types::SchedulerPriorityFloor,
+    agave_banking_stage_ingress_types::{
+        PrioritySendOutcome, PrioritySender, SchedulerPriorityFloor, priority_channel,
+    },
     agave_votor::event::VotorEventSender,
     agave_votor_messages::VerifiedVoterSlotsSender,
     agave_xdp::transmitter::XdpSender,
-    crossbeam_channel::{Receiver, bounded, unbounded},
+    crossbeam_channel::{Receiver, SendError, TrySendError, bounded, unbounded},
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
     solana_keypair::Keypair,
     solana_ledger::{blockstore::Blockstore, entry_notifier_service::EntryNotifierSender},
+    solana_measure::measure_us,
+    solana_perf::packet::PacketBatch,
     solana_poh::{
         poh_recorder::{PohRecorder, WorkingBankEntryOrMarker},
         transaction_recorder::TransactionRecorder,
@@ -42,7 +47,7 @@ use {
         rpc_subscriptions::RpcSubscriptions,
     },
     solana_runtime::{
-        bank_forks::BankForks,
+        bank_forks::{BankForks, SharableBanks},
         prioritization_fee_cache::PrioritizationFeeCache,
         transaction_execution::TransactionStatusSender,
         vote_sender_types::{ReplayVoteReceiver, ReplayVoteSender},
@@ -54,7 +59,7 @@ use {
             spawn_simple_qos_server, spawn_stake_weighted_qos_server,
         },
         quic_socket::QuicSocket,
-        streamer::StakedNodes,
+        streamer::{ChannelSend, StakedNodes},
     },
     solana_turbine::{
         XdpSender as TurbineXdpSender,
@@ -65,7 +70,10 @@ use {
         net::{Ipv4Addr, UdpSocket},
         num::NonZeroUsize,
         path::PathBuf,
-        sync::{Arc, RwLock, atomic::AtomicBool},
+        sync::{
+            Arc, RwLock,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
         thread::{self, JoinHandle},
     },
     tokio::sync::mpsc,
@@ -97,6 +105,47 @@ pub(crate) const TPU_VOTE_CHANNEL_SIZE: usize = 4_000;
 /// Mirrors `TPU_CHANNEL_SIZE`; the streamer uses `try_send`, so an over-full
 /// channel drops packets (tracked via streamer metrics) rather than blocking.
 const TPU_FORWARD_CHANNEL_SIZE: usize = 50_000;
+
+#[derive(Clone)]
+struct TpuPriorityPacketSender {
+    sender: PrioritySender<PacketBatch>,
+    sharable_banks: SharableBanks,
+    total_priority_calculation_time_us: Arc<AtomicUsize>,
+}
+
+impl ChannelSend<PacketBatch> for TpuPriorityPacketSender {
+    fn try_send(&self, packet_batch: PacketBatch) -> Result<(), TrySendError<PacketBatch>> {
+        // QUIC transaction streams contain one transaction each. Calculate
+        // priority before admission to sigverify and carry it through the
+        // pipeline so it is not recalculated downstream.
+        let working_bank = self.sharable_banks.working();
+        let (priority, priority_time_us) = measure_us!(
+            packet_batch
+                .get(0)
+                .and_then(|packet| packet.data(..))
+                .and_then(|data| calculate_priority_from_bytes(&working_bank, data))
+        );
+        self.total_priority_calculation_time_us
+            .fetch_add(priority_time_us as usize, Ordering::Relaxed);
+
+        match self.sender.try_send(priority.unwrap_or(0), packet_batch) {
+            Ok(PrioritySendOutcome::Inserted) => Ok(()),
+            Ok(PrioritySendOutcome::Replaced(packet_batch))
+            | Ok(PrioritySendOutcome::Rejected(packet_batch)) => {
+                Err(TrySendError::Full(packet_batch))
+            }
+            Err(SendError(packet_batch)) => Err(TrySendError::Disconnected(packet_batch)),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.sender.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.sender.len()
+    }
+}
 
 pub struct Tpu {
     fetch_stage: FetchStage,
@@ -173,7 +222,14 @@ impl Tpu {
             vote_forwarding_client: vote_forwarding_client_socket,
         } = sockets;
 
-        let (packet_sender, packet_receiver) = bounded(TPU_CHANNEL_SIZE);
+        let sharable_banks = bank_forks.read().unwrap().sharable_banks();
+        let total_priority_calculation_time_us = Arc::new(AtomicUsize::default());
+        let (packet_sender, packet_receiver) = priority_channel(TPU_CHANNEL_SIZE);
+        let packet_sender = TpuPriorityPacketSender {
+            sender: packet_sender,
+            sharable_banks: sharable_banks.clone(),
+            total_priority_calculation_time_us: total_priority_calculation_time_us.clone(),
+        };
         let (vote_packet_sender, vote_packet_receiver) = bounded(TPU_VOTE_CHANNEL_SIZE);
         let evicting_vote_sender =
             EvictingSender::new(vote_packet_sender.clone(), vote_packet_receiver.clone());
@@ -287,8 +343,9 @@ impl Tpu {
             forward_stage_sender.clone(),
             tpu_sigverify_threads,
             enable_block_production_forwarding,
-            bank_forks.read().unwrap().sharable_banks(),
+            sharable_banks,
             Some(scheduler_priority_floor.clone()),
+            total_priority_calculation_time_us,
         );
 
         let cluster_info_vote_listener = ClusterInfoVoteListener::new(
@@ -438,4 +495,76 @@ fn into_quic_sockets(
             }
             None => QuicSocket::from(socket),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        solana_compute_budget_interface::ComputeBudgetInstruction,
+        solana_fee_calculator::FeeRateGovernor,
+        solana_hash::Hash,
+        solana_ledger::genesis_utils::{GenesisConfigInfo, create_genesis_config},
+        solana_message::Message,
+        solana_perf::packet::BytesPacket,
+        solana_runtime::bank::Bank,
+        solana_signer::Signer,
+        solana_system_interface::instruction as system_instruction,
+        solana_transaction::{Transaction, versioned::VersionedTransaction},
+    };
+
+    fn packet_batch(
+        payer: &Keypair,
+        recent_blockhash: Hash,
+        compute_unit_price: u64,
+    ) -> PacketBatch {
+        let transfer = system_instruction::transfer(&payer.pubkey(), &Pubkey::new_unique(), 1);
+        let set_compute_unit_price =
+            ComputeBudgetInstruction::set_compute_unit_price(compute_unit_price);
+        let message = Message::new(&[transfer, set_compute_unit_price], Some(&payer.pubkey()));
+        let transaction = Transaction::new(&[payer], message, recent_blockhash);
+        let bytes = bincode::serialize(&VersionedTransaction::from(transaction)).unwrap();
+        PacketBatch::Single(BytesPacket::from_bytes(None, bytes))
+    }
+
+    fn packet_priority(sharable_banks: &SharableBanks, packet_batch: &PacketBatch) -> u64 {
+        let bank = sharable_banks.working();
+        packet_batch
+            .get(0)
+            .and_then(|packet| packet.data(..))
+            .and_then(|data| calculate_priority_from_bytes(&bank, data))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_tpu_priority_packet_sender_replaces_lower_priority() {
+        let GenesisConfigInfo {
+            mut genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config(u64::MAX);
+        genesis_config.fee_rate_governor = FeeRateGovernor::new(5_000, 0);
+        let (_bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+        let sharable_banks = bank_forks.read().unwrap().sharable_banks();
+        let recent_blockhash = sharable_banks.working().last_blockhash();
+
+        let low = packet_batch(&mint_keypair, recent_blockhash, 1);
+        let high = packet_batch(&mint_keypair, recent_blockhash, 1_000_000);
+        let low_priority = packet_priority(&sharable_banks, &low);
+        let high_priority = packet_priority(&sharable_banks, &high);
+        assert!(high_priority > low_priority);
+
+        let (sender, receiver) = priority_channel(1);
+        let sender = TpuPriorityPacketSender {
+            sender,
+            sharable_banks,
+            total_priority_calculation_time_us: Arc::default(),
+        };
+
+        sender.try_send(low).unwrap();
+        assert_matches!(sender.try_send(high), Err(TrySendError::Full(_evicted_low)));
+
+        let (priority, _high) = receiver.recv().unwrap();
+        assert_eq!(priority, high_priority);
+    }
 }

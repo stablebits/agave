@@ -11,7 +11,9 @@ use {
             SigVerifyWorkerSenders, SigVerifyWorkerState, SigVerifyWorkerStats,
         },
     },
-    agave_banking_stage_ingress_types::{BankingPacketBatch, SchedulerPriorityFloor},
+    agave_banking_stage_ingress_types::{
+        BankingPacketBatch, PriorityReceiver, SchedulerPriorityFloor,
+    },
     core::time::Duration,
     crossbeam_channel::{Receiver, Sender, unbounded},
     solana_perf::{deduper::Deduper, packet::PacketBatch},
@@ -65,6 +67,7 @@ struct SigVerifierStats {
     /// Count of sends in which the EvictingSender had to drop a batch.
     eviction_drops: Arc<AtomicUsize>,
     total_dropped_below_priority_floor: Arc<AtomicUsize>,
+    total_priority_calculation_time_us: Arc<AtomicUsize>,
     total_priority_floor_time_us: Arc<AtomicUsize>,
 }
 
@@ -117,6 +120,12 @@ impl SigVerifierStats {
                 i64
             ),
             (
+                "total_priority_calculation_time_us",
+                self.total_priority_calculation_time_us
+                    .swap(0, Ordering::Relaxed),
+                i64
+            ),
+            (
                 "total_priority_floor_time_us",
                 self.total_priority_floor_time_us.swap(0, Ordering::Relaxed),
                 i64
@@ -147,7 +156,7 @@ impl SigVerifierStats {
 
 impl SigVerifyStage {
     pub fn new(
-        packet_receiver: Receiver<PacketBatch>,
+        packet_receiver: PriorityReceiver<PacketBatch>,
         vote_packet_receiver: Receiver<PacketBatch>,
         non_vote_sender: BankingPacketSender,
         tpu_vote_sender: BankingPacketSender,
@@ -156,9 +165,13 @@ impl SigVerifyStage {
         forward_non_votes: bool,
         sharable_banks: SharableBanks,
         scheduler_priority_floor: Option<Arc<SchedulerPriorityFloor>>,
+        total_priority_calculation_time_us: Arc<AtomicUsize>,
     ) -> (Self, GossipSigVerifyHandle) {
         let (gossip_verified_vote_sender, verified_vote_receiver) = unbounded();
-        let non_vote_stats = SigVerifierStats::default();
+        let non_vote_stats = SigVerifierStats {
+            total_priority_calculation_time_us,
+            ..SigVerifierStats::default()
+        };
         let tpu_vote_stats = SigVerifierStats::default();
         let exit = Arc::new(AtomicBool::new(false));
         let mut rng = rand::rng();
@@ -353,6 +366,7 @@ mod tests {
     use {
         super::*,
         crate::banking_trace::BankingTracer,
+        agave_banking_stage_ingress_types::{PrioritySendOutcome, priority_channel},
         crossbeam_channel::bounded,
         solana_hash::Hash,
         solana_keypair::Keypair,
@@ -403,13 +417,52 @@ mod tests {
         test_sigverify_stage(false)
     }
 
+    #[test]
+    fn test_sigverify_stage_preserves_ingress_priority() {
+        let (_bank, bank_forks) =
+            Bank::new_with_bank_forks_for_tests(&create_genesis_config(1).genesis_config);
+        let sharable_banks = bank_forks.read().unwrap().sharable_banks();
+        let (packet_s, packet_r) = priority_channel(1);
+        let (vote_packet_s, vote_packet_r) = bounded(1);
+        let (verified_s, verified_r) = BankingTracer::new_disabled().create_channel_non_vote();
+        let (tpu_vote_s, _tpu_vote_r) = BankingTracer::channel_for_test();
+        let (forward_stage_s, _forward_stage_r) = bounded(1);
+        let (stage, gossip_sigverify_handle) = SigVerifyStage::new(
+            packet_r,
+            vote_packet_r,
+            verified_s,
+            tpu_vote_s,
+            forward_stage_s,
+            NonZeroUsize::new(1).unwrap(),
+            false,
+            sharable_banks,
+            None,
+            Arc::default(),
+        );
+
+        const INGRESS_PRIORITY: u64 = 42;
+        let packet_batch = to_packet_batches(&[test_tx()], 1).pop().unwrap();
+        assert!(matches!(
+            packet_s.try_send(INGRESS_PRIORITY, packet_batch),
+            Ok(PrioritySendOutcome::Inserted)
+        ));
+        let (priority, verified_batch) = verified_r.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(priority, INGRESS_PRIORITY);
+        assert!(!verified_batch.get(0).unwrap().meta().discard());
+
+        drop(packet_s);
+        drop(vote_packet_s);
+        drop(gossip_sigverify_handle);
+        stage.join().unwrap();
+    }
+
     fn test_sigverify_stage(use_same_tx: bool) {
         agave_logger::setup();
         trace!("start");
         let (_bank, bank_forks) =
             Bank::new_with_bank_forks_for_tests(&create_genesis_config(1).genesis_config);
         let sharable_banks = bank_forks.read().unwrap().sharable_banks();
-        let (packet_s, packet_r) = bounded(1024);
+        let (packet_s, packet_r) = priority_channel(1024);
         let (vote_packet_s, vote_packet_r) = bounded(1024);
         let (verified_s, verified_r) = BankingTracer::channel_for_test();
         let (tpu_vote_s, _tpu_vote_r) = BankingTracer::channel_for_test();
@@ -424,6 +477,7 @@ mod tests {
             false,
             sharable_banks,
             None,
+            Arc::default(),
         );
 
         let now = Instant::now();
@@ -481,7 +535,7 @@ mod tests {
         }
         let (_bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
         let sharable_banks = bank_forks.read().unwrap().sharable_banks();
-        let (packet_s, packet_r) = bounded(1024);
+        let (packet_s, packet_r) = priority_channel(1024);
         let (vote_packet_s, vote_packet_r) = bounded(1024);
         let (verified_s, verified_r) = BankingTracer::channel_for_test();
         let (tpu_vote_s, _tpu_vote_r) = BankingTracer::channel_for_test();
@@ -496,6 +550,7 @@ mod tests {
             false,
             sharable_banks,
             None,
+            Arc::default(),
         );
 
         let tx_v1_bytes = wincode::serialize(&test_tx_v1()).unwrap();

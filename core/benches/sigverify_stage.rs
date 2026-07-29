@@ -1,6 +1,7 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use {
+    agave_banking_stage_ingress_types::priority_channel,
     bencher::{Bencher, TDynBenchFn, TestDesc, TestDescAndFn, TestFn, benchmark_main},
     crossbeam_channel::bounded,
     log::*,
@@ -74,7 +75,7 @@ fn bench_sigverify_stage(bencher: &mut Bencher, use_same_tx: bool) {
     let (_bank, bank_forks) =
         Bank::new_with_bank_forks_for_tests(&create_genesis_config(1).genesis_config);
     let sharable_banks = bank_forks.read().unwrap().sharable_banks();
-    let (packet_s, packet_r) = bounded(1024);
+    let (packet_s, packet_r) = priority_channel(1024);
     let (vote_packet_s, vote_packet_r) = bounded(1024);
     let (verified_s, verified_r) = BankingTracer::channel_for_test();
     let (tpu_vote_s, _tpu_vote_r) = BankingTracer::channel_for_test();
@@ -89,6 +90,7 @@ fn bench_sigverify_stage(bencher: &mut Bencher, use_same_tx: bool) {
         false,
         sharable_banks,
         None,
+        Arc::default(),
     );
     let packet_s = packet_s;
     let packet_s_for_bench = packet_s.clone();

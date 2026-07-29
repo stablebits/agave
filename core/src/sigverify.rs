@@ -3,11 +3,10 @@
 //! cores.
 
 use {
-    crate::{
-        banking_trace::BankingPacketSender, sigverify_stage::SigVerifyServiceError,
-        transaction_priority::calculate_priority_from_bytes,
+    crate::{banking_trace::BankingPacketSender, sigverify_stage::SigVerifyServiceError},
+    agave_banking_stage_ingress_types::{
+        BankingPacketBatch, PriorityReceiver, SchedulerPriorityFloor,
     },
-    agave_banking_stage_ingress_types::{BankingPacketBatch, SchedulerPriorityFloor},
     crossbeam_channel::{Receiver, Sender, TrySendError, bounded},
     solana_measure::measure_us,
     solana_perf::{
@@ -137,7 +136,7 @@ pub(crate) struct SigVerifyWorkerSenders {
 
 #[derive(Clone)]
 struct WorkerPoolChannels {
-    non_vote_receiver: Receiver<PacketBatch>,
+    non_vote_receiver: PriorityReceiver<PacketBatch>,
     tpu_vote_receiver: Receiver<PacketBatch>,
     gossip_receiver: Receiver<GossipVerifyTask>,
     gossip_verified_vote_sender: Sender<GossipVerifiedVoteBatch>,
@@ -167,7 +166,7 @@ impl Drop for SigVerifyWorkerPool {
 impl SigVerifyWorkerPool {
     pub(crate) fn new(
         num_workers: NonZeroUsize,
-        non_vote_receiver: Receiver<PacketBatch>,
+        non_vote_receiver: PriorityReceiver<PacketBatch>,
         tpu_vote_receiver: Receiver<PacketBatch>,
         senders: SigVerifyWorkerSenders,
         forward_non_votes: bool,
@@ -222,17 +221,21 @@ impl SigVerifyWorkerPool {
     /// Returns false if some channel connection is disconnected.
     fn worker_iteration(channels: &WorkerPoolChannels, forward_non_votes: bool) -> bool {
         crossbeam_channel::select! {
-            recv(&channels.non_vote_receiver) -> maybe_work => {
-                match maybe_work {
-                    Ok(batch) => Self::run_transaction_task(
-                        batch,
-                        false,
-                        &channels.forward_stage_sender,
-                        forward_non_votes,
-                        false,
-                        &channels.sharable_banks,
-                        &channels.non_vote_state,
-                    ),
+            recv(channels.non_vote_receiver.ready_receiver()) -> ready => {
+                match ready {
+                    Ok(()) => match channels.non_vote_receiver.pop_ready() {
+                        Ok((priority, batch)) => Self::run_transaction_task(
+                            batch,
+                            priority,
+                            false,
+                            &channels.forward_stage_sender,
+                            forward_non_votes,
+                            false,
+                            &channels.sharable_banks,
+                            &channels.non_vote_state,
+                        ),
+                        Err(_) => false,
+                    },
                     Err(_) => false,
                 }
             }
@@ -240,6 +243,7 @@ impl SigVerifyWorkerPool {
                 match maybe_work {
                     Ok(batch) => Self::run_transaction_task(
                         batch,
+                        0,
                         true,
                         &channels.forward_stage_sender,
                         true,
@@ -265,6 +269,7 @@ impl SigVerifyWorkerPool {
 
     fn run_transaction_task(
         mut batch: PacketBatch,
+        ingress_priority: u64,
         reject_non_vote: bool,
         forward_stage_sender: &Sender<(BankingPacketBatch, bool)>,
         should_forward: bool,
@@ -299,32 +304,25 @@ impl SigVerifyWorkerPool {
 
         let working_bank = sharable_banks.working();
 
-        // The PoC assumes one transaction per PacketBatch. Priority is
-        // calculated once here, used for pre-sigverify admission, and carried
-        // into the priority channel after verification.
         let packet_priority = if state.banking_stage_sender.is_priority_channel() {
-            let (priority, priority_time_us) = measure_us!(
-                batch
-                    .get(0)
-                    .and_then(|packet| packet.data(..))
-                    .and_then(|data| calculate_priority_from_bytes(&working_bank, data))
-            );
+            let (below_floor, priority_floor_time_us) = measure_us!({
+                let scheduler_floor = state.priority_floor.as_ref().map_or(0, |floor| floor.get());
+                let channel_floor = state.banking_stage_sender.admission_floor();
+                let effective_floor = scheduler_floor.max(channel_floor);
+                effective_floor > 0 && ingress_priority <= effective_floor
+            });
             state
                 .stats
                 .total_priority_floor_time_us
-                .fetch_add(priority_time_us as usize, Ordering::Relaxed);
-
-            let scheduler_floor = state.priority_floor.as_ref().map_or(0, |floor| floor.get());
-            let channel_floor = state.banking_stage_sender.admission_floor();
-            let effective_floor = scheduler_floor.max(channel_floor);
-            if priority.is_some_and(|priority| effective_floor > 0 && priority <= effective_floor) {
+                .fetch_add(priority_floor_time_us as usize, Ordering::Relaxed);
+            if below_floor {
                 state
                     .stats
                     .total_dropped_below_priority_floor
                     .fetch_add(1, Ordering::Relaxed);
                 return true;
             }
-            priority.unwrap_or(0)
+            ingress_priority
         } else {
             0
         };
