@@ -8,11 +8,11 @@ use {
         transaction_priority::calculate_priority_from_bytes,
     },
     agave_banking_stage_ingress_types::{BankingPacketBatch, SchedulerPriorityFloor},
-    crossbeam_channel::{Receiver, Sender, TrySendError, bounded},
+    crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded},
     solana_measure::measure_us,
     solana_perf::{
         deduper::{self, Deduper},
-        packet::PacketBatch,
+        packet::{BytesPacket, PacketBatch},
         sigverify::{self},
     },
     solana_runtime::{bank::Bank, bank_forks::SharableBanks},
@@ -130,6 +130,13 @@ impl GossipSigVerifier {
 /// Gossip votes use a bounded queue into the worker pool.
 const SIGVERIFY_GOSSIP_VOTE_WORK_CHANNEL_SIZE: usize = 50_000;
 
+/// Max packets the drainer coalesces into a single work batch. Only packets
+/// already sitting in the ingress channel are merged -- the drainer never
+/// waits for a batch to fill, so an idle channel adds no latency.
+const NON_VOTE_COALESCE_LIMIT: usize = 64;
+/// Coalesced work batches queued between the drainer and the workers.
+const NON_VOTE_WORK_CHANNEL_SIZE: usize = 4_096;
+
 pub(crate) struct SigVerifyWorkerSenders {
     pub(crate) gossip_verified_vote_sender: Sender<GossipVerifiedVoteBatch>,
     pub(crate) forward_stage_sender: Sender<(BankingPacketBatch, bool)>,
@@ -176,8 +183,29 @@ impl SigVerifyWorkerPool {
         tpu_vote_state: SigVerifyWorkerState,
     ) -> Self {
         let (gossip_sender, gossip_receiver) = bounded(SIGVERIFY_GOSSIP_VOTE_WORK_CHANNEL_SIZE);
+        let (non_vote_work_sender, non_vote_work_receiver) = bounded(NON_VOTE_WORK_CHANNEL_SIZE);
+        let exit = Arc::new(AtomicBool::new(false));
+        // A single drainer consumes the ingress channel, coalescing queued
+        // packets into larger batches for the workers. Keeping exactly one
+        // blocking receiver on the ingress channel lets producers take the
+        // wakeup fast path (no waker lock) whenever the drainer is awake.
+        let drainer_hdl = {
+            let exit = exit.clone();
+            let non_vote_state = non_vote_state.clone();
+            std::thread::Builder::new()
+                .name("solSigDrain".to_string())
+                .spawn(move || {
+                    Self::non_vote_drainer(
+                        exit,
+                        non_vote_receiver,
+                        non_vote_work_sender,
+                        non_vote_state,
+                    )
+                })
+                .expect("failed to spawn sigverify drainer thread")
+        };
         let channels = WorkerPoolChannels {
-            non_vote_receiver,
+            non_vote_receiver: non_vote_work_receiver,
             tpu_vote_receiver,
             gossip_receiver,
             gossip_verified_vote_sender: senders.gossip_verified_vote_sender,
@@ -186,8 +214,7 @@ impl SigVerifyWorkerPool {
             non_vote_state,
             tpu_vote_state,
         };
-        let exit = Arc::new(AtomicBool::new(false));
-        let worker_hdls = (0..num_workers.get())
+        let mut worker_hdls: Vec<JoinHandle<()>> = (0..num_workers.get())
             .map(|idx| {
                 let exit = exit.clone();
                 let channels = channels.clone();
@@ -198,6 +225,7 @@ impl SigVerifyWorkerPool {
                     .expect("failed to spawn sigverify worker thread")
             })
             .collect();
+        worker_hdls.push(drainer_hdl);
         Self {
             exit,
             gossip_sender,
@@ -208,6 +236,80 @@ impl SigVerifyWorkerPool {
     pub(crate) fn gossip_verifier(&self) -> GossipSigVerifier {
         GossipSigVerifier {
             worker_sender: self.gossip_sender.clone(),
+        }
+    }
+
+    /// Drains the non-vote ingress channel, merging queued packets into
+    /// larger batches for the worker pool. Coalescing is opportunistic: only
+    /// packets already in the channel are merged, so batch size adapts to
+    /// load (1 when idle, up to the limit under bursts) without adding
+    /// latency.
+    ///
+    /// The drainer also dedups (a cheap bloom-filter lookup), so duplicate
+    /// floods are absorbed here without ever waking a worker. The costlier
+    /// per-packet work (priority-floor parsing, signature verification) stays
+    /// in the workers to keep this single thread off the throughput-critical
+    /// path.
+    fn non_vote_drainer(
+        exit: Arc<AtomicBool>,
+        non_vote_receiver: Receiver<PacketBatch>,
+        work_sender: Sender<PacketBatch>,
+        state: SigVerifyWorkerState,
+    ) {
+        const RECV_TIMEOUT: Duration = Duration::from_millis(10);
+        while !exit.load(Ordering::Relaxed) {
+            let first = match non_vote_receiver.recv_timeout(RECV_TIMEOUT) {
+                Ok(batch) => batch,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => return,
+            };
+
+            let mut merged: Vec<BytesPacket> = Vec::new();
+            let mut out: Vec<PacketBatch> = Vec::new();
+            let mut num_packets = first.len();
+            Self::absorb_batch(first, &mut merged, &mut out);
+            while num_packets < NON_VOTE_COALESCE_LIMIT {
+                match non_vote_receiver.try_recv() {
+                    Ok(batch) => {
+                        num_packets = num_packets.saturating_add(batch.len());
+                        Self::absorb_batch(batch, &mut merged, &mut out);
+                    }
+                    // Forward what was drained; a disconnect is picked up by
+                    // the recv_timeout in the next iteration.
+                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                }
+            }
+            if !merged.is_empty() {
+                out.push(merged.into());
+            }
+
+            for mut batch in out {
+                if !Self::dedup_batch(&mut batch, &state) {
+                    continue;
+                }
+                if work_sender.send(batch).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn absorb_batch(
+        batch: PacketBatch,
+        merged: &mut Vec<BytesPacket>,
+        out: &mut Vec<PacketBatch>,
+    ) {
+        match batch {
+            PacketBatch::Single(packet) => merged.push(packet),
+            PacketBatch::Bytes(mut batch) => merged.append(&mut batch),
+            // Pinned batches cannot be merged without copying; flush merged
+            // packets first to preserve arrival order.
+            batch @ PacketBatch::Pinned(_) => {
+                if !merged.is_empty() {
+                    out.push(std::mem::take(merged).into());
+                }
+                out.push(batch);
+            }
         }
     }
 
@@ -230,6 +332,7 @@ impl SigVerifyWorkerPool {
                         &channels.forward_stage_sender,
                         forward_non_votes,
                         false,
+                        true, // deduped: the drainer already deduped this batch
                         &channels.sharable_banks,
                         &channels.non_vote_state,
                     ),
@@ -244,6 +347,7 @@ impl SigVerifyWorkerPool {
                         &channels.forward_stage_sender,
                         true,
                         true,
+                        false, // deduped: votes are deduped here
                         &channels.sharable_banks,
                         &channels.tpu_vote_state,
                     ),
@@ -263,15 +367,9 @@ impl SigVerifyWorkerPool {
         }
     }
 
-    fn run_transaction_task(
-        mut batch: PacketBatch,
-        reject_non_vote: bool,
-        forward_stage_sender: &Sender<(BankingPacketBatch, bool)>,
-        should_forward: bool,
-        is_tpu_vote: bool,
-        sharable_banks: &SharableBanks,
-        state: &SigVerifyWorkerState,
-    ) -> bool {
+    /// Accounts for received packets and dedups them. Returns false when the
+    /// entire batch was discarded and nothing is left to verify or forward.
+    fn dedup_batch(batch: &mut PacketBatch, state: &SigVerifyWorkerState) -> bool {
         let batch_len = batch.len();
         state.stats.total_batches.fetch_add(1, Ordering::Relaxed);
         state
@@ -282,7 +380,7 @@ impl SigVerifyWorkerPool {
         let (discard_or_dedup_fail, dedup_time_us) =
             measure_us!(deduper::dedup_packets_and_count_discards(
                 &state.deduper,
-                std::slice::from_mut(&mut batch)
+                std::slice::from_mut(batch)
             ));
         state
             .stats
@@ -293,12 +391,31 @@ impl SigVerifyWorkerPool {
             .total_dedup_time_us
             .fetch_add(dedup_time_us as usize, Ordering::Relaxed);
 
-        if discard_or_dedup_fail as usize == batch_len {
+        discard_or_dedup_fail as usize != batch_len
+    }
+
+    fn run_transaction_task(
+        mut batch: PacketBatch,
+        reject_non_vote: bool,
+        forward_stage_sender: &Sender<(BankingPacketBatch, bool)>,
+        should_forward: bool,
+        is_tpu_vote: bool,
+        deduped: bool,
+        sharable_banks: &SharableBanks,
+        state: &SigVerifyWorkerState,
+    ) -> bool {
+        // Non-vote batches are already deduped by the drainer; vote batches
+        // are deduped here.
+        if !deduped && !Self::dedup_batch(&mut batch, state) {
             return true;
         }
 
         let working_bank = sharable_banks.working();
 
+        // The priority floor stays in the workers rather than the drainer: it
+        // parses every packet, and spreading that cost across the pool keeps
+        // the single drainer off the throughput-critical path. Coalesced
+        // batches keep the work done per wakeup meaningful.
         if let Some(floor) = state.priority_floor.as_ref() {
             let floor = floor.get();
             if floor > 0 {
