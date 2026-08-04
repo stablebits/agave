@@ -250,8 +250,11 @@ impl<T> Channel<T> {
             inner
                 .senders
                 .register_with_packet(oper, &mut packet as *mut Packet<T> as *mut (), cx);
-            inner.receivers.notify();
+            let ready = inner.receivers.notify();
             drop(inner);
+            for entry in ready {
+                entry.cx.unpark();
+            }
 
             // Block the current thread.
             let sel = cx.wait_until(deadline);
@@ -323,8 +326,11 @@ impl<T> Channel<T> {
                 &mut packet as *mut Packet<T> as *mut (),
                 cx,
             );
-            inner.senders.notify();
+            let ready = inner.senders.notify();
             drop(inner);
+            for entry in ready {
+                entry.cx.unpark();
+            }
 
             // Block the current thread.
             let sel = cx.wait_until(deadline);
@@ -407,8 +413,13 @@ impl<T> SelectHandle for Receiver<'_, T> {
         inner
             .receivers
             .register_with_packet(oper, packet.cast::<()>(), cx);
-        inner.senders.notify();
-        inner.senders.can_select() || inner.is_disconnected
+        let ready = inner.senders.notify();
+        let result = inner.senders.can_select() || inner.is_disconnected;
+        drop(inner);
+        for entry in ready {
+            entry.cx.unpark();
+        }
+        result
     }
 
     fn unregister(&self, oper: Operation) {
@@ -457,8 +468,13 @@ impl<T> SelectHandle for Sender<'_, T> {
         inner
             .senders
             .register_with_packet(oper, packet.cast::<()>(), cx);
-        inner.receivers.notify();
-        inner.receivers.can_select() || inner.is_disconnected
+        let ready = inner.receivers.notify();
+        let result = inner.receivers.can_select() || inner.is_disconnected;
+        drop(inner);
+        for entry in ready {
+            entry.cx.unpark();
+        }
+        result
     }
 
     fn unregister(&self, oper: Operation) {

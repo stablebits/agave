@@ -142,14 +142,22 @@ impl Waker {
         self.observers.retain(|e| e.oper != oper);
     }
 
-    /// Notifies all operations waiting to be ready.
+    /// Notifies all operations waiting to be ready, claiming them for wakeup.
+    ///
+    /// Returns the claimed entries; the *caller* is responsible for waking
+    /// them (`entry.cx.unpark()`), preferably after releasing any lock
+    /// protecting this waker (see `try_select` for the rationale).
+    /// Dropping a claimed entry without unparking it loses the wakeup.
+    #[must_use]
     #[inline]
-    pub(crate) fn notify(&mut self) {
+    pub(crate) fn notify(&mut self) -> Vec<Entry> {
+        let mut claimed = Vec::new();
         for entry in self.observers.drain(..) {
             if entry.cx.try_select(Selected::Operation(entry.oper)).is_ok() {
-                entry.cx.unpark();
+                claimed.push(entry);
             }
         }
+        claimed
     }
 
     /// Notifies all registered operations that the channel is disconnected.
@@ -166,7 +174,11 @@ impl Waker {
             }
         }
 
-        self.notify();
+        // Disconnection is a cold path; waking under the caller's lock here
+        // preserves upstream behavior.
+        for entry in self.notify() {
+            entry.cx.unpark();
+        }
     }
 }
 
@@ -229,19 +241,22 @@ impl SyncWaker {
             let mut inner = self.inner.lock();
             if !self.is_empty.load(Ordering::SeqCst) {
                 let entry = inner.try_select();
-                inner.notify();
+                let ready = inner.notify();
                 self.is_empty.store(
                     inner.selectors.is_empty() && inner.observers.is_empty(),
                     Ordering::SeqCst,
                 );
-                // Wake the selected thread only after releasing the lock. The
-                // wake is a syscall (futex/park token); holding the lock
-                // across it serializes every sender contending on this waker
-                // and invites priority-inversion convoys when the holder is
-                // preempted mid-syscall. The entry was already exclusively
-                // claimed via CAS, so waking late is safe.
+                // Wake the claimed threads only after releasing the lock.
+                // Each wake is a syscall (futex/park token); holding the lock
+                // across them serializes every sender contending on this
+                // waker and invites priority-inversion convoys when the
+                // holder is preempted mid-syscall. The entries were already
+                // exclusively claimed via CAS, so waking late is safe.
                 drop(inner);
                 if let Some(entry) = entry {
+                    entry.cx.unpark();
+                }
+                for entry in ready {
                     entry.cx.unpark();
                 }
             }
