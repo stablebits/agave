@@ -651,3 +651,9 @@ blstrs = { git = "https://github.com/anza-xyz/blstrs", rev = "a1faffa3420bdaf410
 crossbeam-epoch = { git = "https://github.com/anza-xyz/crossbeam", rev = "5ee1c6ec671d94db14ed9238eb99e59a84555aad" }
 librocksdb-sys = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }
 rocksdb = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }
+# Test build: quinn copying each received datagram into its own buffer, with a hook for
+# application-supplied receive buffers. anza-quinn resolves its proto and udp dependencies inside
+# the same git repository, so patch all three to keep a single copy of each.
+anza-quinn = { git = "https://github.com/stablebits/quinn", branch = "anza-quinn-proto-0.11.19-vendor.1-recv-buffers" }
+anza-quinn-proto = { git = "https://github.com/stablebits/quinn", branch = "anza-quinn-proto-0.11.19-vendor.1-recv-buffers" }
+quinn-udp = { git = "https://github.com/stablebits/quinn", branch = "anza-quinn-proto-0.11.19-vendor.1-recv-buffers" }

@@ -1,6 +1,7 @@
 pub mod connection_rate_limiter;
 pub mod qos;
 pub mod quic;
+mod recv_buffer_pool;
 pub mod simple_qos;
 mod stream_throttle;
 pub mod swqos;

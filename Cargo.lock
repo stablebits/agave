@@ -903,8 +903,7 @@ dependencies = [
 [[package]]
 name = "anza-quinn"
 version = "0.11.12-vendor.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2995b1182fcfcc8fe8cd8f5a48b867442db5bd6a306393a2cbf6eeab4f69c1d"
+source = "git+https://github.com/stablebits/quinn?branch=anza-quinn-proto-0.11.19-vendor.1-recv-buffers#ee36476a8c60b551c01ad2e17103da25d94a6a01"
 dependencies = [
  "anza-quinn-proto",
  "bytes",
@@ -923,8 +922,7 @@ dependencies = [
 [[package]]
 name = "anza-quinn-proto"
 version = "0.11.19-vendor.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da740799e2d83bbca540e98735389d9b77113ca1180e39c6b22cf775563638f3"
+source = "git+https://github.com/stablebits/quinn?branch=anza-quinn-proto-0.11.19-vendor.1-recv-buffers#ee36476a8c60b551c01ad2e17103da25d94a6a01"
 dependencies = [
  "bytes",
  "fastbloom",
@@ -5767,8 +5765,7 @@ dependencies = [
 [[package]]
 name = "quinn-udp"
 version = "0.5.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af66907df18639dcf4db56ca65490cabc4b27a97dbadd96f2926cca73298f016"
+source = "git+https://github.com/stablebits/quinn?branch=anza-quinn-proto-0.11.19-vendor.1-recv-buffers#ee36476a8c60b551c01ad2e17103da25d94a6a01"
 dependencies = [
  "cfg_aliases",
  "libc",

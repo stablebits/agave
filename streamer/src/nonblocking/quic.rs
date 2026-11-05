@@ -3,6 +3,7 @@ use {
         nonblocking::{
             connection_rate_limiter::ConnectionRateLimiter,
             qos::{ConnectionContext, OpaqueStreamerCounter, QosController},
+            recv_buffer_pool::RecvBufferPool,
         },
         quic::{QuicServerError, QuicStreamerConfig, StreamerStats, configure_server},
         streamer::{ChannelSend, StakedNodes},
@@ -200,6 +201,9 @@ where
                 .map_err(QuicServerError::EndpointFailed)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    for endpoint in &endpoints {
+        endpoint.set_recv_buffers(Box::new(RecvBufferPool::new(stats.clone())));
+    }
 
     let max_concurrent_connections = qos.max_concurrent_connections();
     let handle = tokio::spawn({

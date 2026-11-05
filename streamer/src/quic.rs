@@ -228,6 +228,10 @@ pub struct StreamerStats {
     pub(crate) outstanding_incoming_connection_attempts: AtomicUsize,
     pub(crate) total_incoming_connection_attempts: AtomicUsize,
     pub(crate) quic_endpoints_count: AtomicUsize,
+    /// Buffers allocated by the receive buffer pools of the server's endpoints
+    pub(crate) recv_buffers_allocated: AtomicUsize,
+    /// Datagrams copied into their own allocation because no pooled buffer was available
+    pub(crate) recv_buffer_fallbacks: AtomicUsize,
 }
 
 impl StreamerStats {
@@ -516,6 +520,16 @@ impl StreamerStats {
             (
                 "quic_endpoints_count",
                 self.quic_endpoints_count.load(Ordering::Relaxed),
+                i64
+            ),
+            (
+                "recv_buffers_allocated",
+                self.recv_buffers_allocated.load(Ordering::Relaxed),
+                i64
+            ),
+            (
+                "recv_buffer_fallbacks",
+                self.recv_buffer_fallbacks.swap(0, Ordering::Relaxed),
                 i64
             ),
             (
