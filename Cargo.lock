@@ -903,7 +903,7 @@ dependencies = [
 [[package]]
 name = "anza-quinn"
 version = "0.11.12-vendor.1"
-source = "git+https://github.com/stablebits/quinn?branch=anza-quinn-proto-0.11.19-vendor.1-recv-buffers#ee36476a8c60b551c01ad2e17103da25d94a6a01"
+source = "git+https://github.com/stablebits/quinn?branch=anza-quinn-proto-0.11.19-vendor.1-recv-buffers#4c6c718b53bc9df9c2162bae5c6f274ad66a5539"
 dependencies = [
  "anza-quinn-proto",
  "bytes",
@@ -922,7 +922,7 @@ dependencies = [
 [[package]]
 name = "anza-quinn-proto"
 version = "0.11.19-vendor.1"
-source = "git+https://github.com/stablebits/quinn?branch=anza-quinn-proto-0.11.19-vendor.1-recv-buffers#ee36476a8c60b551c01ad2e17103da25d94a6a01"
+source = "git+https://github.com/stablebits/quinn?branch=anza-quinn-proto-0.11.19-vendor.1-recv-buffers#4c6c718b53bc9df9c2162bae5c6f274ad66a5539"
 dependencies = [
  "bytes",
  "fastbloom",
@@ -5765,7 +5765,7 @@ dependencies = [
 [[package]]
 name = "quinn-udp"
 version = "0.5.16"
-source = "git+https://github.com/stablebits/quinn?branch=anza-quinn-proto-0.11.19-vendor.1-recv-buffers#ee36476a8c60b551c01ad2e17103da25d94a6a01"
+source = "git+https://github.com/stablebits/quinn?branch=anza-quinn-proto-0.11.19-vendor.1-recv-buffers#4c6c718b53bc9df9c2162bae5c6f274ad66a5539"
 dependencies = [
  "cfg_aliases",
  "libc",
